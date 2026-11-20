@@ -1,5 +1,6 @@
 """Exercise the Slicer launcher and completion bookkeeping without Slicer."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -247,6 +248,129 @@ class HardenWorkerTests(unittest.TestCase):
                                     str(root / 'out_tensor'), 'none', '-t', str(tfm), '-i']):
                 with self.assertRaisesRegex(RuntimeError, 'tensor|Slicer'):
                     launcher.main()
+
+    def test_slicer_auto_prepare_command_runs_once_and_avoids_redundant_reads(self):
+        with tempfile.TemporaryDirectory(prefix='wma auto prepare ') as temporary:
+            root = Path(temporary)
+            catalogue = root / 'catalogue'
+            catalogue.mkdir()
+            for name in ('cluster_00001.vtp', 'cluster_00002.vtp'):
+                (catalogue / name).write_bytes(b'catalogue')
+
+            fake_slicer = root / 'Slicer'
+            fake_slicer.write_text('#!/bin/sh\nexit 0\n')
+
+            tx = vtk.vtkTransform()
+            tx.Translate(2.0, -3.0, 4.0)
+            linear_tfm = Path(wma.io.write_transforms_to_itk_format([tx], str(root), ['lin'])[0])
+            bspline_tfm = root / 'bspline.tfm'
+            bspline_tfm.write_text(
+                '#Insight Transform File V1.0\n# Transform 0\n'
+                'Transform: BSplineTransform_double_3_3\nParameters: 0 0 0\n'
+                'FixedParameters: 4 4 4 -100 -100 -100 50 50 50 1 0 0 0 1 0 0 0 1\n'
+            )
+
+            pd_free = self._make_cluster_polydata(
+                [[[-10.0, 0.0, 0.0], [-10.0, 5.0, 0.0]]], hemi_labels=[1.0])
+            pd_tensor = self._make_cluster_polydata(
+                [[[-10.0, 0.0, 0.0], [-10.0, 5.0, 0.0]]], hemi_labels=[1.0], tensors=True)
+
+            # 1) BSpline transform with Slicer='auto' + --prepare-command: goes directly to _run_prepared (1 prepare call)
+            in_bspline = root / 'in_bspline'
+            out_bspline = root / 'out_bspline'
+            in_bspline.mkdir()
+            prep_calls = []
+
+            def fake_prepare_bspline(command, check=False):
+                prep_calls.append(list(command))
+                for name in ('cluster_00001.vtp', 'cluster_00002.vtp'):
+                    wma.io.write_polydata(pd_free, str(in_bspline / name))
+
+            def fake_slicer_worker(polydata, transform, inverse, slicer_path, helper, outdir,
+                                   partition, partitions, log, split_output_dir=None,
+                                   profile_output=None, input_status=None):
+                import time
+                while not Path(input_status).is_file():
+                    time.sleep(0.01)
+                self.assertEqual(Path(input_status).read_text(), 'ready')
+                for name in sorted(p.name for p in in_bspline.glob('*.vtp'))[partition::partitions]:
+                    (outdir / name).write_bytes(b'hardened')
+                log.write_text('ok')
+
+            stdout_bspline = io.StringIO()
+            with patch.object(launcher.shutil, 'which', return_value=str(fake_slicer)), \
+                    patch.object(launcher.subprocess, 'run', side_effect=fake_prepare_bspline), \
+                    patch.object(launcher, '_run_slicer', side_effect=fake_slicer_worker) as slicer_mock, \
+                    patch('sys.stdout', stdout_bspline), \
+                    patch('sys.argv', [
+                        'wm_harden_transform.py', str(in_bspline), str(out_bspline), 'auto',
+                        '-t', str(bspline_tfm), '-i', '-j', '2',
+                        '--input-catalogue', str(catalogue), '--prepare-command', 'echo', 'prep']):
+                launcher.main()
+            self.assertEqual(len(prep_calls), 1)
+            self.assertEqual(slicer_mock.call_count, 2)
+            self.assertIsNotNone(slicer_mock.call_args_list[0].args[11])
+            self.assertNotIn('pure-Python affine', stdout_bspline.getvalue())
+
+            # 2) Linear .tfm + tensor-bearing VTP with Slicer='auto' + --prepare-command: prepares ONCE, falls back cleanly
+            in_tensor = root / 'in_tensor'
+            out_tensor = root / 'out_tensor'
+            in_tensor.mkdir()
+            prep_calls_tensor = []
+
+            def fake_prepare_tensor(command, check=False):
+                prep_calls_tensor.append(list(command))
+                for name in ('cluster_00001.vtp', 'cluster_00002.vtp'):
+                    wma.io.write_polydata(pd_tensor, str(in_tensor / name))
+
+            def fake_slicer_tensor(polydata, transform, inverse, slicer_path, helper, outdir,
+                                   partition, partitions, log, split_output_dir=None,
+                                   profile_output=None, input_status=None):
+                for name in sorted(p.name for p in in_tensor.glob('*.vtp'))[partition::partitions]:
+                    (outdir / name).write_bytes(b'hardened')
+                log.write_text('ok')
+
+            stdout_tensor = io.StringIO()
+            with patch.object(launcher.shutil, 'which', return_value=str(fake_slicer)), \
+                    patch.object(launcher.subprocess, 'run', side_effect=fake_prepare_tensor), \
+                    patch.object(launcher, '_run_slicer', side_effect=fake_slicer_tensor) as slicer_mock, \
+                    patch('sys.stdout', stdout_tensor), \
+                    patch('sys.argv', [
+                        'wm_harden_transform.py', str(in_tensor), str(out_tensor), 'auto',
+                        '-t', str(linear_tfm), '-i', '-j', '2',
+                        '--input-catalogue', str(catalogue), '--prepare-command', 'echo', 'prep']):
+                launcher.main()
+            self.assertEqual(len(prep_calls_tensor), 1)
+            self.assertEqual(slicer_mock.call_count, 2)
+            self.assertIsNone(slicer_mock.call_args_list[0].args[11])
+            self.assertNotIn('pure-Python affine', stdout_tensor.getvalue())
+
+            # 3) Linear .tfm + tensor-free VTPs with Slicer='auto' + --prepare-command: prepares ONCE, reads each VTP ONCE
+            in_free = root / 'in_free'
+            out_free = root / 'out_free'
+            in_free.mkdir()
+            prep_calls_free = []
+
+            def fake_prepare_free(command, check=False):
+                prep_calls_free.append(list(command))
+                for name in ('cluster_00001.vtp', 'cluster_00002.vtp'):
+                    wma.io.write_polydata(pd_free, str(in_free / name))
+
+            stdout_free = io.StringIO()
+            with patch.object(launcher.shutil, 'which', return_value=str(fake_slicer)), \
+                    patch.object(launcher.subprocess, 'run', side_effect=fake_prepare_free), \
+                    patch.object(launcher, '_run_slicer', side_effect=AssertionError('Slicer must not run')), \
+                    patch.object(wma.io, 'read_polydata', wraps=wma.io.read_polydata) as read_spy, \
+                    patch('sys.stdout', stdout_free), \
+                    patch('sys.argv', [
+                        'wm_harden_transform.py', str(in_free), str(out_free), 'auto',
+                        '-t', str(linear_tfm), '-i', '-j', '2',
+                        '--input-catalogue', str(catalogue), '--prepare-command', 'echo', 'prep']):
+                launcher.main()
+            self.assertEqual(len(prep_calls_free), 1)
+            self.assertEqual(read_spy.call_count, 2)
+            self.assertIn('pure-Python affine', stdout_free.getvalue())
+            self.assertTrue((out_free / 'transform_complete.log').is_file())
 
 
 if __name__ == '__main__':

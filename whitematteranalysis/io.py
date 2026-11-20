@@ -895,11 +895,12 @@ def _write_polydata_index(item):
     write_polydata(_writer_polydatas[index], filename)
 
 
-def write_polydatas_parallel(polydatas, filenames, jobs=None):
+def write_polydatas_parallel(polydatas, filenames, jobs=None, use_threads=False):
     """Write independent polydata files without serializing VTK objects.
 
-    Fork workers inherit read-only data on Linux. Windows and macOS use
-    threads with a separate writer per file. Workers never access CUDA.
+    Fork workers inherit read-only data on Linux. Windows, macOS, and
+    ``use_threads=True`` callers use threads with a separate writer per file.
+    Workers never access CUDA.
     """
     import multiprocessing
 
@@ -911,7 +912,7 @@ def write_polydatas_parallel(polydatas, filenames, jobs=None):
             write_polydata(pd, fname)
         return
     import sys
-    if sys.platform == 'darwin' or 'fork' not in multiprocessing.get_all_start_methods():
+    if use_threads or sys.platform == 'darwin' or 'fork' not in multiprocessing.get_all_start_methods():
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=jobs) as pool:
             list(pool.map(write_polydata, polydatas, filenames))

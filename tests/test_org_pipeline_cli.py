@@ -1,7 +1,9 @@
 """End-to-end tests for bin/wm_apply_ORG_atlas.py and Slicer-Core ModelNode fallback."""
 import builtins
+import concurrent.futures
 import importlib.util
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import subprocess
@@ -576,6 +578,57 @@ class ORGPipelineCLITests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, 'tensor|SlicerDMRI|9-component'):
                         helper.main()
             self.assertEqual(scene.GetNumberOfNodes(), 0)
+
+    def test_org_pipeline_never_forks_after_threads_and_writes_serially_at_j1(self):
+        org_cli = _load_module('wm_apply_ORG_atlas_nofork', ORG_CLI_PATH)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            atlas_root = root / 'ORG-Atlas'
+            _build_synthetic_org_atlas(atlas_root)
+            fibers = (_bundle_coords(-35.0, 0.0, 4, n_pts=21, step=3.0, seed=40)
+                      + _bundle_coords(35.0, 0.0, 4, n_pts=21, step=3.0, seed=41)
+                      + _bundle_coords(0.0, 35.0, 4, n_pts=21, step=3.0, commissural=True, seed=42))
+            subj_path = root / 'sub-nofork.vtp'
+            wma.io.write_polydata(_make_tract_polydata(fibers), str(subj_path))
+
+            # Direct check on write_polydatas_parallel(use_threads=True) on mocked Linux fork host
+            direct_pd = _make_tract_polydata(fibers[:2])
+            direct_paths = [str(root / 'direct_0.vtp'), str(root / 'direct_1.vtp')]
+            with patch.object(sys, 'platform', 'linux'), \
+                    patch.object(multiprocessing, 'get_all_start_methods', return_value=['fork', 'spawn']), \
+                    patch.object(multiprocessing, 'get_context',
+                                 side_effect=AssertionError('fork context must not be used when use_threads=True')):
+                wma.io.write_polydatas_parallel([direct_pd, direct_pd], direct_paths, jobs=2, use_threads=True)
+            self.assertTrue(all(Path(p).is_file() for p in direct_paths))
+
+            for jobs in (1, 2):
+                out_root = root / f'out_j{jobs}'
+                recorded_write_calls = []
+                orig_parallel_write = wma.io.write_polydatas_parallel
+
+                def spy_write(polydatas, filenames, jobs=None, use_threads=False):
+                    recorded_write_calls.append((jobs, use_threads))
+                    if jobs == 1:
+                        with patch.object(concurrent.futures, 'ThreadPoolExecutor',
+                                          side_effect=AssertionError('-j 1 must write serially without ThreadPoolExecutor')):
+                            return orig_parallel_write(polydatas, filenames, jobs=jobs, use_threads=use_threads)
+                    return orig_parallel_write(polydatas, filenames, jobs=jobs, use_threads=use_threads)
+
+                with self.subTest(jobs=jobs), \
+                        patch.object(sys, 'platform', 'linux'), \
+                        patch.object(multiprocessing, 'get_all_start_methods', return_value=['fork', 'spawn']), \
+                        patch.object(multiprocessing, 'get_context',
+                                     side_effect=AssertionError('ORG pipeline must never fork()')), \
+                        patch.object(wma.io, 'write_polydatas_parallel', side_effect=spy_write), \
+                        patch.object(sys, 'argv', [
+                            str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_root),
+                            '-a', str(atlas_root), '-r', 'rig', '-j', str(jobs),
+                            '-gpu', 'off', '--keep-intermediates', '2']):
+                    org_cli.main()
+
+                # keep_intermediates=2 calls write_polydatas_parallel 6 times (init, outrem, tfm, 3x sep)
+                self.assertEqual(len(recorded_write_calls), 6)
+                self.assertTrue(all(call == (jobs, True) for call in recorded_write_calls), recorded_write_calls)
 
 
 if __name__ == '__main__':

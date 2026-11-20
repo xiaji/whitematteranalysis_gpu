@@ -683,7 +683,7 @@ def run_pipeline(args):
                     init_dir.mkdir(parents=True, exist_ok=True)
                     init_fnames = [str(init_dir / name) for name in atlas_cluster_names]
                     wma.io.write_polydatas_parallel(
-                        cluster_pds, init_fnames, jobs=workers if workers > 1 else None)
+                        cluster_pds, init_fnames, jobs=workers, use_threads=True)
                 del labeled_pd, cluster_numbers, color, embed
             else:
                 empty_pd = _empty_like_schema(filtered_reg_pd)
@@ -707,7 +707,7 @@ def run_pipeline(args):
                 outrem_dir.mkdir(parents=True, exist_ok=True)
                 wma.io.write_polydatas_parallel(
                     cleaned_pds, [str(outrem_dir / name) for name in atlas_cluster_names],
-                    jobs=workers if workers > 1 else None)
+                    jobs=workers, use_threads=True)
                 with (outrem_dir / 'cluster_log.txt').open('w') as lf:
                     lf.write('cluster\t input_fibers\t output_fibers\t number_removed\t percentage_removed\t '
                              'mean_distance_before\t mean_distance_after\t mean_probability_before\t mean_probability_after\n')
@@ -762,7 +762,7 @@ def run_pipeline(args):
                     tfm_dir.mkdir(parents=True, exist_ok=True)
                     wma.io.write_polydatas_parallel(
                         hardened_for_save, [str(tfm_dir / name) for name in atlas_cluster_names],
-                        jobs=workers if workers > 1 else None)
+                        jobs=workers, use_threads=True)
                     (tfm_dir / 'transform_complete.log').write_text(
                         f'Transforms completed for {number_of_clusters} files.\n')
                     del hardened_for_save
@@ -774,7 +774,7 @@ def run_pipeline(args):
                         wma.io.write_polydatas_parallel(
                             [separated_map[folder][name] for name in atlas_cluster_names],
                             [str(sep_dir / folder / name) for name in atlas_cluster_names],
-                            jobs=workers if workers > 1 else None)
+                            jobs=workers, use_threads=True)
                     (sep_dir / 'hemisphere_separation_complete.log').write_text(
                         f'Hemisphere separation completed for {number_of_clusters} clusters.\n')
             else:
@@ -787,7 +787,7 @@ def run_pipeline(args):
                     try:
                         wma.io.write_polydatas_parallel(
                             cleaned_pds, [str(outrem_work / name) for name in atlas_cluster_names],
-                            jobs=workers if workers > 1 else None)
+                            jobs=workers, use_threads=True)
                     finally:
                         if prev_comp is None:
                             os.environ.pop('WMA_VTP_COMPRESSION', None)

@@ -138,8 +138,7 @@ def _split_hardened_polydata(polydata, out_name, split_output_dir):
     split_polydata(polydata, labels, os.path.basename(str(out_name)), str(split_output_dir))
 
 
-def _run_pure_python(inputs, transform_paths, inverse, outdir, workers,
-                     split_output_dir=None, allow_fallback=False):
+def _load_linear_matrices(transform_paths, inverse, allow_fallback):
     matrix_cache = {}
     for tf_path in transform_paths:
         key = str(tf_path)
@@ -147,21 +146,35 @@ def _run_pure_python(inputs, transform_paths, inverse, outdir, workers,
             mat = wma.transform.read_itk_affine_matrix_ras(key, inverse=inverse)
             if mat is None:
                 if allow_fallback:
-                    return False
+                    return None
                 raise RuntimeError(
                     'Pure-Python hardening requires linear ITK affine .tfm transforms; '
                     'unsupported transform: ' + key)
             matrix_cache[key] = mat
+    return matrix_cache
 
+
+def _run_pure_python(inputs, transform_paths, matrix_cache, outdir, workers,
+                     split_output_dir=None, allow_fallback=False):
+    cached_polydatas = {}
     if allow_fallback:
         for pd_path in inputs:
-            if wma.transform.has_tensor_arrays(wma.io.read_polydata(str(pd_path))):
+            out_name = outdir / Path(pd_path).name
+            if out_name.exists():
+                continue
+            pd = wma.io.read_polydata(str(pd_path))
+            if wma.transform.has_tensor_arrays(pd):
+                cached_polydatas.clear()
                 return False
+            cached_polydatas[str(pd_path)] = pd
+
+    print('Harden %d files with pure-Python affine (%d worker(s)).' % (len(inputs), workers), flush=True)
 
     def _harden_one(item):
         pd_path, tf_path = item
         out_name = outdir / Path(pd_path).name
         if out_name.exists():
+            cached_polydatas.pop(str(pd_path), None)
             if split_output_dir is None:
                 return
             split_files = [split_output_dir / folder / Path(pd_path).name
@@ -174,7 +187,9 @@ def _run_pure_python(inputs, transform_paths, inverse, outdir, workers,
             return
 
         with SmallPages():
-            pd = wma.io.read_polydata(str(pd_path))
+            pd = cached_polydatas.pop(str(pd_path), None)
+            if pd is None:
+                pd = wma.io.read_polydata(str(pd_path))
             if wma.transform.has_tensor_arrays(pd):
                 raise RuntimeError(
                     'Pure-Python hardening cannot rotate tensor/vector/normal arrays; '
@@ -270,42 +285,50 @@ def main():
     if marker.exists():
         marker.unlink()
 
+    prepare_already_ran = False
+    prepare_seconds = None
+    expected = {Path(path).name for path in inputs}
+
     if pure_python_requested or auto_requested:
-        print('Harden %d files with pure-Python affine (%d worker(s)).' % (len(inputs), workers), flush=True)
-        expected = {Path(path).name for path in inputs}
-        if args.prepare_command:
-            subprocess.run(args.prepare_command, check=True)
-            actual = {Path(path).name for path in wma.io.list_vtk_files(str(inputdir))}
-            if actual != expected:
-                raise RuntimeError('Prepared input filenames do not match the catalogue.')
-        if _run_pure_python(inputs, transform_list, args.inverse_transform, outdir,
-                            workers, split_output_dir, allow_fallback=auto_requested):
-            actual = {Path(path).name for path in wma.io.list_vtk_files(str(outdir))}
-            if not expected.issubset(actual):
-                raise RuntimeError('Transformed files are missing in ' + str(outdir))
-            if split_output_dir is not None:
-                for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
-                    split_files = {Path(path).name for path in wma.io.list_vtk_files(str(split_output_dir / folder))}
-                    if not expected.issubset(split_files):
-                        raise RuntimeError('Hemisphere outputs are missing from %s' % folder)
-            marker.write_text('Transforms completed for %d files.\n' % len(inputs))
-            print('Transforms completed for %d files.' % len(inputs), flush=True)
-            return
+        matrix_cache = _load_linear_matrices(
+            transform_list, args.inverse_transform, allow_fallback=auto_requested)
+        if matrix_cache is not None:
+            if args.prepare_command:
+                prep_started = time.perf_counter()
+                subprocess.run(args.prepare_command, check=True)
+                prepare_seconds = time.perf_counter() - prep_started
+                prepare_already_ran = True
+                actual = {Path(path).name for path in wma.io.list_vtk_files(str(inputdir))}
+                if actual != expected:
+                    raise RuntimeError('Prepared input filenames do not match the catalogue.')
+            if _run_pure_python(inputs, transform_list, matrix_cache, outdir,
+                                workers, split_output_dir, allow_fallback=auto_requested):
+                actual = {Path(path).name for path in wma.io.list_vtk_files(str(outdir))}
+                if not expected.issubset(actual):
+                    raise RuntimeError('Transformed files are missing in ' + str(outdir))
+                if split_output_dir is not None:
+                    for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
+                        split_files = {Path(path).name for path in wma.io.list_vtk_files(str(split_output_dir / folder))}
+                        if not expected.issubset(split_files):
+                            raise RuntimeError('Hemisphere outputs are missing from %s' % folder)
+                marker.write_text('Transforms completed for %d files.\n' % len(inputs))
+                print('Transforms completed for %d files.' % len(inputs), flush=True)
+                return
         if slicer_path is None or not slicer_path.is_file():
             raise RuntimeError('Slicer executable is required for non-linear transforms or tensor-bearing inputs.')
 
     print('Harden %d files with %d Slicer worker(s).' % (len(inputs), workers), flush=True)
     logs = Path(tempfile.mkdtemp(prefix='wma-harden-', dir=str(outdir)))
     print('Slicer worker logs: ' + str(logs), flush=True)
-    status = logs / 'input.status' if args.prepare_command else None
+    run_prepare_via_gate = bool(args.prepare_command and not prepare_already_ran)
+    status = logs / 'input.status' if run_prepare_via_gate else None
     xvfb_kw = {'no_xvfb': True} if args.no_xvfb else {}
     runs = [partial(_run_slicer, polydata, transform, args.inverse_transform, slicer_path, helper,
             outdir, index, count, logs/('worker_%04d.log' % task), split_output_dir,
             logs/('worker_%04d.json' % task) if args.profile else None, status, **xvfb_kw)
         for task, (polydata, transform, index, count) in enumerate(tasks)]
-    expected = {Path(path).name for path in inputs}
     started = time.perf_counter()
-    if args.prepare_command:
+    if run_prepare_via_gate:
         prepare_seconds = _run_prepared(runs, workers, args.prepare_command, status, inputdir, expected)
         if args.profile:
             (logs / 'preparation.json').write_text(json.dumps({
@@ -313,6 +336,10 @@ def main():
                 'command': args.prepare_command}, indent=2) + '\n')
     else:
         Parallel(n_jobs=workers, prefer='threads')(delayed(run)() for run in runs)
+        if args.profile and prepare_already_ran:
+            (logs / 'preparation.json').write_text(json.dumps({
+                'prepare_s': prepare_seconds, 'combined_s': time.perf_counter() - started,
+                'command': args.prepare_command}, indent=2) + '\n')
     actual = {Path(path).name for path in wma.io.list_vtk_files(str(outdir))}
     if not expected.issubset(actual):
         raise RuntimeError('Transformed files are missing; inspect Slicer logs: ' + str(logs))
