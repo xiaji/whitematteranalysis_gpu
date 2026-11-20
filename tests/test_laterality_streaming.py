@@ -96,7 +96,10 @@ class LateralityTests(unittest.TestCase):
         self.compare_pipeline(False)
 
     def test_total_similarity_strict_row_sum_matches_matrix_sum(self):
-        import torch
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
 
         rng = np.random.RandomState(52)
         queries = rng.normal(size=(17, 15, 3))

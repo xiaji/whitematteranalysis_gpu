@@ -155,8 +155,15 @@ class DistanceKernelTests(unittest.TestCase):
 
 
 class DistanceSimilarityCpuTests(unittest.TestCase):
+    def _require_torch(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+        return torch
+
     def test_pairwise_and_rectangular_similarity_use_gpu_exp_cpu(self):
-        import torch
+        torch = self._require_torch()
         from test_atlas_blocks import polydata
         pd_n, pd_m = polydata(5), polydata(4)
         cpu_dev = torch.device('cpu')
@@ -174,7 +181,7 @@ class DistanceSimilarityCpuTests(unittest.TestCase):
                 np.testing.assert_allclose(actual_rect, ref_rect, rtol=1e-12, atol=1e-12)
 
     def test_choose_tile_rows_triton_2d(self):
-        import torch
+        torch = self._require_torch()
         # With 4 GiB fallback budget (0.55 * 4 GiB = 2.2 GiB):
         # m = 2000, P = 15, float64 (itemsize = 8):
         # eager: bytes_per_row = 2000 * 15 * 8 * 6 = 1,440,000 -> ~1640 rows

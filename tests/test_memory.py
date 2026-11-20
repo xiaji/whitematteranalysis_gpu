@@ -74,8 +74,15 @@ class MemoryTests(unittest.TestCase):
 
 
 class GPUMemoryTests(unittest.TestCase):
+    def _require_torch(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+        return torch
+
     def test_is_gpu_oom_detects_cuda_and_cublas_runtime_errors(self):
-        import torch
+        torch = self._require_torch()
         from whitematteranalysis.gpu import _memory as gpu_memory
 
         self.assertTrue(gpu_memory.is_gpu_oom(torch.cuda.OutOfMemoryError('oom')))
@@ -88,7 +95,7 @@ class GPUMemoryTests(unittest.TestCase):
 
     def test_effective_free_vram_respects_max_vram_gib_cap_and_disable_tf32(self):
         import importlib
-        import torch
+        torch = self._require_torch()
         from whitematteranalysis.gpu import _memory as gpu_memory
 
         gpu_config = importlib.import_module('whitematteranalysis.gpu.config')
@@ -121,7 +128,7 @@ class GPUMemoryTests(unittest.TestCase):
 
     def test_tiled_host_apis_fall_back_in_bounded_cpu_batches_on_tile_1_oom(self):
         import numpy as np
-        import torch
+        torch = self._require_torch()
         import whitematteranalysis as wma
         from whitematteranalysis.gpu import cpu_backend, distance
 

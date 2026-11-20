@@ -104,7 +104,10 @@ class RemoveOutliersTests(unittest.TestCase):
             np.testing.assert_array_equal(accelerated[1], expected_mask)
 
     def test_remove_outliers_gpu_uses_topk_without_full_matrix(self):
-        import torch
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
 
         cpu_device = torch.device('cpu')
         datasets = [
@@ -147,6 +150,27 @@ class RemoveOutliersTests(unittest.TestCase):
                 topk_mock.assert_called_once()
                 full_mock.assert_not_called()
                 self.assert_same_result(actual, expected)
+
+    def test_nearest_neighbor_distances_uses_exact_numpy_division(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+
+        data = fibers_at((0., 1., 2., 3.))
+        fa = wma.fibers.FiberArray()
+        fa.points_per_fiber = 10
+        fa.convert_from_polydata(data)
+        # Distances [0, 1, 2, 4] have sum 7; exact IEEE 7.0 / 3.0 == 2.3333333333333335
+        # whereas CUDA reciprocal multiply yields 2.333333333333333.
+        fake_row = torch.tensor([[0.0, 1.0, 2.0, 4.0]] * 4, dtype=torch.float64)
+        with patch.object(wma.gpu.distance, 'get_device', return_value=torch.device('cpu')), \
+                patch.object(wma.gpu.distance, '_fiber_block_distances', return_value=fake_row):
+            actual = wma.gpu.distance.nearest_neighbor_distances_from_fiber_array(
+                fa, k=3, distance_method='Mean')
+        expected = wma.filter._mean_nearest_neighbor_distance(fake_row.numpy())
+        np.testing.assert_array_equal(actual, expected)
+        self.assertEqual(float(actual[0]), 7.0 / 3.0)
 
 
 if __name__ == '__main__':

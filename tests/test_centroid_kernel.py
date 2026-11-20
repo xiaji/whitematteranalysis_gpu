@@ -138,7 +138,10 @@ class CentroidKernelTests(unittest.TestCase):
 
 class CentroidKernelApiTests(unittest.TestCase):
     def test_nearest_centroids_symbol_and_cpu_fallback(self):
-        import torch
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
         self.assertTrue(hasattr(distance_kernel, 'nearest_centroids'))
         self.assertTrue(callable(distance_kernel.nearest_centroids))
         query = torch.zeros((4, 10), dtype=torch.float64)

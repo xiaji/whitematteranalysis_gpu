@@ -91,7 +91,10 @@ class EmbeddingKernelTests(unittest.TestCase):
 
 class EmbeddingKernelCpuTests(unittest.TestCase):
     def test_in_place_and_col_sums_parity_cpu(self):
-        import torch
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
         torch.manual_seed(82)
         base = torch.randn((37, 19), dtype=torch.float64)
         for B_orig in (base, base.t()):

@@ -205,10 +205,13 @@ def _distance_matrix(Xn, Xm, threshold, distance_method='Hausdorff',
                 _warn_cpu_fallback('_distance_matrix', s, n)
                 from .cpu_backend import _distance_matrix as cpu_distance_matrix
                 batch_rows = _cpu_fallback_batch_rows(m, Xn.shape[1])
+                cpu_dtype = numpy.float64 if out_dtype == numpy.float64 else out_dtype
+                Xm_cpu = numpy.asarray(Xm, dtype=cpu_dtype)
                 for b0 in range(s, n, batch_rows):
                     b1 = min(b0 + batch_rows, n)
                     dist = cpu_distance_matrix(
-                        Xn[b0:b1], Xm, threshold, distance_method=distance_method,
+                        numpy.asarray(Xn[b0:b1], dtype=cpu_dtype), Xm_cpu,
+                        threshold, distance_method=distance_method,
                         bilateral=bilateral, sigmasq=sigmasq,
                         number_of_jobs=1, tile_rows=batch_rows)
                     if similarity_sigmasq is not None:
@@ -311,11 +314,14 @@ def nearest_neighbor_distances_from_fiber_array(fiber_array, k=3,
             q = torch.as_tensor(X[s:e], dtype=dtype, device=device)
             d = _fiber_block_distances(q, f, 0, distance_method, 6400)
             vals = torch.topk(d, k=topk_k, dim=1, largest=False, sorted=True).values
-            neighbors = vals[:, 1:]
+            neighbors = vals[:, 1:].cpu().numpy()
             if count == 3:
-                row_means = ((neighbors[:, 0] + neighbors[:, 1]) + neighbors[:, 2]) / 3.0
+                # Finish in NumPy for exact IEEE division (PyTorch CUDA / 3.0 multiplies by reciprocal).
+                row_means = numpy.asarray(
+                    (neighbors[:, 0] + neighbors[:, 1]) + neighbors[:, 2],
+                    dtype=numpy.float64) / 3.0
             else:
-                row_means = neighbors.mean(dim=1)
+                row_means = neighbors.mean(axis=-1, dtype=numpy.float64)
         except Exception as exc:
             if not _memory.is_gpu_oom(exc):
                 raise
@@ -324,23 +330,26 @@ def nearest_neighbor_distances_from_fiber_array(fiber_array, k=3,
                 _warn_cpu_fallback('nearest_neighbor_distances_from_fiber_array', s, n)
                 from .cpu_backend import _distance_matrix as cpu_distance_matrix
                 batch_rows = _cpu_fallback_batch_rows(n, X.shape[1])
+                X_cpu = numpy.asarray(X, dtype=numpy.float64 if dtype == torch.float64 else numpy.float32)
                 for b0 in range(s, n, batch_rows):
                     b1 = min(b0 + batch_rows, n)
                     distances = cpu_distance_matrix(
-                        X[b0:b1], X, 0, distance_method=distance_method,
+                        X_cpu[b0:b1], X_cpu, 0, distance_method=distance_method,
                         number_of_jobs=1, tile_rows=batch_rows)
                     nearest = numpy.partition(distances, count, axis=-1)[..., :count + 1]
                     nearest.sort(axis=-1)
                     nb = nearest[..., 1:]
                     if count == 3:
-                        out[b0:b1] = ((nb[:, 0] + nb[:, 1]) + nb[:, 2]) / 3.0
+                        out[b0:b1] = numpy.asarray(
+                            (nb[:, 0] + nb[:, 1]) + nb[:, 2],
+                            dtype=numpy.float64) / 3.0
                     else:
                         out[b0:b1] = nb.mean(axis=-1, dtype=numpy.float64)
                 break
             tr = max(1, (e - s) // 2)
             continue
 
-        out[s:e] = row_means.cpu().numpy()
+        out[s:e] = row_means
         s = e
 
     del f
@@ -383,8 +392,10 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
             and X_queries.shape[0] * X_fixed.shape[0] < config.min_pair_work
             and tile_rows is None):
         from .cpu_backend import _distance_matrix as cpu_distance_matrix
+        q_cpu = numpy.asarray(X_queries, dtype=numpy.float64)
+        f_cpu = numpy.asarray(X_fixed, dtype=numpy.float64)
         distances = cpu_distance_matrix(
-            X_queries, X_fixed, threshold, distance_method=distance_method,
+            q_cpu, f_cpu, threshold, distance_method=distance_method,
             bilateral=bilateral, sigmasq=sigmasq, number_of_jobs=1)
         similarity_sums = numpy.sum(numpy.exp(-distances / sigmasq), axis=1)
         if sqrt_distance_sums:
@@ -404,8 +415,9 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
         end = min(start + rows, n_queries)
         try:
             queries = torch.as_tensor(X_queries[start:end], dtype=dtype, device=device)
-            if (distance_kernel.triton is not None and dtype == torch.float64
-                    and distance_method == 'Mean' and queries.shape[1] <= 32
+            if (distance_kernel.triton is not None and queries.is_cuda and fixed.is_cuda
+                    and dtype == torch.float64
+                    and distance_method == 'Mean' and 0 < queries.shape[1] <= 32
                     and sigmasq > 0 and queries.is_contiguous() and fixed.is_contiguous()):
                 sim_sum, distance_sum = distance_kernel.similarity_row_sums(
                     queries, fixed, threshold, sigmasq,
@@ -429,10 +441,13 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
                 _warn_cpu_fallback('similarity_row_sums_from_arrays', start, n_queries)
                 from .cpu_backend import _distance_matrix as cpu_distance_matrix
                 batch_rows = _cpu_fallback_batch_rows(X_fixed.shape[0], X_queries.shape[1])
+                cpu_dtype = numpy.float64 if out_dtype == numpy.float64 else out_dtype
+                f_cpu = numpy.asarray(X_fixed, dtype=cpu_dtype)
                 for b0 in range(start, n_queries, batch_rows):
                     b1 = min(b0 + batch_rows, n_queries)
                     distances = cpu_distance_matrix(
-                        X_queries[b0:b1], X_fixed, threshold,
+                        numpy.asarray(X_queries[b0:b1], dtype=cpu_dtype), f_cpu,
+                        threshold,
                         distance_method=distance_method,
                         bilateral=bilateral, sigmasq=sigmasq,
                         number_of_jobs=1, tile_rows=batch_rows)
@@ -699,15 +714,17 @@ def total_similarity_matrix_strict(X_queries, X_fixed, reflect_mask, threshold,
                 _warn_cpu_fallback('total_similarity_matrix_strict', s, n)
                 from .cpu_backend import _distance_matrix as cpu_distance_matrix
                 batch_rows = _cpu_fallback_batch_rows(m, X_queries.shape[1])
+                cpu_dtype = numpy.float64 if out_dtype == numpy.float64 else out_dtype
+                f_cpu = numpy.asarray(X_fixed, dtype=cpu_dtype)
                 for b0 in range(s, n, batch_rows):
                     b1 = min(b0 + batch_rows, n)
-                    q_batch = X_queries[b0:b1]
+                    q_batch = numpy.asarray(X_queries[b0:b1], dtype=cpu_dtype)
                     batch_mask = reflect_mask[b0:b1]
                     if batch_mask.any():
-                        q_batch = numpy.array(q_batch, dtype=numpy.float64, copy=True)
+                        q_batch = numpy.array(q_batch, dtype=cpu_dtype, copy=True)
                         q_batch[batch_mask, :, 0] *= -1.0
                     values = cpu_distance_matrix(
-                        q_batch, X_fixed, threshold,
+                        q_batch, f_cpu, threshold,
                         distance_method='StrictSimilarity',
                         sigmasq=sigmasq, number_of_jobs=1, tile_rows=batch_rows)
                     if out_dtype == numpy.float32:

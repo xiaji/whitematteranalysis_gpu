@@ -79,7 +79,10 @@ class CLIOutlierReductionTests(unittest.TestCase):
                                        [2., 2.5, .5333333333333333, .75])
 
     def test_gpu_multiworker_uses_threads_preserves_cli_flags_and_cluster_order(self):
-        import torch
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
 
         saved_cfg = {name: getattr(wma.gpu.config, name)
                      for name in ('requested', 'float32', 'devices', 'device_index')}

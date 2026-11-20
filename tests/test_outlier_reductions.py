@@ -244,6 +244,61 @@ class BoundaryRefinementTests(unittest.TestCase):
         self.assertIs(actual_subject, subject)
         self.assertIs(actual_atlas, atlas)
 
+    def test_small_cluster_and_oom_fallback_promote_float32_to_float64(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+
+        rng = np.random.RandomState(61)
+        q32 = rng.normal(size=(4, 15, 3)).astype(np.float32)
+        f32 = rng.normal(size=(4, 15, 3)).astype(np.float32)
+        q64 = q32.astype(np.float64)
+        f64 = f32.astype(np.float64)
+        ref_d = cpu_backend._distance_matrix(
+            q64, f64, 0., distance_method='Mean', sigmasq=self.sigma_sq, number_of_jobs=1)
+        ref_sim = np.exp(-ref_d / self.sigma_sq).sum(1)
+        ref_dist = np.sqrt(ref_d).sum(1)
+
+        # Small-cluster CPU shortcut with float32 inputs and gpu_float32=False
+        sim_small, dist_small = distance.similarity_row_sums_from_arrays(
+            q32, f32, 0., distance_method='Mean', sigmasq=self.sigma_sq,
+            gpu_float32=False, sqrt_distance_sums=True)
+        self.assertEqual(sim_small.dtype, np.float64)
+        self.assertEqual(dist_small.dtype, np.float64)
+        np.testing.assert_array_equal(sim_small, ref_sim)
+        np.testing.assert_array_equal(dist_small, ref_dist)
+
+        # OOM fallback at tile_rows=1 with float32 inputs and gpu_float32=False
+        with patch.object(distance, 'get_device', return_value=torch.device('cpu')), \
+                patch.object(distance, '_fiber_block_distances',
+                             side_effect=RuntimeError('CUDA out of memory')), \
+                patch.object(torch.cuda, 'empty_cache'):
+            sim_oom, dist_oom = distance.similarity_row_sums_from_arrays(
+                q32, f32, 0., distance_method='Mean', sigmasq=self.sigma_sq,
+                gpu_float32=False, tile_rows=1, sqrt_distance_sums=True)
+        self.assertEqual(sim_oom.dtype, np.float64)
+        self.assertEqual(dist_oom.dtype, np.float64)
+        np.testing.assert_array_equal(sim_oom, ref_sim)
+        np.testing.assert_array_equal(dist_oom, ref_dist)
+
+    def test_fused_row_sums_requires_cuda_tensors_even_when_triton_enabled(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+
+        q = np.zeros((7, 15, 3), dtype=np.float64)
+        f = np.ones((11, 15, 3), dtype=np.float64)
+        with patch.object(distance, 'get_device', return_value=torch.device('cpu')), \
+                patch.object(distance.distance_kernel, 'triton', object()):
+            actual = distance.similarity_row_sums_from_arrays(
+                q, f, 0., distance_method='Mean', sigmasq=self.sigma_sq, tile_rows=4)
+        ref_d = cpu_backend._distance_matrix(
+            q, f, 0., distance_method='Mean', sigmasq=self.sigma_sq, number_of_jobs=1)
+        expected = np.exp(-ref_d / self.sigma_sq).sum(1)
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
     def test_refinement_band_catches_1e_13_score_and_cutoff_perturbation(self):
         rng = np.random.RandomState(20261120)
         atlas = rng.normal(size=(9, 15, 3)) * 5.

@@ -131,7 +131,10 @@ class AtlasTests(unittest.TestCase):
 
 class AtlasBlocksCpuTests(unittest.TestCase):
     def test_atlas_label_embedding_blocks_single_d2h_transfer_cpu(self):
-        import torch
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
         rng = np.random.RandomState(44)
         atlas = types.SimpleNamespace(number_of_eigenvectors=3,
             row_sum_1=np.ones(11), row_sum_matrix=rng.uniform(0, .1, 11),
