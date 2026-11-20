@@ -227,9 +227,11 @@ def nearest_centroids(queries, centroids):
 
     nq = queries.shape[0]
     nc = centroids.shape[0]
+    if nc == 0:
+        raise IndexError('centroids must be non-empty')
     min_distances = torch.empty((nq,), dtype=queries.dtype, device=queries.device)
     best_indices = torch.empty((nq,), dtype=torch.int64, device=queries.device)
-    if nq == 0 or nc == 0:
+    if nq == 0:
         return min_distances, best_indices
     dimensions = queries.shape[1]
     block_c = 64 if dimensions <= 16 else 32
