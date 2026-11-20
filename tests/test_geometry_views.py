@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from unittest.mock import patch
+
 import numpy as np
 import vtk
 from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
@@ -99,6 +101,85 @@ class GeometryViewTests(unittest.TestCase):
         actual = wma.filter._gather_conn(connectivity, offsets, selected)
         for a, b in zip(expected, actual):
             np.testing.assert_array_equal(a, b)
+
+    def test_fiber_array_chunked_conversion_matches_vtk_loop_across_chunk_boundary(self):
+        rng = np.random.RandomState(51)
+        n_lines = 5000
+        lengths = rng.randint(2, 20, size=n_lines, dtype=np.int64)
+        offsets = np.r_[0, lengths.cumsum()]
+        count = int(offsets[-1])
+        coords = rng.normal(size=(count, 3)).astype(np.float32)
+        points = vtk.vtkPoints()
+        points.SetData(numpy_to_vtk(coords, deep=True))
+        lines = vtk.vtkCellArray()
+        lines.SetData(numpy_to_vtk(offsets, deep=True),
+                      numpy_to_vtk(np.arange(count, dtype=np.int64), deep=True))
+        data = vtk.vtkPolyData()
+        data.SetPoints(points)
+        data.SetLines(lines)
+
+        vec = wma.fibers.FiberArray()
+        vec.convert_from_polydata(data, points_per_fiber=15)
+
+        loop = wma.fibers.FiberArray()
+        with patch.object(wma.fibers.FiberArray, '_convert_from_polydata_vectorized',
+                          return_value=False):
+            loop.convert_from_polydata(data, points_per_fiber=15)
+
+        for name in ('fiber_array_r', 'fiber_array_a', 'fiber_array_s'):
+            np.testing.assert_array_equal(getattr(vec, name), getattr(loop, name))
+
+    def test_fiber_array_vectorized_rejects_malformed_offsets_and_falls_back(self):
+        def make_fake_polydata(offsets, conn, n_points):
+            class _FakeLines:
+                def GetOffsetsArray(self):
+                    return numpy_to_vtk(np.asarray(offsets, dtype=np.int64), deep=True)
+                def GetConnectivityArray(self):
+                    return numpy_to_vtk(np.asarray(conn, dtype=np.int64), deep=True)
+            class _FakePoints:
+                def GetData(self):
+                    return numpy_to_vtk(np.zeros((n_points, 3), dtype=np.float32), deep=True)
+            class _FakePolyData:
+                def GetLines(self):
+                    return _FakeLines()
+                def GetPoints(self):
+                    return _FakePoints()
+            return _FakePolyData()
+
+        cases = [
+            ('negative_start_offset', [-1, 2, 4], [0, 1, 2, 3], 4),
+            ('offset_past_conn', [0, 2, 6], [0, 1, 2, 3], 4),
+            ('zero_length_line', [0, 2, 2], [0, 1], 4),
+            ('non_monotonic_offsets', [0, 3, 2], [0, 1, 2], 4),
+            ('negative_point_id', [0, 2, 4], [0, -1, 2, 3], 4),
+            ('point_id_out_of_bounds', [0, 2, 4], [0, 1, 2, 4], 4),
+        ]
+        for label, offsets, conn, n_points in cases:
+            with self.subTest(case=label):
+                fa = wma.fibers.FiberArray()
+                fa.number_of_fibers = len(offsets) - 1
+                fa.points_per_fiber = 5
+                fa.fiber_array_r = np.zeros((fa.number_of_fibers, fa.points_per_fiber))
+                fa.fiber_array_a = np.zeros((fa.number_of_fibers, fa.points_per_fiber))
+                fa.fiber_array_s = np.zeros((fa.number_of_fibers, fa.points_per_fiber))
+                self.assertFalse(
+                    fa._convert_from_polydata_vectorized(
+                        make_fake_polydata(offsets, conn, n_points)))
+
+    def test_gather_conn_arange_and_interior_permutation(self):
+        offsets = np.array([0, 2, 5], dtype=np.int64)
+        keep = np.array([1, 0], dtype=np.int64)
+        cases = [
+            ('arange', np.arange(5, dtype=np.int64)),
+            ('reversed', np.arange(5, dtype=np.int64)[::-1].copy()),
+            ('interior_permutation', np.array([0, 1, 3, 2, 4], dtype=np.int64)),
+        ]
+        for label, conn in cases:
+            with self.subTest(case=label):
+                expected_sel, expected_off = self.old_filter._gather_conn(conn, offsets, keep)
+                actual_sel, actual_off = wma.filter._gather_conn(conn, offsets, keep)
+                np.testing.assert_array_equal(actual_sel, expected_sel)
+                np.testing.assert_array_equal(actual_off, expected_off)
 
 
 if __name__ == '__main__':

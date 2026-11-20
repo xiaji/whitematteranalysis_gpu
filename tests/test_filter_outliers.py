@@ -103,6 +103,51 @@ class RemoveOutliersTests(unittest.TestCase):
             np.testing.assert_array_equal(reference[1], expected_mask)
             np.testing.assert_array_equal(accelerated[1], expected_mask)
 
+    def test_remove_outliers_gpu_uses_topk_without_full_matrix(self):
+        import torch
+
+        cpu_device = torch.device('cpu')
+        datasets = [
+            ('n0', ()),
+            ('n1', (0.,)),
+            ('n2', (0., 1.)),
+            ('n3', (0., 1., 3.)),
+            ('n5', (0., 1., 2., 3., 100.)),
+            ('duplicates', (0., 0., 0., 0., 5., 5., 50.)),
+        ]
+        for label, xs in datasets:
+            with self.subTest(case=label):
+                data = fibers_at(xs)
+                expected = self.run_cpu_fast(data, 10.)
+                fa = wma.fibers.FiberArray()
+                fa.points_per_fiber = 10
+                fa.convert_from_polydata(data)
+                if len(xs) > 0:
+                    coords = wma.gpu.fiber_tensors.fiber_array_to_numpy(
+                        fa, coordinate_major=True)
+                    ref_dist = wma.gpu.cpu_backend._distance_matrix(
+                        coords, coords, 0, distance_method='Mean', number_of_jobs=1)
+                    ref_mindist = wma.filter._mean_nearest_neighbor_distance(ref_dist)
+                else:
+                    ref_mindist = np.empty(0, dtype=np.float64)
+
+                with patch.object(wma.gpu.distance, 'get_device', return_value=cpu_device):
+                    actual_mindist = wma.gpu.distance.nearest_neighbor_distances_from_fiber_array(
+                        fa, k=3, distance_method='Mean')
+                np.testing.assert_allclose(actual_mindist, ref_mindist, rtol=1e-12, atol=1e-12)
+
+                orig_topk = wma.gpu.distance.nearest_neighbor_distances_from_fiber_array
+                with patch.object(wma.gpu, 'use_gpu', return_value=True), \
+                        patch.object(wma.gpu.distance, 'get_device', return_value=cpu_device), \
+                        patch.object(wma.gpu.distance, 'nearest_neighbor_distances_from_fiber_array',
+                                     wraps=orig_topk) as topk_mock, \
+                        patch.object(wma.gpu.distance, 'pairwise_distance_matrix_from_fiber_array',
+                                     side_effect=AssertionError('must not allocate full matrix')) as full_mock:
+                    actual = wma.filter.remove_outliers(data, 10., n_jobs=1, distance_method='Mean')
+                topk_mock.assert_called_once()
+                full_mock.assert_not_called()
+                self.assert_same_result(actual, expected)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -17,9 +17,9 @@ from .config import float32_enabled, get_device
 
 @lru_cache(maxsize=4)
 def _implementation(backend, float32, device_index):
-    files = ('fibers.py', 'filter.py', 'io.py', 'similarity.py', 'gpu/fiber_tensors.py',
-             'gpu/cpu_backend.py', 'gpu/distance.py', 'gpu/distance_kernel.py',
-             'gpu/registration_kernel.py', 'gpu/atlas_cache.py')
+    files = ('fibers.py', 'filter.py', 'io.py', 'similarity.py', 'gpu/_memory.py',
+             'gpu/fiber_tensors.py', 'gpu/cpu_backend.py', 'gpu/distance.py',
+             'gpu/distance_kernel.py', 'gpu/registration_kernel.py', 'gpu/atlas_cache.py')
     root = Path(__file__).resolve().parents[1]
     digest = hashlib.sha256()
     for name in files:

@@ -95,6 +95,39 @@ class LateralityTests(unittest.TestCase):
     def test_cpu_pipeline_matches_full_and_serial(self):
         self.compare_pipeline(False)
 
+    def test_total_similarity_strict_row_sum_matches_matrix_sum(self):
+        import torch
+
+        rng = np.random.RandomState(52)
+        queries = rng.normal(size=(17, 15, 3))
+        fixed = rng.normal(size=(29, 15, 3))
+        masks = [
+            ('all_false', np.zeros(17, dtype=bool)),
+            ('all_true', np.ones(17, dtype=bool)),
+            ('alternating', np.arange(17) % 2 == 0),
+        ]
+        cpu_device = torch.device('cpu')
+        before = queries.copy()
+        with patch.object(distance, 'get_device', return_value=cpu_device):
+            for label, reflect_mask in masks:
+                for float32 in (False, True):
+                    with self.subTest(mask=label, float32=float32):
+                        matrix = distance.total_similarity_matrix_strict(
+                            queries, fixed, reflect_mask, .1, 400.,
+                            gpu_float32=float32, tile_rows=5, row_sum=False)
+                        row_sums = distance.total_similarity_matrix_strict(
+                            queries, fixed, reflect_mask, .1, 400.,
+                            gpu_float32=float32, tile_rows=5, row_sum=True)
+                        np.testing.assert_array_equal(row_sums, matrix.sum(1))
+                        self.assertEqual(row_sums.dtype,
+                                         np.float32 if float32 else np.float64)
+                        if not float32:
+                            expected = cpu.total_similarity_matrix_strict(
+                                queries, fixed, reflect_mask, .1, 400., row_sum=True)
+                            np.testing.assert_allclose(row_sums, expected,
+                                                       rtol=1e-12, atol=1e-12)
+        np.testing.assert_array_equal(queries, before)
+
 
 @unittest.skipUnless(wma.gpu.available(), 'CUDA is required')
 class GPULateralityTests(unittest.TestCase):
@@ -126,14 +159,14 @@ class GPULateralityTests(unittest.TestCase):
         import torch
         queries, fixed = np.zeros((5, 15, 3)), np.zeros((3, 15, 3))
         functions = (
-            lambda rows: distance.distance_matrix_from_arrays(queries, fixed, 0., tile_rows=rows),
-            lambda rows: distance.rectangular_similarity_tensor(polydata(5), polydata(3), 0., 20., tile_rows=rows),
-            lambda rows: distance.total_similarity_matrix_strict(queries, fixed, np.array([1, 0, 1, 0, 1], bool),
-                                                                 0., 400., tile_rows=rows, row_sum=True))
+            (False, lambda rows: distance.distance_matrix_from_arrays(queries, fixed, 0., tile_rows=rows)),
+            (True, lambda rows: distance.rectangular_similarity_tensor(polydata(5), polydata(3), 0., 20., tile_rows=rows)),
+            (False, lambda rows: distance.total_similarity_matrix_strict(
+                queries, fixed, np.array([1, 0, 1, 0, 1], bool), 0., 400., tile_rows=rows, row_sum=True)))
         original = distance._fiber_block_distances
         def array(value):
             return value.cpu().numpy() if isinstance(value, torch.Tensor) else value
-        for function in functions:
+        for reraises_at_one, function in functions:
             expected = array(function(2))
             sizes = []
             def constrained(q, *args, **kwargs):
@@ -153,8 +186,11 @@ class GPULateralityTests(unittest.TestCase):
                     raise AssertionError('Retry did not terminate at one row')
                 raise torch.cuda.OutOfMemoryError('test exhausted device')
             with patch.object(distance, '_fiber_block_distances', side_effect=exhausted):
-                with self.assertRaises(torch.cuda.OutOfMemoryError):
-                    function(8192)
+                if reraises_at_one:
+                    with self.assertRaises(torch.cuda.OutOfMemoryError):
+                        function(8192)
+                else:
+                    np.testing.assert_allclose(array(function(8192)), expected, rtol=1e-12, atol=1e-12)
             self.assertEqual(sizes, [5, 2, 1])
 
 

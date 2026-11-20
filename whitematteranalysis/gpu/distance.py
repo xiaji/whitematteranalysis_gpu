@@ -34,7 +34,7 @@ try:
 except ImportError:  # allow import of this module without torch
     torch = None
 
-from . import fiber_tensors, distance_kernel
+from . import fiber_tensors, distance_kernel, _memory
 
 # Methods with a GPU implementation. Landmarks/Frechet/Mean_shape stay
 # on the CPU path (see gpu.distance_supported).
@@ -146,13 +146,19 @@ def _choose_tile_rows(n, m, points_per_fiber, dtype, device, override=None,
     else:
         # a handful of (b, m, P) temporaries are alive at once
         bytes_per_query_fiber = m * points_per_fiber * itemsize * 6
-    try:
-        free_bytes, _total = torch.cuda.mem_get_info(device)
-    except Exception:
-        free_bytes = 4 << 30
+    free_bytes = _memory.effective_free_vram(device)
     budget = max(256 << 20, int(free_bytes * 0.55))
     tile_rows = int(budget // max(1, bytes_per_query_fiber))
     return max(16, min(tile_rows, 16384, n))
+
+
+def _cpu_fallback_batch_rows(m, points_per_fiber):
+    return max(1, (16 << 20) // max(8, m * points_per_fiber * 8 * 12))
+
+
+def _warn_cpu_fallback(api_name, start, total):
+    print(f"<{__name__}> GPU out of memory at tile size 1 in {api_name}; "
+          f"falling back to bounded CPU batches for rows {start}:{total}")
 
 
 def _distance_matrix(Xn, Xm, threshold, distance_method='Hausdorff',
@@ -169,6 +175,7 @@ def _distance_matrix(Xn, Xm, threshold, distance_method='Hausdorff',
     if torch is None:
         raise RuntimeError("torch is not available, cannot use the GPU distance backend.")
 
+    _memory.disable_tf32()
     device = get_device()
     dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
     out_dtype = numpy.float32 if dtype == torch.float32 else numpy.float64
@@ -190,10 +197,24 @@ def _distance_matrix(Xn, Xm, threshold, distance_method='Hausdorff',
             q = torch.as_tensor(Xn[s:e], dtype=dtype, device=device)
             d = _fiber_block_distances(q, f, threshold, distance_method, sigmasq, bilateral,
                                        similarity_sigmasq=similarity_sigmasq)
-        except torch.cuda.OutOfMemoryError:
-            if e - s == 1:
+        except Exception as exc:
+            if not _memory.is_gpu_oom(exc):
                 raise
             torch.cuda.empty_cache()
+            if e - s == 1:
+                _warn_cpu_fallback('_distance_matrix', s, n)
+                from .cpu_backend import _distance_matrix as cpu_distance_matrix
+                batch_rows = _cpu_fallback_batch_rows(m, Xn.shape[1])
+                for b0 in range(s, n, batch_rows):
+                    b1 = min(b0 + batch_rows, n)
+                    dist = cpu_distance_matrix(
+                        Xn[b0:b1], Xm, threshold, distance_method=distance_method,
+                        bilateral=bilateral, sigmasq=sigmasq,
+                        number_of_jobs=1, tile_rows=batch_rows)
+                    if similarity_sigmasq is not None:
+                        dist = numpy.exp(-dist / similarity_sigmasq)
+                    out[b0:b1] = dist
+                break
             tr = max(1, (e - s) // 2)
             print(f"<{__name__}> GPU out of memory, retrying with tile size {tr}")
             continue
@@ -254,6 +275,78 @@ def distance_matrix_from_arrays(Xn, Xm, threshold, distance_method='Hausdorff',
                             sigmasq, gpu_float32, tile_rows)
 
 
+def nearest_neighbor_distances_from_fiber_array(fiber_array, k=3,
+                                                distance_method='Mean',
+                                                gpu_float32=None,
+                                                tile_rows=None):
+    """Mean distance to the *k* nearest non-self neighbors per fiber on GPU.
+
+    Uses tiled GPU top-k reductions so the full (N, N) pairwise distance matrix
+    is never materialized on host RAM. Matches filter._mean_nearest_neighbor_distance.
+    """
+
+    if torch is None:
+        raise RuntimeError("torch is not available, cannot use the GPU distance backend.")
+
+    _memory.disable_tf32()
+    X = fiber_tensors.fiber_array_to_numpy(fiber_array)
+    n = X.shape[0]
+    if n == 0:
+        return numpy.empty(0, dtype=numpy.float64)
+    if n == 1:
+        return numpy.full(1, numpy.inf, dtype=numpy.float64)
+
+    count = min(int(k), n - 1)
+    topk_k = min(count + 1, n)
+    device = get_device()
+    dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
+    out = numpy.empty(n, dtype=numpy.float64)
+
+    f = torch.as_tensor(X, dtype=dtype, device=device)
+    tr = _choose_tile_rows(n, n, X.shape[1], dtype, device, override=tile_rows)
+    s = 0
+    while s < n:
+        e = min(s + tr, n)
+        try:
+            q = torch.as_tensor(X[s:e], dtype=dtype, device=device)
+            d = _fiber_block_distances(q, f, 0, distance_method, 6400)
+            vals = torch.topk(d, k=topk_k, dim=1, largest=False, sorted=True).values
+            neighbors = vals[:, 1:]
+            if count == 3:
+                row_means = ((neighbors[:, 0] + neighbors[:, 1]) + neighbors[:, 2]) / 3.0
+            else:
+                row_means = neighbors.mean(dim=1)
+        except Exception as exc:
+            if not _memory.is_gpu_oom(exc):
+                raise
+            torch.cuda.empty_cache()
+            if e - s == 1:
+                _warn_cpu_fallback('nearest_neighbor_distances_from_fiber_array', s, n)
+                from .cpu_backend import _distance_matrix as cpu_distance_matrix
+                batch_rows = _cpu_fallback_batch_rows(n, X.shape[1])
+                for b0 in range(s, n, batch_rows):
+                    b1 = min(b0 + batch_rows, n)
+                    distances = cpu_distance_matrix(
+                        X[b0:b1], X, 0, distance_method=distance_method,
+                        number_of_jobs=1, tile_rows=batch_rows)
+                    nearest = numpy.partition(distances, count, axis=-1)[..., :count + 1]
+                    nearest.sort(axis=-1)
+                    nb = nearest[..., 1:]
+                    if count == 3:
+                        out[b0:b1] = ((nb[:, 0] + nb[:, 1]) + nb[:, 2]) / 3.0
+                    else:
+                        out[b0:b1] = nb.mean(axis=-1, dtype=numpy.float64)
+                break
+            tr = max(1, (e - s) // 2)
+            continue
+
+        out[s:e] = row_means.cpu().numpy()
+        s = e
+
+    del f
+    return out
+
+
 def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
                                     distance_method='Mean', bilateral=False,
                                     sigmasq=400., gpu_float32=None,
@@ -299,14 +392,16 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
             return similarity_sums, distance_sums
         return similarity_sums
 
+    _memory.disable_tf32()
     device = get_device()
     fixed = torch.as_tensor(X_fixed, dtype=dtype, device=device)
     rows = _choose_tile_rows(X_queries.shape[0], X_fixed.shape[0],
                              X_queries.shape[1], dtype, device,
                              override=tile_rows)
+    n_queries = X_queries.shape[0]
     start = 0
-    while start < X_queries.shape[0]:
-        end = min(start + rows, X_queries.shape[0])
+    while start < n_queries:
+        end = min(start + rows, n_queries)
         try:
             queries = torch.as_tensor(X_queries[start:end], dtype=dtype, device=device)
             if (distance_kernel.triton is not None and dtype == torch.float64
@@ -326,10 +421,26 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
                 similarities = torch.exp(-distances / sigmasq)
                 sim_sum = similarities.sum(dim=1)
                 distance_sum = distances.sqrt().sum(dim=1)
-        except torch.cuda.OutOfMemoryError:
-            if end - start == 1:
+        except Exception as exc:
+            if not _memory.is_gpu_oom(exc):
                 raise
             torch.cuda.empty_cache()
+            if end - start == 1:
+                _warn_cpu_fallback('similarity_row_sums_from_arrays', start, n_queries)
+                from .cpu_backend import _distance_matrix as cpu_distance_matrix
+                batch_rows = _cpu_fallback_batch_rows(X_fixed.shape[0], X_queries.shape[1])
+                for b0 in range(start, n_queries, batch_rows):
+                    b1 = min(b0 + batch_rows, n_queries)
+                    distances = cpu_distance_matrix(
+                        X_queries[b0:b1], X_fixed, threshold,
+                        distance_method=distance_method,
+                        bilateral=bilateral, sigmasq=sigmasq,
+                        number_of_jobs=1, tile_rows=batch_rows)
+                    similarity_sums[b0:b1] = numpy.sum(
+                        numpy.exp(-distances / sigmasq), axis=1)
+                    if sqrt_distance_sums:
+                        distance_sums[b0:b1] = numpy.sum(numpy.sqrt(distances), axis=1)
+                break
             rows = max(1, (end - start) // 2)
             continue
 
@@ -456,6 +567,7 @@ def rectangular_similarity_tensor(input_polydata_n, input_polydata_m, threshold,
     if torch is None:
         raise RuntimeError("torch is not available, cannot use the GPU distance backend.")
 
+    _memory.disable_tf32()
     device = get_device()
     dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
 
@@ -475,7 +587,9 @@ def rectangular_similarity_tensor(input_polydata_n, input_polydata_m, threshold,
             q = torch.as_tensor(Xn[s:e], dtype=dtype, device=device)
             d = _fiber_block_distances(q, f, threshold, distance_method, sigmasq, bilateral,
                 similarity_sigmasq=sigma * sigma if distance_method != 'StrictSimilarity' else None)
-        except torch.cuda.OutOfMemoryError:
+        except Exception as exc:
+            if not _memory.is_gpu_oom(exc):
+                raise
             if e - s == 1:
                 raise
             torch.cuda.empty_cache()
@@ -494,6 +608,7 @@ def iter_rectangular_similarity(input_polydata_n, input_polydata_m, threshold,
                                sigmasq=6400, points_per_fiber=15,
                                gpu_float32=None, tile_rows=None):
     """Yield (start, (atlas_sample, input_block)) GPU similarity blocks."""
+    _memory.disable_tf32()
     device = get_device()
     dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
     queries = fiber_tensors.polydata_to_numpy(input_polydata_n, points_per_fiber)
@@ -513,7 +628,9 @@ def iter_rectangular_similarity(input_polydata_n, input_polydata_m, threshold,
         try:
             block = _similarity_tensor_block(queries_t[start:end], fixed, threshold,
                                              sigma, distance_method, bilateral, sigmasq)
-        except torch.cuda.OutOfMemoryError:
+        except Exception as exc:
+            if not _memory.is_gpu_oom(exc):
+                raise
             if end - start == 1:
                 raise
             rows = max(1, (end - start) // 2)
@@ -547,6 +664,7 @@ def total_similarity_matrix_strict(X_queries, X_fixed, reflect_mask, threshold,
     if torch is None:
         raise RuntimeError("torch is not available, cannot use the GPU distance backend.")
 
+    _memory.disable_tf32()
     device = get_device()
     dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
     out_dtype = numpy.float32 if dtype == torch.float32 else numpy.float64
@@ -554,10 +672,12 @@ def total_similarity_matrix_strict(X_queries, X_fixed, reflect_mask, threshold,
     f = torch.as_tensor(X_fixed, dtype=dtype, device=device)
     q_all = torch.as_tensor(X_queries, dtype=torch.float64)
     reflect_mask = numpy.asarray(reflect_mask, dtype=bool)
+    mask_gpu = torch.as_tensor(reflect_mask, dtype=torch.bool, device=device)
 
     out = numpy.empty(X_queries.shape[0] if row_sum else (X_queries.shape[0], X_fixed.shape[0]), dtype=out_dtype)
     n = X_queries.shape[0]
-    tr = _choose_tile_rows(n, X_fixed.shape[0], X_queries.shape[1], dtype,
+    m = X_fixed.shape[0]
+    tr = _choose_tile_rows(n, m, X_queries.shape[1], dtype,
                            device, override=tile_rows)
 
     s = 0
@@ -565,17 +685,35 @@ def total_similarity_matrix_strict(X_queries, X_fixed, reflect_mask, threshold,
         e = min(s + tr, n)
         try:
             q = q_all[s:e].to(device=device, dtype=dtype)
-            if reflect_mask[s:e].any():
-                idx = numpy.nonzero(reflect_mask[s:e])[0]
-                q_reflect = q[idx]
-                q_reflect[:, :, 0] = -q_reflect[:, :, 0]
-                q[idx] = q_reflect
+            sign = torch.where(mask_gpu[s:e], -1.0, 1.0).to(dtype=dtype)
+            if q.device.type == 'cpu':
+                q = q.clone()
+            q[:, :, 0] *= sign[:, None]
             sim = _fiber_block_distances(q, f, threshold, 'StrictSimilarity',
                                          sigmasq)
-        except torch.cuda.OutOfMemoryError:
-            if e - s == 1:
+        except Exception as exc:
+            if not _memory.is_gpu_oom(exc):
                 raise
             torch.cuda.empty_cache()
+            if e - s == 1:
+                _warn_cpu_fallback('total_similarity_matrix_strict', s, n)
+                from .cpu_backend import _distance_matrix as cpu_distance_matrix
+                batch_rows = _cpu_fallback_batch_rows(m, X_queries.shape[1])
+                for b0 in range(s, n, batch_rows):
+                    b1 = min(b0 + batch_rows, n)
+                    q_batch = X_queries[b0:b1]
+                    batch_mask = reflect_mask[b0:b1]
+                    if batch_mask.any():
+                        q_batch = numpy.array(q_batch, dtype=numpy.float64, copy=True)
+                        q_batch[batch_mask, :, 0] *= -1.0
+                    values = cpu_distance_matrix(
+                        q_batch, X_fixed, threshold,
+                        distance_method='StrictSimilarity',
+                        sigmasq=sigmasq, number_of_jobs=1, tile_rows=batch_rows)
+                    if out_dtype == numpy.float32:
+                        values = values.astype(numpy.float32, copy=False)
+                    out[b0:b1] = values.sum(1) if row_sum else values
+                break
             tr = max(1, (e - s) // 2)
             continue
         values = sim.cpu().numpy()

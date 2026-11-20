@@ -422,31 +422,42 @@ class FiberArray:
         number_of_lines = len(offsets) - 1
         if number_of_lines != self.number_of_fibers:
             return False
+        if number_of_lines == 0:
+            return True
+
+        line_lengths = offsets[1:] - offsets[:-1]
+        if (offsets[0] < 0 or offsets[-1] > len(conn)
+                or not bool(numpy.all(line_lengths >= 1))):
+            return False
+        if len(conn) > 0 and (int(conn.min()) < 0 or int(conn.max()) >= len(points)):
+            return False
 
         P = self.points_per_fiber
-        line_lengths = offsets[1:] - offsets[:-1]
+        pt_range = numpy.arange(P, dtype=numpy.float64)
+        for first in range(0, number_of_lines, 4096):
+            last = min(first + 4096, number_of_lines)
+            chunk_lengths = line_lengths[first:last]
+            # step = (input_line_length - 1.0) / (output_line_length - 1.0)
+            steps = (chunk_lengths.astype(numpy.float64) - 1.0) / (P - 1.0)
+            # ptlist.append(ptidx * step) for ptidx in range(P)
+            positions = pt_range * steps[:, numpy.newaxis]
+            # int(round(...)): round-half-to-even in both Python and numpy
+            local_ids = numpy.rint(positions).astype(numpy.int64)
 
-        # step = (input_line_length - 1.0) / (output_line_length - 1.0)
-        steps = (line_lengths.astype(numpy.float64) - 1.0) / (P - 1.0)
-        # ptlist.append(ptidx * step) for ptidx in range(P)
-        positions = numpy.arange(P, dtype=numpy.float64) * steps[:, numpy.newaxis]
-        # int(round(...)): round-half-to-even in both Python and numpy
-        local_ids = numpy.rint(positions).astype(numpy.int64)
+            # same sanity check as _calculate_line_indices: last point is included
+            if __debug__:
+                test = bool(numpy.all(local_ids[:, -1] == (chunk_lengths - 1)))
+                if not test:
+                    print(f"<{os.path.basename(__file__)}> ERROR: fiber numbers don't add up.")
+                    raise AssertionError
 
-        # same sanity check as _calculate_line_indices: last point is included
-        if __debug__ and self.number_of_fibers > 0:
-            test = bool(numpy.all(local_ids[:, -1] == (line_lengths - 1)))
-            if not test:
-                print(f"<{os.path.basename(__file__)}> ERROR: fiber numbers don't add up.")
-                raise AssertionError
+            # nearest neighbor lookup of the original point ids
+            global_ids = conn[offsets[first:last, numpy.newaxis] + local_ids]
 
-        # nearest neighbor lookup of the original point ids
-        global_ids = conn[offsets[:-1][:, numpy.newaxis] + local_ids]
-
-        pts = points[global_ids]  # (n, P, 3) float32, exact upcast below
-        self.fiber_array_r[:] = pts[:, :, 0]
-        self.fiber_array_a[:] = pts[:, :, 1]
-        self.fiber_array_s[:] = pts[:, :, 2]
+            pts = points[global_ids]  # (chunk, P, 3) float32, exact upcast below
+            self.fiber_array_r[first:last] = pts[:, :, 0]
+            self.fiber_array_a[first:last] = pts[:, :, 1]
+            self.fiber_array_s[first:last] = pts[:, :, 2]
         return True
             
     def calculate_hemispheres(self):

@@ -68,6 +68,7 @@ def _gather_conn(conn, offsets, keep_indices):
         return numpy.zeros(0, dtype=numpy.int64), numpy.zeros(keep_indices.size + 1, dtype=numpy.int64)
     out_offsets = numpy.zeros(keep_indices.size + 1, dtype=numpy.int64)
     numpy.cumsum(lengths, out=out_offsets[1:])
+    conn_is_arange = conn.size == 0 or (conn[0] == 0 and bool(numpy.all(conn[1:] == conn[:-1] + 1)))
     # Build source IDs in line batches instead of allocating two full-size
     # temporary index arrays for a whole-brain tractogram.
     selected = numpy.empty(total, dtype=numpy.int64)
@@ -77,7 +78,10 @@ def _gather_conn(conn, offsets, keep_indices):
         idx = numpy.arange(end - begin, dtype=numpy.int64)
         idx += numpy.repeat(starts[first:last] - out_offsets[first:last] + begin,
                             lengths[first:last])
-        selected[begin:end] = conn[idx]
+        if conn_is_arange:
+            selected[begin:end] = idx
+        else:
+            selected[begin:end] = conn[idx]
     return selected, out_offsets
 
 
@@ -817,8 +821,8 @@ def remove_outliers(inpd, min_fiber_distance, n_jobs=0, distance_method ='Mean')
     distances_matrix = None
     if gpu.use_gpu() and gpu.distance.distance_supported(distance_method):
         print(f"<{os.path.basename(__file__)}> Computing pairwise distances on GPU.")
-        distances_matrix = gpu.distance.pairwise_distance_matrix_from_fiber_array(
-            fiber_array, 0, distance_method=distance_method)
+        mindist = gpu.distance.nearest_neighbor_distances_from_fiber_array(
+            fiber_array, k=3, distance_method=distance_method)
     elif gpu.config.cpu_fast_enabled() and gpu.fiber_tensors.distance_supported(distance_method):
         print(f"<{os.path.basename(__file__)}> Computing pairwise distances with the vectorized CPU backend.")
         coordinates = gpu.fiber_tensors.fiber_array_to_numpy(
