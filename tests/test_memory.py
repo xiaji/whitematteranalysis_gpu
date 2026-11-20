@@ -279,9 +279,11 @@ class GPUMemoryTests(unittest.TestCase):
                 patch.object(distance, '_fiber_block_distances', side_effect=oom_above_two):
             if not has_real_mps:
                 # Simulate dev.type == 'mps' for empty_cache even when MPS backend is absent
+                orig_empty = torch.empty
+                orig_as_tensor_local = torch.as_tensor
                 with patch.object(distance, 'get_device', return_value=mps_device), \
-                        patch.object(torch, 'empty', side_effect=lambda *a, **kw: torch.empty(*a, **{**kw, 'device': torch.device('cpu')})), \
-                        patch.object(torch, 'as_tensor', side_effect=lambda d, *a, **kw: torch.as_tensor(d, *a, **{**kw, 'device': torch.device('cpu')})):
+                        patch.object(torch, 'empty', side_effect=lambda *a, **kw: orig_empty(*a, **{**kw, 'device': torch.device('cpu')})), \
+                        patch.object(torch, 'as_tensor', side_effect=lambda d, *a, **kw: orig_as_tensor_local(d, *a, **{**kw, 'device': torch.device('cpu')})):
                     tensor_out = distance.rectangular_similarity_tensor(
                         pd_n, pd_m, 0., 20., gpu_float32=True, tile_rows=5)
             else:
