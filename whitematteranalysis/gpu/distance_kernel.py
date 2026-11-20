@@ -184,62 +184,97 @@ if triton is not None:
         tl.store(BestIdx + qi, best_idx, qi < NQ)
 
     @triton.jit
-    def _nearest_centroids_stage1(Q, C, PartialDist, PartialIdx, NQ, NC, N_SPLITS,
+    def _nearest_centroids_stage1(Q, C, PartialDist, PartialIdx, NQ, NC,
                                   D: tl.constexpr, WIDTH: tl.constexpr,
-                                  STEPS: tl.constexpr, BQ: tl.constexpr,
-                                  BLOCK_C: tl.constexpr, DTYPE: tl.constexpr = tl.float64):
-        q_base = tl.program_id(0).to(tl.int64) * BQ
+                                  STEPS: tl.constexpr, BLOCK_C: tl.constexpr,
+                                  DTYPE: tl.constexpr = tl.float64):
+        qi = tl.program_id(0).to(tl.int64)
         split_id = tl.program_id(1).to(tl.int64)
         dim = tl.arange(0, WIDTH)
         d_mask = dim < D
         zero = tl.full((), 0., DTYPE)
         inf = tl.full((), float('inf'), DTYPE)
         nc_i64 = tl.zeros((), dtype=tl.int64) + NC
-        n_splits_i64 = tl.zeros((), dtype=tl.int64) + N_SPLITS
+        q_row = tl.load(Q + qi * D + dim, d_mask, other=zero)
         c_idx = split_id * BLOCK_C + tl.arange(0, BLOCK_C).to(tl.int64)
         c_valid = c_idx < NC
         c_mask = c_valid[:, None] & d_mask[None, :]
         c_vals = tl.load(C + c_idx[:, None] * D + dim[None, :], c_mask, other=zero)
+        diff = q_row[None, :] - c_vals
+        values = diff * diff
+        for step in tl.static_range(STEPS):
+            a, b = tl.split(tl.trans(tl.reshape(values,
+                (BLOCK_C, 2, WIDTH // (1 << (step + 1)))), 0, 2, 1))
+            values = a + b
+        dists = libdevice.sqrt_rn(tl.reshape(values, (BLOCK_C,)))
+        dists = tl.where(c_valid, dists, inf)
         idxs = tl.where(c_valid, c_idx, nc_i64)
-        for q_off in range(BQ):
-            qi = q_base + q_off
-            if qi < NQ:
-                q_row = tl.load(Q + qi * D + dim, d_mask, other=zero)
-                diff = q_row[None, :] - c_vals
-                values = diff * diff
-                for step in tl.static_range(STEPS):
-                    a, b = tl.split(tl.trans(tl.reshape(values,
-                        (BLOCK_C, 2, WIDTH // (1 << (step + 1)))), 0, 2, 1))
-                    values = a + b
-                dists = libdevice.sqrt_rn(tl.reshape(values, (BLOCK_C,)))
-                dists = tl.where(c_valid, dists, inf)
-                block_dist, block_idx = tl.reduce((dists, idxs), axis=0, combine_fn=_argmin_combine)
-                out_offset = qi * n_splits_i64 + split_id
-                tl.store(PartialDist + out_offset, block_dist)
-                tl.store(PartialIdx + out_offset, block_idx)
+        best_dist, best_idx = tl.reduce((dists, idxs), axis=0, combine_fn=_argmin_combine)
+        out_offset = split_id * NQ + qi
+        tl.store(PartialDist + out_offset, best_dist)
+        tl.store(PartialIdx + out_offset, best_idx)
+
+    @triton.jit
+    def _nearest_centroids_stage1_2d(Q, C, PartialDist, PartialIdx, NQ, NC,
+                                     D: tl.constexpr, WIDTH: tl.constexpr,
+                                     STEPS: tl.constexpr, BQ: tl.constexpr,
+                                     BLOCK_C: tl.constexpr, DTYPE: tl.constexpr = tl.float32):
+        qi = tl.program_id(0).to(tl.int64) * BQ + tl.arange(0, BQ).to(tl.int64)
+        split_id = tl.program_id(1).to(tl.int64)
+        q_valid = qi < NQ
+        c_idx = split_id * BLOCK_C + tl.arange(0, BLOCK_C).to(tl.int64)
+        c_valid = c_idx < NC
+        dim = tl.arange(0, WIDTH)
+        d_mask = dim < D
+        zero = tl.full((), 0., DTYPE)
+        inf = tl.full((), float('inf'), DTYPE)
+        nc_i64 = tl.zeros((), dtype=tl.int64) + NC
+
+        q_vals = tl.load(
+            Q + qi[:, None] * D + dim[None, :],
+            q_valid[:, None] & d_mask[None, :],
+            other=zero,
+        )
+        c_vals = tl.load(
+            C + c_idx[:, None] * D + dim[None, :],
+            c_valid[:, None] & d_mask[None, :],
+            other=zero,
+        )
+        diff = q_vals[:, None, :] - c_vals[None, :, :]
+        values = diff * diff
+        for step in tl.static_range(STEPS):
+            a, b = tl.split(tl.trans(tl.reshape(values,
+                (BQ, BLOCK_C, 2, WIDTH // (1 << (step + 1)))), 0, 1, 3, 2))
+            values = a + b
+        dists = libdevice.sqrt_rn(tl.reshape(values, (BQ, BLOCK_C)))
+        dists = tl.where(c_valid[None, :], dists, inf)
+        idxs = tl.where(c_valid[None, :], c_idx[None, :], nc_i64) + tl.zeros((BQ, BLOCK_C), dtype=tl.int64)
+        best_dist, best_idx = tl.reduce((dists, idxs), axis=1, combine_fn=_argmin_combine)
+        out_offset = split_id * NQ + qi
+        tl.store(PartialDist + out_offset, best_dist, q_valid)
+        tl.store(PartialIdx + out_offset, best_idx, q_valid)
 
     @triton.jit
     def _nearest_centroids_stage2(PartialDist, PartialIdx, MinDist, BestIdx,
-                                  NQ, N_SPLITS, NC, BLOCK_S: tl.constexpr,
-                                  DTYPE: tl.constexpr = tl.float64):
-        qi = tl.program_id(0).to(tl.int64)
-        if qi >= NQ:
-            return
+                                  NQ, N_SPLITS, NC, BLOCK_Q: tl.constexpr,
+                                  BLOCK_S: tl.constexpr, DTYPE: tl.constexpr = tl.float64):
+        qi = tl.program_id(0).to(tl.int64) * BLOCK_Q + tl.arange(0, BLOCK_Q).to(tl.int64)
+        q_valid = qi < NQ
         inf = tl.full((), float('inf'), DTYPE)
         nc_i64 = tl.zeros((), dtype=tl.int64) + NC
-        n_splits_i64 = tl.zeros((), dtype=tl.int64) + N_SPLITS
-        best_dist = inf
-        best_idx = nc_i64
-        row_offset = qi * n_splits_i64
+        best_dist = tl.full((BLOCK_Q,), float('inf'), dtype=DTYPE)
+        best_idx = tl.zeros((BLOCK_Q,), dtype=tl.int64) + nc_i64
         for base in range(0, N_SPLITS, BLOCK_S):
-            s_idx = base + tl.arange(0, BLOCK_S).to(tl.int64)
+            s_idx = (base + tl.arange(0, BLOCK_S)).to(tl.int64)
             s_valid = s_idx < N_SPLITS
-            vals = tl.load(PartialDist + row_offset + s_idx, s_valid, other=inf)
-            idxs = tl.load(PartialIdx + row_offset + s_idx, s_valid, other=nc_i64)
+            mask = s_valid[:, None] & q_valid[None, :]
+            off = s_idx[:, None] * NQ + qi[None, :]
+            vals = tl.load(PartialDist + off, mask, other=inf)
+            idxs = tl.load(PartialIdx + off, mask, other=nc_i64)
             block_dist, block_idx = tl.reduce((vals, idxs), axis=0, combine_fn=_argmin_combine)
             best_dist, best_idx = _argmin_combine(best_dist, best_idx, block_dist, block_idx)
-        tl.store(MinDist + qi, best_dist)
-        tl.store(BestIdx + qi, best_idx)
+        tl.store(MinDist + qi, best_dist, q_valid)
+        tl.store(BestIdx + qi, best_idx, q_valid)
 
     @triton.jit
     def _similarity_row_sums(F, Q, SimOut, DistOut, NF, NQ,
@@ -343,18 +378,28 @@ def nearest_centroids(queries, centroids):
     block_c = 64 if dimensions <= 16 else 32
     with torch.cuda.device(queries.device):
         if nq * nc >= 65536 and nc >= 256:
-            bq = 32
-            n_splits = triton.cdiv(nc, block_c)
-            partial_dists = torch.empty((nq, n_splits), dtype=queries.dtype, device=queries.device)
-            partial_idxs = torch.empty((nq, n_splits), dtype=torch.int64, device=queries.device)
-            _nearest_centroids_stage1[(triton.cdiv(nq, bq), n_splits)](
-                queries, centroids, partial_dists, partial_idxs, nq, nc, n_splits,
-                D=dimensions, WIDTH=width, STEPS=steps, BQ=bq, BLOCK_C=block_c,
-                DTYPE=dtype_tl, num_warps=4, enable_fp_fusion=False)
-            _nearest_centroids_stage2[(nq,)](
+            split_c = ((32 if dimensions <= 16 else 64) if dtype_tl == tl.float32
+                       else (128 if dimensions <= 16 else 64))
+            n_splits = triton.cdiv(nc, split_c)
+            partial_dists = torch.empty((n_splits, nq), dtype=queries.dtype, device=queries.device)
+            partial_idxs = torch.empty((n_splits, nq), dtype=torch.int64, device=queries.device)
+            if dtype_tl == tl.float32:
+                bq = 16 if dimensions <= 16 else 4
+                _nearest_centroids_stage1_2d[(triton.cdiv(nq, bq), n_splits)](
+                    queries, centroids, partial_dists, partial_idxs, nq, nc,
+                    D=dimensions, WIDTH=width, STEPS=steps, BQ=bq, BLOCK_C=split_c,
+                    DTYPE=dtype_tl, num_warps=4, enable_fp_fusion=False)
+            else:
+                _nearest_centroids_stage1[(nq, n_splits)](
+                    queries, centroids, partial_dists, partial_idxs, nq, nc,
+                    D=dimensions, WIDTH=width, STEPS=steps, BLOCK_C=split_c,
+                    DTYPE=dtype_tl, num_warps=1, enable_fp_fusion=False)
+            block_q = 64
+            block_s = min(64, triton.next_power_of_2(n_splits))
+            _nearest_centroids_stage2[(triton.cdiv(nq, block_q),)](
                 partial_dists, partial_idxs, min_distances, best_indices,
-                nq, n_splits, nc, BLOCK_S=32, DTYPE=dtype_tl,
-                num_warps=1, enable_fp_fusion=False)
+                nq, n_splits, nc, BLOCK_Q=block_q, BLOCK_S=block_s, DTYPE=dtype_tl,
+                num_warps=2, enable_fp_fusion=False)
         else:
             _nearest_centroids[(nq,)](
                 queries, centroids, min_distances, best_indices, nq, nc,
