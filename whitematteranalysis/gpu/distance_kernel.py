@@ -119,6 +119,49 @@ if triton is not None:
         tl.store(Output + pair, result, pair < COUNT)
 
     @triton.jit
+    def _argmin_combine(val_a, idx_a, val_b, idx_b):
+        a_nan = val_a != val_a
+        b_nan = val_b != val_b
+        a_wins = tl.where(
+            a_nan | b_nan,
+            tl.where(a_nan & b_nan, idx_a < idx_b, a_nan),
+            (val_a < val_b) | ((val_a == val_b) & (idx_a < idx_b)),
+        )
+        return tl.where(a_wins, val_a, val_b), tl.where(a_wins, idx_a, idx_b)
+
+    @triton.jit
+    def _nearest_centroids(Q, C, MinDist, BestIdx, NQ, NC,
+                           D: tl.constexpr, WIDTH: tl.constexpr,
+                           STEPS: tl.constexpr, BLOCK_C: tl.constexpr):
+        qi = tl.program_id(0).to(tl.int64)
+        dim = tl.arange(0, WIDTH)
+        d_mask = dim < D
+        q_row = tl.load(Q + qi * D + dim, d_mask, other=0.)
+        inf = tl.full((), float('inf'), tl.float64)
+        nc_i64 = tl.zeros((), dtype=tl.int64) + NC
+        best_dist = inf
+        best_idx = nc_i64
+        for base in range(0, NC, BLOCK_C):
+            c_idx = base + tl.arange(0, BLOCK_C)
+            c_valid = c_idx < NC
+            mask = c_valid[:, None] & d_mask[None, :]
+            c_vals = tl.load(C + c_idx[:, None].to(tl.int64) * D + dim[None, :], mask, other=0.)
+            diff = q_row[None, :] - c_vals
+            values = diff * diff
+            # Match cdist's descending warp-shuffle reduction, including sqrt rounding.
+            for step in tl.static_range(STEPS):
+                a, b = tl.split(tl.trans(tl.reshape(values,
+                    (BLOCK_C, 2, WIDTH // (1 << (step + 1)))), 0, 2, 1))
+                values = a + b
+            dists = libdevice.sqrt_rn(tl.reshape(values, (BLOCK_C,)))
+            dists = tl.where(c_valid, dists, inf)
+            idxs = tl.where(c_valid, c_idx.to(tl.int64), nc_i64)
+            block_dist, block_idx = tl.reduce((dists, idxs), axis=0, combine_fn=_argmin_combine)
+            best_dist, best_idx = _argmin_combine(best_dist, best_idx, block_dist, block_idx)
+        tl.store(MinDist + qi, best_dist, qi < NQ)
+        tl.store(BestIdx + qi, best_idx, qi < NQ)
+
+    @triton.jit
     def _similarity_row_sums(F, Q, SimOut, DistOut, NF, NQ,
                              P: tl.constexpr, WIDTH: tl.constexpr, STEPS: tl.constexpr,
                              THRESHOLD2: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -176,6 +219,27 @@ def centroid_distances(queries, centroids):
                 STEPS=(dimensions - 1).bit_length(), BLOCK=block,
                 num_warps=1, enable_fp_fusion=False)
     return output
+
+
+def nearest_centroids(queries, centroids):
+    """Fused Euclidean argmin for contiguous float64 CUDA vectors, 1<=D<=32."""
+    import torch
+
+    nq = queries.shape[0]
+    nc = centroids.shape[0]
+    min_distances = torch.empty((nq,), dtype=queries.dtype, device=queries.device)
+    best_indices = torch.empty((nq,), dtype=torch.int64, device=queries.device)
+    if nq == 0 or nc == 0:
+        return min_distances, best_indices
+    dimensions = queries.shape[1]
+    block_c = 64 if dimensions <= 16 else 32
+    with torch.cuda.device(queries.device):
+        _nearest_centroids[(nq,)](
+            queries, centroids, min_distances, best_indices, nq, nc,
+            D=dimensions, WIDTH=triton.next_power_of_2(dimensions),
+            STEPS=(dimensions - 1).bit_length(), BLOCK_C=block_c,
+            num_warps=4, enable_fp_fusion=False)
+    return min_distances, best_indices
 
 
 def fiber_distances(queries, fixed, threshold, method, bilateral=False, sigmasq=6400.,

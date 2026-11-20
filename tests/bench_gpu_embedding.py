@@ -51,7 +51,7 @@ def main():
     similarities = torch.rand((args.fibers, atlas.nystrom_polydata.GetNumberOfLines()),
                               dtype=torch.float64, device=wma.gpu.get_device())
     def embedding(module):
-        blocks = ((start, similarities[start:start+2048].t())
+        blocks = ((start, similarities[start:start+2048].clone().t())
                   for start in range(0, args.fibers, 2048))
         return module.atlas_label_embedding_blocks(blocks, atlas, args.fibers)
     outputs, timings = compare([lambda: embedding(original), lambda: embedding(current)], args.repeat)

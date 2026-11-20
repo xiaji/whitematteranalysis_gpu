@@ -129,7 +129,8 @@ def _fiber_block_distances(q, f, threshold, distance_method, sigmasq, bilateral=
     return distances
 
 
-def _choose_tile_rows(n, m, points_per_fiber, dtype, device, override=None):
+def _choose_tile_rows(n, m, points_per_fiber, dtype, device, override=None,
+                      triton_2d=False):
     """Pick the number of query fibers per tile from the free VRAM."""
 
     if override:
@@ -139,8 +140,12 @@ def _choose_tile_rows(n, m, points_per_fiber, dtype, device, override=None):
         return max(1, int(override))
 
     itemsize = 8 if dtype == torch.float64 else 4
-    # a handful of (b, m, P) temporaries are alive at once
-    bytes_per_query_fiber = m * points_per_fiber * itemsize * 6
+    if triton_2d:
+        # Fused 2D Triton kernel avoids (b, m, P) temporaries.
+        bytes_per_query_fiber = m * itemsize * 3
+    else:
+        # a handful of (b, m, P) temporaries are alive at once
+        bytes_per_query_fiber = m * points_per_fiber * itemsize * 6
     try:
         free_bytes, _total = torch.cuda.mem_get_info(device)
     except Exception:
@@ -152,7 +157,7 @@ def _choose_tile_rows(n, m, points_per_fiber, dtype, device, override=None):
 
 def _distance_matrix(Xn, Xm, threshold, distance_method='Hausdorff',
                      bilateral=False, sigmasq=6400, gpu_float32=None,
-                     tile_rows=None, verbose=False):
+                     tile_rows=None, verbose=False, similarity_sigmasq=None):
     """(n, P, 3) queries x (m, P, 3) fixed -> (n, m) distance matrix.
 
     Row i holds the distances from query fiber i to all fixed fibers,
@@ -183,7 +188,8 @@ def _distance_matrix(Xn, Xm, threshold, distance_method='Hausdorff',
         e = min(s + tr, n)
         try:
             q = torch.as_tensor(Xn[s:e], dtype=dtype, device=device)
-            d = _fiber_block_distances(q, f, threshold, distance_method, sigmasq, bilateral)
+            d = _fiber_block_distances(q, f, threshold, distance_method, sigmasq, bilateral,
+                                       similarity_sigmasq=similarity_sigmasq)
         except torch.cuda.OutOfMemoryError:
             if e - s == 1:
                 raise
@@ -412,13 +418,11 @@ def pairwise_similarity_matrix(input_polydata, threshold, sigma,
     exactly as in the CPU implementation.
     """
 
-    distances = pairwise_distance_matrix(input_polydata, threshold,
-                                         distance_method, bilateral,
-                                         sigmasq, points_per_fiber,
-                                         gpu_float32, tile_rows)
-    if distance_method == 'StrictSimilarity':
-        return distances
-    return numpy.exp(-distances / (sigma * sigma))
+    X = fiber_tensors.polydata_to_numpy(input_polydata, points_per_fiber)
+    sim_sigmasq = sigma * sigma if distance_method != 'StrictSimilarity' else None
+    return _distance_matrix(X, X, threshold, distance_method, bilateral,
+                            sigmasq, gpu_float32, tile_rows,
+                            similarity_sigmasq=sim_sigmasq)
 
 
 def rectangular_similarity_matrix(input_polydata_n, input_polydata_m, threshold,
@@ -430,13 +434,12 @@ def rectangular_similarity_matrix(input_polydata_n, input_polydata_m, threshold,
     cluster._rectangular_similarity_matrix applies to its result.
     """
 
-    distances = rectangular_distance_matrix(input_polydata_n, input_polydata_m,
-                                            threshold, distance_method,
-                                            bilateral, gpu_float32=gpu_float32,
-                                            tile_rows=tile_rows)
-    if distance_method == 'StrictSimilarity':
-        return distances
-    return numpy.exp(-distances / (sigma * sigma))
+    Xn = fiber_tensors.polydata_to_numpy(input_polydata_n, 15)
+    Xm = fiber_tensors.polydata_to_numpy(input_polydata_m, 15)
+    sim_sigmasq = sigma * sigma if distance_method != 'StrictSimilarity' else None
+    return _distance_matrix(Xn, Xm, threshold, distance_method, bilateral,
+                            gpu_float32=gpu_float32, tile_rows=tile_rows,
+                            similarity_sigmasq=sim_sigmasq)
 
 
 def rectangular_similarity_tensor(input_polydata_n, input_polydata_m, threshold,
@@ -496,14 +499,19 @@ def iter_rectangular_similarity(input_polydata_n, input_polydata_m, threshold,
     queries = fiber_tensors.polydata_to_numpy(input_polydata_n, points_per_fiber)
     fixed = fiber_tensors.polydata_to_numpy(input_polydata_m, points_per_fiber)
     fixed = torch.as_tensor(fixed, dtype=dtype, device=device)
-    requested = tile_rows or config.tile_rows or 2048
+    triton_2d = (distance_kernel.triton is not None
+                 and dtype == torch.float64 and points_per_fiber <= 32)
     rows = _choose_tile_rows(len(queries), len(fixed), points_per_fiber,
-                             dtype, device, override=requested)
+                             dtype, device, override=tile_rows,
+                             triton_2d=triton_2d)
+    queries_t = torch.from_numpy(numpy.ascontiguousarray(queries)).to(dtype=dtype)
+    if queries_t.shape[0] > 0 and device.type == 'cuda':
+        queries_t = queries_t.pin_memory()
     start = 0
-    while start < len(queries):
-        end = min(start + rows, len(queries))
+    while start < len(queries_t):
+        end = min(start + rows, len(queries_t))
         try:
-            block = _similarity_tensor_block(queries[start:end], fixed, threshold,
+            block = _similarity_tensor_block(queries_t[start:end], fixed, threshold,
                                              sigma, distance_method, bilateral, sigmasq)
         except torch.cuda.OutOfMemoryError:
             if end - start == 1:
@@ -517,7 +525,10 @@ def iter_rectangular_similarity(input_polydata_n, input_polydata_m, threshold,
 
 
 def _similarity_tensor_block(queries, fixed, threshold, sigma, method, bilateral, sigmasq):
-    queries = torch.as_tensor(queries, dtype=fixed.dtype, device=fixed.device)
+    if torch.is_tensor(queries):
+        queries = queries.to(device=fixed.device, dtype=fixed.dtype, non_blocking=True)
+    else:
+        queries = torch.as_tensor(queries, dtype=fixed.dtype, device=fixed.device)
     return _fiber_block_distances(queries, fixed, threshold, method, sigmasq, bilateral,
         similarity_sigmasq=sigma * sigma if method != 'StrictSimilarity' else None)
 

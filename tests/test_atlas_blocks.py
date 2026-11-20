@@ -104,3 +104,64 @@ class AtlasTests(unittest.TestCase):
         with patch.object(distance, '_similarity_tensor_block', side_effect=torch.cuda.OutOfMemoryError):
             with self.assertRaises(torch.cuda.OutOfMemoryError):
                 list(distance.iter_rectangular_similarity(*args, tile_rows=1))
+
+    def test_atlas_label_embedding_blocks_single_d2h_transfer(self):
+        import torch
+        rng = np.random.RandomState(44)
+        atlas = types.SimpleNamespace(number_of_eigenvectors=3,
+            row_sum_1=np.ones(11), row_sum_matrix=rng.uniform(0, .1, 11),
+            e_vec=rng.uniform(.1, 1, (11, 11)), e_val=np.arange(1., 12.),
+            e_vec_norm=np.ones(11), centroids=rng.uniform(0, 2, (5, 3)))
+        full = torch.rand((11, 15), dtype=torch.float64, device='cuda')
+        expected = linalg.atlas_label_embedding(full.clone(), atlas)
+        blocks = [(s, full[:, s:s + 4].clone()) for s in range(0, 15, 4)]
+        cpu_calls = 0
+        orig_cpu = torch.Tensor.cpu
+        def counting_cpu(tensor, *args, **kwargs):
+            nonlocal cpu_calls
+            cpu_calls += 1
+            return orig_cpu(tensor, *args, **kwargs)
+        with patch.object(torch.Tensor, 'cpu', counting_cpu):
+            actual = linalg.atlas_label_embedding_blocks(iter(blocks), atlas, 15)
+        self.assertEqual(cpu_calls, 1)
+        for a, b in zip(expected, actual):
+            np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-12)
+        np.testing.assert_array_equal(expected[1], actual[1])
+
+
+class AtlasBlocksCpuTests(unittest.TestCase):
+    def test_atlas_label_embedding_blocks_single_d2h_transfer_cpu(self):
+        import torch
+        rng = np.random.RandomState(44)
+        atlas = types.SimpleNamespace(number_of_eigenvectors=3,
+            row_sum_1=np.ones(11), row_sum_matrix=rng.uniform(0, .1, 11),
+            e_vec=rng.uniform(.1, 1, (11, 11)), e_val=np.arange(1., 12.),
+            e_vec_norm=np.ones(11), centroids=rng.uniform(0, 2, (5, 3)))
+        full = torch.rand((11, 15), dtype=torch.float64)
+        cpu_dev = torch.device('cpu')
+        with patch.object(linalg, 'get_device', return_value=cpu_dev):
+            expected = linalg.atlas_label_embedding(full.clone(), atlas)
+            blocks = [(s, full[:, s:s + 4].clone()) for s in range(0, 15, 4)]
+            cpu_calls = 0
+            orig_cpu = torch.Tensor.cpu
+            def counting_cpu(tensor, *args, **kwargs):
+                nonlocal cpu_calls
+                cpu_calls += 1
+                return orig_cpu(tensor, *args, **kwargs)
+            with patch.object(torch.Tensor, 'cpu', counting_cpu):
+                actual = linalg.atlas_label_embedding_blocks(iter(blocks), atlas, 15)
+            self.assertEqual(cpu_calls, 1)
+            for a, b in zip(expected, actual):
+                np.testing.assert_allclose(a, b, rtol=1e-12, atol=1e-12)
+            np.testing.assert_array_equal(expected[1], actual[1])
+            # Verify _atlas_embedding_block_gpu exists and respects in_place=False default
+            prepared = linalg._prepare_atlas(atlas)
+            b_copy = full.clone()
+            before = b_copy.clone()
+            res = linalg._atlas_embedding_block_gpu(b_copy, prepared)
+            self.assertEqual(len(res), 5)
+            self.assertTrue(torch.equal(b_copy, before))
+            # Verify empty blocks
+            empty = linalg.atlas_label_embedding_blocks(iter(()), atlas, 0)
+            self.assertEqual(empty[0].shape, (0, 3))
+            np.testing.assert_array_equal(empty[3], atlas.row_sum_1)

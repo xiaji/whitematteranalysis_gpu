@@ -137,3 +137,50 @@ class DistanceKernelTests(unittest.TestCase):
                     bilateral=True, similarity_sigmasq=similarity_sigmasq)
             self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(torch.cuda.current_device(), previous)
+
+    def test_pairwise_and_rectangular_similarity_use_gpu_exp(self):
+        from test_atlas_blocks import polydata
+        pd_n, pd_m = polydata(5), polydata(4)
+        for method in ('Mean', 'MeanSquared', 'Hausdorff', 'StrictSimilarity'):
+            ref_pair = distance.pairwise_distance_matrix(pd_n, 0.1, distance_method=method)
+            ref_rect = distance.rectangular_distance_matrix(pd_n, pd_m, 0.1, distance_method=method)
+            if method != 'StrictSimilarity':
+                ref_pair = np.exp(-ref_pair / (20. * 20.))
+                ref_rect = np.exp(-ref_rect / (20. * 20.))
+            with patch.object(np, 'exp', side_effect=AssertionError('numpy.exp should not be called')):
+                actual_pair = distance.pairwise_similarity_matrix(pd_n, 0.1, 20., distance_method=method)
+                actual_rect = distance.rectangular_similarity_matrix(pd_n, pd_m, 0.1, 20., distance_method=method)
+            np.testing.assert_allclose(actual_pair, ref_pair, rtol=1e-12, atol=1e-12)
+            np.testing.assert_allclose(actual_rect, ref_rect, rtol=1e-12, atol=1e-12)
+
+
+class DistanceSimilarityCpuTests(unittest.TestCase):
+    def test_pairwise_and_rectangular_similarity_use_gpu_exp_cpu(self):
+        import torch
+        from test_atlas_blocks import polydata
+        pd_n, pd_m = polydata(5), polydata(4)
+        cpu_dev = torch.device('cpu')
+        with patch.object(distance, 'get_device', return_value=cpu_dev):
+            for method in ('Mean', 'MeanSquared', 'Hausdorff', 'StrictSimilarity'):
+                ref_pair = distance.pairwise_distance_matrix(pd_n, 0.1, distance_method=method)
+                ref_rect = distance.rectangular_distance_matrix(pd_n, pd_m, 0.1, distance_method=method)
+                if method != 'StrictSimilarity':
+                    ref_pair = np.exp(-ref_pair / (20. * 20.))
+                    ref_rect = np.exp(-ref_rect / (20. * 20.))
+                with patch.object(np, 'exp', side_effect=AssertionError('numpy.exp should not be called')):
+                    actual_pair = distance.pairwise_similarity_matrix(pd_n, 0.1, 20., distance_method=method)
+                    actual_rect = distance.rectangular_similarity_matrix(pd_n, pd_m, 0.1, 20., distance_method=method)
+                np.testing.assert_allclose(actual_pair, ref_pair, rtol=1e-12, atol=1e-12)
+                np.testing.assert_allclose(actual_rect, ref_rect, rtol=1e-12, atol=1e-12)
+
+    def test_choose_tile_rows_triton_2d(self):
+        import torch
+        # With 4 GiB fallback budget (0.55 * 4 GiB = 2.2 GiB):
+        # m = 2000, P = 15, float64 (itemsize = 8):
+        # eager: bytes_per_row = 2000 * 15 * 8 * 6 = 1,440,000 -> ~1640 rows
+        # triton_2d: bytes_per_row = 2000 * 8 * 3 = 48,000 -> capped at min(49198, 16384, n)
+        with patch.object(torch.cuda, 'mem_get_info', side_effect=RuntimeError('no cuda')):
+            eager_rows = distance._choose_tile_rows(50000, 2000, 15, torch.float64, torch.device('cpu'), triton_2d=False)
+            triton_rows = distance._choose_tile_rows(50000, 2000, 15, torch.float64, torch.device('cpu'), triton_2d=True)
+        self.assertLess(eager_rows, triton_rows)
+        self.assertEqual(triton_rows, 16384)

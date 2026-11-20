@@ -67,6 +67,49 @@ class EmbeddingKernelTests(unittest.TestCase):
         torch.cuda.synchronize(selected)
         self.assertEqual(torch.cuda.memory_allocated(selected), allocated)
 
+    def test_in_place_and_col_sums_parity(self):
+        import torch
+        torch.manual_seed(82)
+        for dtype in (torch.float64, torch.float32):
+            base = torch.randn((4099, 257), dtype=dtype, device='cuda')
+            for B_orig in (base, base.t(), base[:13]):
+                a = torch.randn(B_orig.shape[0], dtype=dtype, device='cuda')
+                c = torch.randn(B_orig.shape[1], dtype=dtype, device='cuda')
+                before = B_orig.clone()
+                out_default = kernel.normalized_similarities(B_orig, a, c)
+                torch.testing.assert_close(B_orig, before, rtol=0., atol=0., equal_nan=True)
+                B_in = B_orig.clone()
+                expected_ptr = B_in.data_ptr()
+                out_ip, col_sums = kernel.normalized_similarities(
+                    B_in, a, c, in_place=True, return_col_sums=True)
+                self.assertEqual(out_ip.data_ptr(), expected_ptr)
+                expected = before * (a[:, None] * c[None, :])
+                torch.testing.assert_close(out_default, expected, rtol=0., atol=0., equal_nan=True)
+                torch.testing.assert_close(out_ip, expected, rtol=0., atol=0., equal_nan=True)
+                torch.testing.assert_close(col_sums, expected.sum(0), rtol=0., atol=0., equal_nan=True)
+
+
+class EmbeddingKernelCpuTests(unittest.TestCase):
+    def test_in_place_and_col_sums_parity_cpu(self):
+        import torch
+        torch.manual_seed(82)
+        base = torch.randn((37, 19), dtype=torch.float64)
+        for B_orig in (base, base.t()):
+            a = torch.randn(B_orig.shape[0], dtype=torch.float64)
+            c = torch.randn(B_orig.shape[1], dtype=torch.float64)
+            before = B_orig.clone()
+            out_default = kernel.normalized_similarities(B_orig, a, c)
+            torch.testing.assert_close(B_orig, before, rtol=0., atol=0., equal_nan=True)
+            B_in = B_orig.clone()
+            expected_ptr = B_in.data_ptr()
+            out_ip, col_sums = kernel.normalized_similarities(
+                B_in, a, c, in_place=True, return_col_sums=True)
+            self.assertEqual(out_ip.data_ptr(), expected_ptr)
+            expected = before * (a[:, None] * c[None, :])
+            torch.testing.assert_close(out_default, expected, rtol=0., atol=0., equal_nan=True)
+            torch.testing.assert_close(out_ip, expected, rtol=0., atol=0., equal_nan=True)
+            torch.testing.assert_close(col_sums, expected.sum(0), rtol=0., atol=0., equal_nan=True)
+
 
 if __name__ == '__main__':
     unittest.main()
