@@ -69,9 +69,9 @@ class GPUBSplineTests(unittest.TestCase):
                         fallback.transform(field).cpu().numpy().transpose(2, 0, 1), original)
 
     def test_complete_optimization_and_release(self):
-        prev_strict = wma.gpu.config.strict_enabled()
-        wma.gpu.config.set_strict(True)
-        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
+        prev_strict = wma.gpu.strict_enabled()
+        wma.gpu.set_strict(True)
+        self.addCleanup(wma.gpu.set_strict, prev_strict)
 
         rng = np.random.RandomState(42)
         reg = RegisterTractographyNonrigid()
@@ -97,7 +97,7 @@ class GPUBSplineTests(unittest.TestCase):
             np.testing.assert_array_equal(values, expected_values)
 
             # Default non-strict mode (fused cross-fiber sums) stays within tight tolerance.
-            wma.gpu.config.set_strict(False)
+            wma.gpu.set_strict(False)
             reg.objective_function_values.clear()
             reg.objective_computations = 0
             reg.minimum_objective = np.inf

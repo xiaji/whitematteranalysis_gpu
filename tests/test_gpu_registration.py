@@ -122,9 +122,9 @@ class RegistrationTests(unittest.TestCase):
 
         if registration_kernel.triton is None:
             self.skipTest('Triton is not installed')
-        prev_strict = wma.gpu.config.strict_enabled()
-        wma.gpu.config.set_strict(True)
-        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
+        prev_strict = wma.gpu.strict_enabled()
+        wma.gpu.set_strict(True)
+        self.addCleanup(wma.gpu.set_strict, prev_strict)
         rng = np.random.RandomState(2026)
         for points in (1, 2, 3, 7, 8, 10, 15, 16, 20, 31, 32, 50, 64):
             with self.subTest(points=points):
@@ -154,9 +154,9 @@ class RegistrationTests(unittest.TestCase):
 
         if registration_kernel.triton is None or torch.cuda.device_count() < 2:
             self.skipTest('Triton and two visible devices are required')
-        prev_strict = wma.gpu.config.strict_enabled()
-        wma.gpu.config.set_strict(True)
-        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
+        prev_strict = wma.gpu.strict_enabled()
+        wma.gpu.set_strict(True)
+        self.addCleanup(wma.gpu.set_strict, prev_strict)
         previous = torch.cuda.current_device()
         selected = (previous + 1) % torch.cuda.device_count()
         fixed = torch.ones((7, 10, 3), dtype=torch.float64, device=selected)
@@ -203,9 +203,9 @@ class RegistrationTests(unittest.TestCase):
                 gpu._inner_loop_objective(fixed, moving, 100., 'cuda', 1)
 
     def test_optimizer_reuses_data_and_refreshes_samples(self):
-        prev_strict = wma.gpu.config.strict_enabled()
-        wma.gpu.config.set_strict(True)
-        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
+        prev_strict = wma.gpu.strict_enabled()
+        wma.gpu.set_strict(True)
+        self.addCleanup(wma.gpu.set_strict, prev_strict)
         rng = np.random.RandomState(123)
         reg = RegisterTractography()
         reg.fixed = rng.normal(size=(3, 31, 10)) * 20
@@ -266,9 +266,9 @@ class RegistrationTests(unittest.TestCase):
         import torch
         if registration_kernel.triton is None:
             self.skipTest('Triton is not installed')
-        prev_strict = wma.gpu.config.strict_enabled()
-        wma.gpu.config.set_strict(False)
-        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
+        prev_strict = wma.gpu.strict_enabled()
+        wma.gpu.set_strict(False)
+        self.addCleanup(wma.gpu.set_strict, prev_strict)
 
         rng = np.random.RandomState(2027)
         for points in (1, 15, 32, 50, 64):
