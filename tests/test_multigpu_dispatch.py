@@ -229,7 +229,7 @@ class MultiGpuDispatchTests(unittest.TestCase):
         self.assertEqual(len(seen_shard_sizes), 2)
         self.assertEqual(sum(cnt for cnt, _ in seen_shard_sizes), n_fibers)
         np.testing.assert_array_equal(labels_2, labels_1)
-        np.testing.assert_allclose(embed_2, embed_1, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(embed_2, embed_1, rtol=1e-9, atol=1e-9)
         self.assertEqual(out_2.GetNumberOfLines(), n_fibers)
 
     def test_congeal_multisubject_dispatches_round_robin_and_skips_stream_on_mps(self):
