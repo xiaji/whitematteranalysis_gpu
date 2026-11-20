@@ -40,12 +40,17 @@ Source: [CPU backend](../whitematteranalysis/gpu/cpu_backend.py),
   Only the required eigenvector columns and compact per-fiber results are kept;
   the full subject-by-atlas similarity matrix is not retained. Scoped BLAS
   thread limits avoid competing thread pools on small embedding matrices.
-- **GPU:** streamed similarity blocks remain on CUDA through normalization,
-  embedding and nearest-centroid assignment. Optional fused distance,
-  normalization and centroid kernels reduce temporary allocations; only compact
-  labels, embedding coordinates and statistics return to the CPU.
+- **GPU:** streamed similarity blocks remain on CUDA through in-place
+  normalization, embedding and fused nearest-centroid reduction (`nearest_centroids`).
+  Compact labels, embedding coordinates and statistics accumulate on the GPU and
+  transfer to the host once after the block loop completes, eliminating per-block
+  D2H pipeline stalls. Tile sizing accounts for Triton's 2D footprint and uses
+  pinned host staging for query blocks; pairwise/rectangular similarity APIs
+  fuse `exp(-d/sigma^2)` on GPU.
 - **Shared geometry/I/O:** bulk VTK connectivity/coordinate access replaces
-  per-point Python calls. Cluster splitting preserves fiber order and data
+  per-point Python calls, and `FiberArray` resamples lines in 4,096-line chunks
+  with bounds validation to keep peak host memory bounded on whole-brain
+  tractograms. Cluster splitting preserves fiber order and data
   arrays while avoiding repeated scans of the full tractogram. Cluster counts
   and color means reuse stable label groups instead of rescanning all labels for
   each cluster. On Linux, parallel VTK writers use fork workers with inherited
@@ -89,12 +94,17 @@ This changes memory allocation, not values or precision.
 
 ## Outlier removal
 
-- Independent clusters run concurrently, with the worker budget shared across
-  cluster tasks instead of nesting large distance worker pools.
+- Independent clusters run concurrently: in GPU mode, `wm_cluster_remove_outliers.py`
+  uses a single-process `ThreadPoolExecutor` with one `torch.cuda.Stream` per
+  worker thread (avoiding multiple CUDA contexts and preserving CLI
+  `-gpu_float32` / `-gpu_devices` settings); CPU mode keeps `joblib.Parallel`.
 - CPU/GPU blocks replace per-fiber distance loops while keeping the same
   probability calculation and rejection rule. Empty subject clusters skip
-  unnecessary reference comparisons.
-- GPU outlier scoring reduces similarity sums by query row, avoiding a full
+  unnecessary reference comparisons, and tiny clusters below
+  `WMA_GPU_MIN_PAIR_WORK` (default `4096` fiber pairs) route directly to the
+  accelerated CPU backend to avoid CUDA launch overhead.
+- GPU outlier scoring uses a fused Triton row-reduction kernel
+  (`similarity_row_sums`) for `Mean` distance without allocating a full
   subject-by-atlas distance matrix. In float64 mode, scores near the rejection
   cutoff are recomputed with the CPU metric and NumPy reductions to preserve
   cutoff-sensitive decisions. Explicit float32 mode remains approximate and
@@ -105,10 +115,12 @@ This changes memory allocation, not values or precision.
   Subject-dependent comparisons are always recomputed.
 - The original CPU fallback also reads atlas clusters as geometry only; its
   keep/reject decisions are checked against full-attribute reference reads.
-- The generic `filter.remove_outliers` API also uses CPU/GPU distance matrices.
-  Partial selection finds the three nearest neighbors without sorting every
-  distance, while preserving the original summation order and rejection cutoff.
-  For two or three fibers it uses the available neighbors; a singleton is rejected.
+- The generic `filter.remove_outliers` API uses tiled GPU `topk`
+  (`nearest_neighbor_distances_from_fiber_array`) so host memory stays $O(N)$
+  instead of materializing an $O(N^2)$ distance matrix, finishing the compact
+  three-neighbor reduction in NumPy to preserve exact IEEE division and
+  summation order. For two or three fibers it uses the available neighbors;
+  a singleton is rejected.
 
 The atlas-based CLI requires identical subject/atlas cluster filenames before
 writing outputs. Atlas loading requires a Boolean `bilateral` field; missing or
@@ -178,6 +190,18 @@ regression: they also include process startup, filesystem cache state and shared
 workstation load. Replacing one column with another run's faster times would not
 be a measured pipeline result. Execution strategies must be compared on identical
 inputs, and any updated total must come from a complete timed run.
+
+## Memory & OOM hardening
+
+- CUDA entry points disable TF32 (`allow_tf32 = False` for matmul and cuDNN)
+  before compute to protect numerical precision.
+- Tiled GPU loops detect both `torch.cuda.OutOfMemoryError` and cuBLAS/cuDNN
+  OOM `RuntimeError`s (`whitematteranalysis/gpu/_memory.py`), halving
+  `tile_rows` down to `1`. When a host-returning API still exhausts VRAM at
+  `tile_rows == 1`, remaining rows finish in bounded 16 MiB CPU batches rather
+  than crashing. GPU-tensor-returning APIs re-raise at `tile_rows == 1`.
+- Set `WMA_GPU_MAX_VRAM_GIB` to cap the effective free-VRAM budget used for
+  tile sizing on shared or low-VRAM GPUs.
 
 ## Numerical behavior
 

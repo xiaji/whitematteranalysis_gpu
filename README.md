@@ -96,6 +96,8 @@ Outlier removal shares cached atlas reference statistics across subjects.
 | `WMA_CPU_BLAS_THREADS=0` | Disable automatic atlas-labeling BLAS caps; a positive value sets a ceiling |
 | `WMA_VTP_COMPRESSION=lz4` | Select faster lossless VTP writing; library/Slicer defaults use compact zlib |
 | `WMA_IO_PREFETCH=1` | Opt into whole-file POSIX readahead; default off, benefit depends on storage |
+| `WMA_GPU_MIN_PAIR_WORK=4096` | Route tiny outlier clusters (`n_queries * n_fixed < threshold`) to the CPU backend |
+| `WMA_GPU_MAX_VRAM_GIB=3.5` | Cap the GPU free-VRAM budget used for tile sizing (useful on shared or low-VRAM GPUs) |
 
 ## 3D Slicer extension
 
