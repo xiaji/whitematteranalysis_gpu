@@ -17,9 +17,14 @@ repeated objective evaluation is faster because:
   access, and a reusable worker pool avoids repeated worker startup.
 - **GPU:** fixed/moving samples and scratch buffers stay on the selected CUDA
   device across objective evaluations. Batched affine transforms and optional
-  Triton kernels compute forward/reversed fiber distances and probabilities
+  Triton kernels (`tl.int64` indexing across `float64`/`float32` and
+  `1 <= P <= 64` points per fiber) compute forward/reversed fiber distances and
+  probabilities (`pairwise_probability_sums`, including a 2D fused registration
+  kernel; set `WMA_GPU_STRICT=1` to force non-fused strict reductions)
   with fewer intermediate tensors and kernel launches. PyTorch provides the
-  fallback when Triton is unavailable.
+  fallback when Triton is unavailable or `P > 64`. Groupwise multi-subject
+  registration (`congeal_multisubject.py`) pre-renders fixed brains on the main
+  thread and schedules subjects round-robin across visible GPUs.
 - Length eligibility and geometry views are reused between registration samples.
   Selected indices are sorted to preserve input fiber order and the original RNG
   sequence without building a full-tractogram selection mask each iteration.
@@ -41,12 +46,19 @@ Source: [CPU backend](../whitematteranalysis/gpu/cpu_backend.py),
   the full subject-by-atlas similarity matrix is not retained. Scoped BLAS
   thread limits avoid competing thread pools on small embedding matrices.
 - **GPU:** streamed similarity blocks remain on CUDA through in-place
-  normalization, embedding and fused nearest-centroid reduction (`nearest_centroids`).
-  Compact labels, embedding coordinates and statistics accumulate on the GPU and
-  transfer to the host once after the block loop completes, eliminating per-block
-  D2H pipeline stalls. Tile sizing accounts for Triton's 2D footprint and uses
-  pinned host staging for query blocks; pairwise/rectangular similarity APIs
-  fuse `exp(-d/sigma^2)` on GPU.
+  normalization, embedding and 2-stage split-C `nearest_centroids` reduction
+  (`whitematteranalysis/gpu/distance_kernel.py`, supporting both `float64` and
+  `float32` across `1 <= P <= 64` points per fiber without materializing full
+  `N_q x N_c` distance matrices). When multiple CUDA devices are visible,
+  `spectral_atlas_label` shards fiber blocks across GPUs and reassembles exact
+  embeddings and cluster labels. Compact labels, embedding coordinates and
+  statistics accumulate on the GPU and transfer to the host once after the block
+  loop completes, eliminating per-block D2H pipeline stalls. Tile sizing accounts
+  for Triton's 2D footprint and uses pinned host staging for query blocks;
+  pairwise/rectangular similarity APIs fuse `exp(-d/sigma^2)` on GPU.
+  Experimental Apple Silicon MPS can be enabled with `WMA_GPU_MPS=1` together
+  with `WMA_GPU_FLOAT32=1` (`-gpu_float32`) when CUDA is absent (unsupported
+  `eigh`/Nyström ops fall back safely to CPU).
 - **Shared geometry/I/O:** bulk VTK connectivity/coordinate access replaces
   per-point Python calls, and `FiberArray` resamples lines in 4,096-line chunks
   with bounds validation to keep peak host memory bounded on whole-brain
@@ -133,11 +145,43 @@ cold-cache speedup.
 Source: [outlier command](../bin/wm_cluster_remove_outliers.py),
 [reference cache](../whitematteranalysis/gpu/atlas_cache.py).
 
-## The four final stages
+## Tiered hardening and single-process ORG pipeline
+
+Hemisphere assessment, transform hardening, hemisphere separation and anatomical
+tract assembly run on the CPU:
+
+- **Tier 1 (SlicerDMRI-free pure-Python affine):** [whitematteranalysis/transform.py](../whitematteranalysis/transform.py)
+  provides `has_tensor_arrays`, LPS-to-RAS linear ITK `.tfm` parsing
+  (`read_itk_affine_matrix_ras`), and bounded-chunk `float64`
+  `apply_affine_to_polydata` (used by `congeal_to_atlas.py`,
+  `wm_harden_transform.py --pure-python` / `Slicer=none`/`auto`, and
+  `bin/wm_apply_ORG_atlas.py` in tensor-free `-r rig` mode). Any tensor, vector,
+  normal, or 9-component array triggers automatic fallback to
+  `vtkTransformPolyDataFilter` / 3D Slicer.
+- **Tier 2 (`vtkMRMLModelNode` fallback without SlicerDMRI):**
+  [bin/harden_transform_with_slicer.py](../bin/harden_transform_with_slicer.py)
+  falls back to `vtkMRMLModelNode` when `vtkMRMLFiberBundleNode` is unavailable,
+  enabling plain 3D Slicer (without SlicerDMRI installed) to harden non-linear or
+  tensor-free transforms, and [bin/wm_harden_transform.py](../bin/wm_harden_transform.py)
+  automatically wraps headless Linux Slicer invocations with `xvfb-run -a` when
+  `DISPLAY` is unset (disable with `-no_xvfb` / `--no-xvfb` or `WMA_NO_XVFB=1`).
+- **Tier 3 (Full SlicerDMRI hardening):** Legacy Slicer `FiberBundleNode`
+  hardening remains active when tensor arrays are present and SlicerDMRI is
+  installed.
+- **Single-process ORG pipeline:** [bin/wm_apply_ORG_atlas.py](../bin/wm_apply_ORG_atlas.py)
+  orchestrates registration, 40 mm length filtering, spectral clustering,
+  multi-GPU/threaded outlier removal + hemisphere assessment, tiered hardening
+  + separation, and anatomical tract assembly in one Python process (using
+  `ThreadPoolExecutor` / `use_threads=True` VTP writes after CUDA init to avoid
+  post-CUDA `fork()` hazards, writing `qc_summary.json`, and staging outputs
+  atomically).
+
+### Legacy Slicer batching notes (shell pipeline)
 
 Hemisphere assessment, inverse transformation with Slicer, hemisphere separation
 and anatomical tract assembly run on the **CPU/Slicer in all three backend
-profiles**. Changing `-g` does not select another implementation for these stages.
+profiles** of `wm_apply_ORG_atlas_to_subject.sh`. Changing `-g` does not select
+another implementation for these stages.
 Their improvements come from vectorized geometry/label access, independent
 file processing, lossless intermediate compression and batching many files into
 Slicer workers. They do not contain the large distance matrices that benefit
@@ -235,3 +279,76 @@ and eager kernels, B-splines, file metadata and Slicer workflows. Float64 retain
 unit coordinate differences even around `1e8`; float32 can erase those differences
 and remains opt-in. Explicit `-gpu on` now requires usable CUDA rather than
 silently falling back to CPU.
+
+## Phase 2 benchmarks (`fan93`, RTX 3090)
+
+Measured on `fan93` (NVIDIA GeForce RTX 3090 GPUs 5 & 6, PyTorch `2.8.0+cu128`,
+Triton `3.4.0`, SciPy `1.13.1`, NumPy `2.0.2`, VTK `9.6.2`) using `sub-13086`
+(**340,795 fibers**) and the `ORG-RegAtlas-100HCP` + `ORG-800FC-100HCP` atlases.
+
+### Benchmark A: Split-C `nearest_centroids` microbenchmark (GPU 5, 31 repeats)
+
+All shapes and dtypes matched `torch.cdist(..., compute_mode='donot_use_mm_for_euclid_dist').min(1)`
+exactly (`max_diff = 0.00e+00`, `idx_eq = True`):
+
+| Dtype | `(N_q, N_c, P)` | `torch.cdist + min` | Split-C Triton | Speedup | Peak VRAM (cdist -> Split-C) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `float64` | `(2048, 800, 10)` | `11.909 ms` | `0.533 ms` | **22.34x** | `12.78 MiB` -> `0.53 MiB` |
+| `float64` | `(8192, 800, 10)` | `47.696 ms` | `1.932 ms` | **24.69x** | `51.00 MiB` -> `1.97 MiB` |
+| `float64` | `(16384, 800, 10)` | `95.806 ms` | `3.813 ms` | **25.12x** | `102.06 MiB` -> `3.94 MiB` |
+| `float64` | `(2048, 800, 20)` | `12.098 ms` | `0.863 ms` | **14.02x** | `13.50 MiB` -> `1.18 MiB` |
+| `float32` | `(2048, 800, 10)` | `3.491 ms` | `0.140 ms` | **24.93x** | `6.47 MiB` -> `0.80 MiB` |
+| `float32` | `(8192, 800, 10)` | `13.901 ms` | `0.158 ms` | **88.04x** | `25.58 MiB` -> `2.99 MiB` |
+| `float32` | `(16384, 800, 10)` | `27.552 ms` | `0.247 ms` | **111.49x** | `51.22 MiB` -> `6.00 MiB` |
+| `float32` | `(2048, 800, 20)` | `3.501 ms` | `0.147 ms` | **23.87x** | `6.89 MiB` -> `0.78 MiB` |
+
+Versus Phase 1's `float64`/`P=10`-only 2D tiled kernel (`c92e92d`, `bench_gpu_centroid_tiles.py`),
+Phase 2 generalizes to `float32` and `1 <= P <= 64` while cutting peak extra tensor
+allocations by ~29x–50x (`13,139,968 B -> 262,144 B` at `(2048, 800, 10)`;
+`52,559,872 B -> 1,048,576 B` at `(8192, 800, 10)`; `13,139,968 B -> 458,752 B` at
+`(2048, 800, 20)`; `81,408 B -> 5,120 B` at `(257, 37, 10)`), at `0.549 -> 0.662 ms`,
+`1.796 -> 2.236 ms`, `0.883 -> 1.021 ms`, and `0.138 -> 0.112 ms` respectively on
+consumer RTX 3090 (`1:64` FP64 throughput).
+
+### Benchmark B: Precision & kernel fusion (`sub-13086`, 340,795 fibers, GPU 5)
+
+| Mode | Cold-process Reg / Label | Warm-GPU Reg / Label | Transform Max Diff | 340,795-fiber Label Match |
+| --- | ---: | ---: | ---: | ---: |
+| `float64 strict` (`WMA_GPU_STRICT=1`) | `6.900 s` / `7.564 s` | `2.424 s` / `4.394 s` | `0` (ref) | `100.0000%` (ref) |
+| `float64 fused` (default, `WMA_GPU_STRICT=0`) | `6.335 s` / `4.496 s` | `2.376 s` / `4.305 s` | `2.681e-12` | `100.0000%` (`0` diffs) |
+| `float32 fused` (`WMA_GPU_FLOAT32=1`) | `5.250 s` / `6.503 s` | `0.757 s` / `0.742 s` | `4.485e-02` | `100.0000%` (`0` diffs) |
+
+Cold-process subprocess times include first-time CUDA/Triton JIT initialization;
+in warm-GPU steady state, `float32` speeds up `rigid_affine_fast` registration by
+**3.20x** and 340k `spectral_atlas_label` by **5.92x** vs `float64`.
+
+### Benchmark C: Single-GPU (`5`) vs dual-GPU (`5, 6`) scaling & parity
+
+| Workload | 1 GPU | 2 GPUs | Speedup | Numerical Parity (1 GPU vs 2 GPUs) |
+| --- | ---: | ---: | ---: | --- |
+| 340k `spectral_atlas_label` (`float64`, warm) | `4.374 s` | `2.690 s` | **1.63x** | `0` label diffs; `embed_max_diff = 0.000e+00` |
+| 340k `spectral_atlas_label` (`float32`, warm) | `0.843 s` | `0.833 s` | `1.01x` | `0` label diffs; `embed_max_diff = 4.292e-06` |
+| 800-cluster `wm_cluster_remove_outliers.py -j 4 -gpu on` (warm `f64` cache) | `19.365 s` | `10.870 s` | **1.78x** | Identical across all 800 clusters & Phase 1 (`230,639` in -> `43,336` kept / `187,303` rejected) |
+| `MultiSubjectRegistration` (4 subj x 2,000 fibers, 1 Affine + 1 Nonrigid, `parallel_jobs=4`) | `3.043 s` (`1.516 s` + `1.527 s`) | `1.854 s` (`1.607 s` + `0.247 s`) | **1.64x** | `aff_diff = 0.000e+00`; `nr_diff = 0.000e+00` |
+
+### Benchmark D: End-to-end single-process `wm_apply_ORG_atlas.py` (`sub-13086`, GPUs `5, 6`, `-r rig -j 4 -gpu on`)
+
+Both runs verified `hardening_backend = "pure_python_affine"`, `has_tensor_arrays = false`,
+`input_fibers = 340,795`, `registered_fibers = 340,795`, `filtered_fibers = 227,409`,
+`excluded_short_fibers = 113,386`, `anatomical_tracts_written = 76 / 76` (74 curated
+tracts plus left/right `T_FalsePositive`), and `anatomical_tracts_complete.log`.
+
+| Run | Wall Time (`/usr/bin/time -v`) | Peak RSS | `clustering` Stage | `outlier_and_hemisphere` | Retained Clustered Fibers | Total Fibers Across 76 `T_*.vtp` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `float64` (warm `f64` atlas cache) | **2:05.21** (`125.21 s`) | `4,154,596 KiB` (`4,057.22 MiB`) | `90.237 s` | `5.581 s` | `48,906` | `37,323` |
+| `-gpu_float32` (first cold `f32` atlas cache) | **2:17.50** (`137.50 s`) | `4,153,856 KiB` (`4,056.50 MiB`) | `91.904 s` | `15.938 s` | `48,497` | `37,007` |
+
+Notes:
+- Between `float64` and `-gpu_float32`, **47 / 76** anatomical tracts had identical
+  fiber counts (`median_abs_delta = 0.0`, `max_abs_delta = 74` on `T_Sup-P_left.vtp`).
+- The ~90 s `clustering` stage is dominated by CPU/I/O work (`ORG-800FC-100HCP/atlas.p`
+  load and single-threaded `mask_all_clusters` splitting 227,409 fibers into 800
+  polydata objects); GPU similarity/embedding itself is < 3 s (`float64`) / < 1 s (`float32`).
+- In the `-gpu_float32` run, `WMA_ATLAS_CACHE` only held pre-warmed `float64`
+  entries, so `outlier_and_hemisphere` (`15.938 s` vs `5.581 s`) included building
+  the 800 `float32` cache files on first run.

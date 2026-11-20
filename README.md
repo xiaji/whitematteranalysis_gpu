@@ -32,6 +32,31 @@ CPU outputs were byte-identical to joblib. GPU membership, connectivity and
 attributes matched; maximum coordinate difference: **1.91e-6 mm**.
 See the [acceleration overview](doc/acceleration.md) for details.
 
+### Single-process ORG CLI & Phase 2 GPU updates (`fan93`, 2x RTX 3090)
+
+For tensor-free rigid ORG parcellation, [bin/wm_apply_ORG_atlas.py](bin/wm_apply_ORG_atlas.py) runs
+registration, spectral clustering, outlier removal, pure-Python affine hardening,
+hemisphere separation and anatomical tract assembly in a single Python process
+with no 3D Slicer or SlicerDMRI subprocesses required (recording `qc_summary.json`
+and publishing atomically by default):
+
+```shell
+wm_apply_ORG_atlas.py -i subject.vtp -o output_dir -a /path/to/ORG-Atlases -r rig -j 4 -gpu on
+```
+
+On `sub-13086` (**340,795 streamlines**, `ORG-RegAtlas-100HCP` + `ORG-800FC-100HCP`,
+dual NVIDIA RTX 3090, warm `float64` atlas cache, `-r rig -j 4 -gpu on`),
+`wm_apply_ORG_atlas.py` completed end-to-end in **2:05.21 (125.21 s)** with
+**4,057.2 MiB** peak RSS (`hardening_backend: pure_python_affine`), writing all
+**76** `AnatomicalTracts/T_*.vtp` outputs (74 curated bundles plus left/right
+`T_FalsePositive`). In microbenchmarks on RTX 3090, Phase 2 adds FP32 + arbitrary
+`1 <= P <= 64` points-per-fiber Triton kernels (`5.9x` faster warm `spectral_atlas_label`
+and `3.2x` faster warm registration in `float32`), split-C low-VRAM `nearest_centroids`
+(`88x–111x` faster than `torch.cdist` in `float32`, `22x–25x` in `float64`),
+and multi-GPU scheduling (`1.63x` on 340k `float64` labeling and `1.78x` on 800-cluster
+outlier removal across 2 GPUs). See [doc/acceleration.md](doc/acceleration.md#phase-2-benchmarks-fan93-rtx-3090)
+for complete Benchmarks A–D tables.
+
 # GPU and 3D Slicer quick start
 
 ## Python / command line
@@ -76,6 +101,8 @@ Linux / Python 3.8 and Slicer 5.2.2 / Python 3.9 were tested; Windows has not be
 | `WMA_GPU=off`, `WMA_CPU_FAST=0` | Use the original per-fiber CPU implementation |
 | `WMA_GPU_DEVICES=0,1` | Select visible CUDA device indices for supported multi-GPU operations |
 | `WMA_GPU_FLOAT32=1` | Opt into float32; default is float64 |
+| `WMA_GPU_STRICT=1` | Use strict non-fused float64 registration reductions for bit-exact parity |
+| `WMA_GPU_MPS=1` | Opt into experimental Apple Silicon MPS when `WMA_GPU_FLOAT32=1` (`-gpu_float32`) and CUDA is absent |
 | `WMA_ATLAS_CACHE=/path/to/cache` | Override the automatic outlier atlas cache; `off` disables it |
 
 These environment variables apply to the Python/CLI backend. Slicer pages provide
@@ -136,7 +163,21 @@ The upstream `whitematteranalysis` documentation can be found at
 https://whitematteranalysis.readthedocs.io/en/latest/.
 Use the guides above for acceleration and Slicer behavior specific to this fork.
 
-* A master shell script `wm_apply_ORG_atlas_to_subject.sh` (see code [here](bin/wm_apply_ORG_atlas_to_subject.sh)) is provided to apply an anatomically curated white matter atlas ([the ORG atlas](https://dmri.slicer.org/atlases/)), along with the computation tools provided in whitematteranalysis, to perform subject-specific tractography parcellation.
+* For automated subject-specific ORG parcellation without SlicerDMRI in tensor-free rigid mode (falling back to 3D Slicer automatically wrapped with `xvfb-run -a` on headless Linux only for nonrigid mode, non-linear `.tfm` pre-transforms, or tensor-bearing inputs), use the single-process CLI [bin/wm_apply_ORG_atlas.py](bin/wm_apply_ORG_atlas.py):
+
+```shell
+$ wm_apply_ORG_atlas.py \
+  -i input_tractography.vtp \
+  -o output_dir \
+  -a path_to_atlas/ORG-Atlases-v1.x \
+  -r rig \
+  -j 4 \
+  -gpu on
+```
+
+For standalone linear `.tfm` hardening without 3D Slicer (on tensor-free files), `wm_harden_transform.py` also accepts `--pure-python` or `Slicer=none`/`auto`.
+
+* The legacy master shell script `wm_apply_ORG_atlas_to_subject.sh` (see code [here](bin/wm_apply_ORG_atlas_to_subject.sh)) remains available for SlicerDMRI-based multi-stage workflows and `FiberTractMeasurements`:
 
 ```shell
 $ wm_apply_ORG_atlas_to_subject.sh \
