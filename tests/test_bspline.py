@@ -69,6 +69,10 @@ class GPUBSplineTests(unittest.TestCase):
                         fallback.transform(field).cpu().numpy().transpose(2, 0, 1), original)
 
     def test_complete_optimization_and_release(self):
+        prev_strict = wma.gpu.config.strict_enabled()
+        wma.gpu.config.set_strict(True)
+        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
+
         rng = np.random.RandomState(42)
         reg = RegisterTractographyNonrigid()
         reg.nonrigid_grid_resolution = 3
@@ -88,8 +92,21 @@ class GPUBSplineTests(unittest.TestCase):
             reg.minimum_objective = np.inf
             with patch.object(registration_kernel, 'triton', None):
                 expected = reg.compute().copy()
+            expected_values = reg.objective_function_values.copy()
             np.testing.assert_array_equal(actual, expected)
-            np.testing.assert_array_equal(values, reg.objective_function_values)
+            np.testing.assert_array_equal(values, expected_values)
+
+            # Default non-strict mode (fused cross-fiber sums) stays within tight tolerance.
+            wma.gpu.config.set_strict(False)
+            reg.objective_function_values.clear()
+            reg.objective_computations = 0
+            reg.minimum_objective = np.inf
+            nonstrict_actual = reg.compute().copy()
+            nonstrict_values = reg.objective_function_values.copy()
+            np.testing.assert_allclose(nonstrict_values[0], expected_values[0],
+                                       rtol=1e-13, atol=1e-13)
+            np.testing.assert_allclose(nonstrict_actual, expected, rtol=1e-6, atol=1e-6)
+
             with patch('scipy.optimize.fmin_cobyla', side_effect=RuntimeError('failed')):
                 with self.assertRaisesRegex(RuntimeError, 'failed'):
                     reg.compute()

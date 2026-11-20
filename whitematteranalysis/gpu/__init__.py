@@ -36,13 +36,13 @@ Modules:
 
 from importlib import import_module as _import_module
 
-from .config import (config, set_gpu, set_float32, set_devices, set_tile_rows,
-                     use_gpu, float32_enabled, get_device, visible_device_count,
+from .config import (config, set_gpu, set_float32, set_strict, set_devices, set_tile_rows,
+                     use_gpu, float32_enabled, strict_enabled, get_device, visible_device_count,
                      add_gpu_arguments, apply_gpu_arguments)
 
 _BACKENDS = ('fiber_tensors', 'distance', 'registration', 'linalg', 'cpu_backend')
-__all__ = ('config', 'set_gpu', 'set_float32', 'set_devices', 'set_tile_rows',
-           'use_gpu', 'float32_enabled', 'get_device', 'visible_device_count',
+__all__ = ('config', 'set_gpu', 'set_float32', 'set_strict', 'set_devices', 'set_tile_rows',
+           'use_gpu', 'float32_enabled', 'strict_enabled', 'get_device', 'visible_device_count',
            'add_gpu_arguments', 'apply_gpu_arguments', 'available', *_BACKENDS)
 
 

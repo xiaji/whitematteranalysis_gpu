@@ -299,9 +299,10 @@ class MultiSubjectRegistration:
                 ret = [congeal_multisubject_inner_loop(*args, use_gpu=True, device=base_dev)
                        for args in arglist]
             elif n_gpus > 1:
+                worker_arglist = _prerender_fixed_brains(arglist)
                 print(f"Using GPU acceleration for registration ({n_gpus} devices, round-robin workers).")
-                ret = [None] * len(arglist)
-                workers = min(n_gpus, len(arglist))
+                ret = [None] * len(worker_arglist)
+                workers = min(n_gpus, len(worker_arglist))
 
                 def _run_gpu_worker(gpu_idx):
                     worker_dev = wma.gpu.get_device(gpu_idx)
@@ -309,13 +310,14 @@ class MultiSubjectRegistration:
                                if worker_dev.type == 'cuda' and torch.cuda.is_available()
                                else contextlib.nullcontext())
                     with dev_ctx:
-                        for subj_i in range(gpu_idx, len(arglist), n_gpus):
+                        for subj_i in range(gpu_idx, len(worker_arglist), n_gpus):
                             ret[subj_i] = congeal_multisubject_inner_loop(
-                                *arglist[subj_i], use_gpu=True, device=worker_dev)
+                                *worker_arglist[subj_i], use_gpu=True, device=worker_dev)
 
                 with ThreadPoolExecutor(max_workers=workers) as executor:
                     list(executor.map(_run_gpu_worker, range(workers)))
             else:
+                worker_arglist = _prerender_fixed_brains(arglist)
                 workers = 2 if self.parallel_jobs < 0 else min(max(1, self.parallel_jobs), 2)
                 print(f"Using GPU acceleration for registration (single device, {workers} CUDA streams).")
                 thread_local = threading.local()
@@ -334,7 +336,7 @@ class MultiSubjectRegistration:
                             *args, use_gpu=True, device=base_dev)
 
                 with ThreadPoolExecutor(max_workers=workers) as executor:
-                    ret = list(executor.map(_run_stream, arglist))
+                    ret = list(executor.map(_run_stream, worker_arglist))
         else:
             ret = Parallel(
                 n_jobs=self.parallel_jobs, verbose=self.parallel_verbose)(
@@ -514,6 +516,30 @@ class MultiSubjectRegistration:
             print("WRITE TXFORMS:", elapsed_time)
 
 
+def _subject_process_id(mode, subject_idx, iteration_count, sigma, grid_resolution):
+    if mode == "Nonrigid":
+        return "_subject_%05d_iteration_%05d_sigma_%03d_grid_%03d" % (
+            subject_idx, iteration_count, sigma, grid_resolution)
+    return "_subject_%05d_iteration_%05d_sigma_%03d" % (
+        subject_idx, iteration_count, sigma)
+
+
+def _prerender_fixed_brains(arglist):
+    worker_arglist = []
+    for args in arglist:
+        (fixed, _moving, _initial_transform, mode, sigma, subject_idx,
+         iteration_count, output_directory, _step_size, _maxfun, do_render,
+         grid_resolution) = args
+        if do_render:
+            wma.register_two_subjects.render_fixed_brain(
+                fixed, output_directory,
+                _subject_process_id(
+                    mode, subject_idx, iteration_count, sigma, grid_resolution))
+            args = args[:10] + (False,) + args[11:]
+        worker_arglist.append(args)
+    return worker_arglist
+
+
 def congeal_multisubject_inner_loop(mean, subject, initial_transform, mode, sigma, subject_idx, iteration_count, output_directory, step_size, maxfun, render, grid_resolution, use_gpu=None, device=None):
 
     """This is the code executed by each subprocess that launches the
@@ -526,7 +552,8 @@ def congeal_multisubject_inner_loop(mean, subject, initial_transform, mode, sigm
     # Set up registration objects and parameters that are specific to affine vs nonrigid
     if mode == "Affine" or mode == "Rigid":
         register = wma.register_two_subjects.RegisterTractography()
-        register.process_id_string = "_subject_%05d_iteration_%05d_sigma_%03d" % (subject_idx, iteration_count, sigma)
+        register.process_id_string = _subject_process_id(
+            mode, subject_idx, iteration_count, sigma, grid_resolution)
         if mode == "Rigid":
             register.mode = [1, 1, 0, 0] 
         # Make sure the initial iterations are performed with Cobyla.
@@ -538,7 +565,8 @@ def congeal_multisubject_inner_loop(mean, subject, initial_transform, mode, sigm
         register = wma.register_two_subjects_nonrigid_bsplines.RegisterTractographyNonrigid()
         register.nonrigid_grid_resolution = grid_resolution
         register.initialize_nonrigid_grid()
-        register.process_id_string = "_subject_%05d_iteration_%05d_sigma_%03d_grid_%03d" % (subject_idx, iteration_count, sigma, grid_resolution) 
+        register.process_id_string = _subject_process_id(
+            mode, subject_idx, iteration_count, sigma, grid_resolution)
 
     else:
         print("ERROR: Unknown registration mode")

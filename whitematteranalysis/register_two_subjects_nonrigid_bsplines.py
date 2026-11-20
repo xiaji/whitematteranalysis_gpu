@@ -217,19 +217,8 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
 
         # For debugging/monitoring of progress
         if self.render:
-            (dims, number_of_fibers_fixed, points_per_fiber) = self.fixed.shape
-            fiber_array = wma.fibers.FiberArray()
-            fiber_array.fiber_array_r = self.fixed[0,:,:]
-            fiber_array.fiber_array_a = self.fixed[1,:,:]
-            fiber_array.fiber_array_s = self.fixed[2,:,:]
-            fiber_array.points_per_fiber = points_per_fiber
-            fiber_array.number_of_fibers = number_of_fibers_fixed
-            pd2 = fiber_array.convert_to_polydata()
-            ren = wma.render.render(pd2, number_of_fibers_fixed, verbose=False)
-            # save low-res images for speed
-            ren.magnification = 3
-            ren.save_views(self.output_directory, 'fixed_brain_' + self.process_id_string)
-            del ren
+            wma.register_two_subjects.render_fixed_brain(
+                self.fixed, self.output_directory, self.process_id_string)
                 
         self.iterations += 1
         self.final_transform = numpy.zeros(self.initial_transform.shape)

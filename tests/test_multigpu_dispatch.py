@@ -120,13 +120,22 @@ class MultiGpuDispatchTests(unittest.TestCase):
                     stream_devices.append(device)
                 return MagicMock()
 
-            # 1. Mocked 2 CUDA GPUs
+            entered_cuda_devices = []
+
+            def fake_cuda_device(dev):
+                with lock:
+                    entered_cuda_devices.append(dev)
+                return contextlib.nullcontext()
+
+            # 1. Mocked 2 CUDA GPUs (safe even on 1-GPU CUDA hosts)
             arguments = [
                 str(OUTLIER_SCRIPT), str(input_dir), str(atlas_dir), str(output_dir),
                 '-gpu', 'on', '-gpu_devices', '0,1', '-j', '2',
             ]
             with patch.object(sys, 'argv', arguments), \
                     patch.object(wma.gpu.config, 'cuda_available', return_value=True), \
+                    patch.object(torch.cuda, 'is_available', return_value=True), \
+                    patch.object(torch.cuda, 'device', side_effect=fake_cuda_device), \
                     patch.object(torch.cuda, 'Stream', side_effect=fake_stream), \
                     patch.object(torch.cuda, 'stream', side_effect=lambda _s: contextlib.nullcontext()), \
                     patch.object(wma.cluster, 'load_atlas', return_value=types.SimpleNamespace(bilateral=False)), \
@@ -145,11 +154,13 @@ class MultiGpuDispatchTests(unittest.TestCase):
             self.assertEqual(by_cluster['cluster_00004.vtp'], dev1)
             self.assertEqual(seen_sim_devices.count(dev0), 2)
             self.assertEqual(seen_sim_devices.count(dev1), 2)
+            self.assertEqual(entered_cuda_devices.count(dev0), 2)
+            self.assertEqual(entered_cuda_devices.count(dev1), 2)
             self.assertGreaterEqual(len(stream_devices), 2)
             log = (output_dir / 'subject_outlier_removed' / 'cluster_log.txt').read_text().splitlines()
             self.assertEqual([row.split()[0] for row in log[1:]], ['1', '2', '3', '4'])
 
-            # 2. Mocked MPS with -j 2 must NOT create torch.cuda.Stream
+            # 2. Mocked MPS with -j 2 must NOT create torch.cuda.Stream or enter torch.cuda.device
             seen_load_devices.clear()
             seen_sim_devices.clear()
             wma.gpu.config.devices = None
@@ -162,6 +173,8 @@ class MultiGpuDispatchTests(unittest.TestCase):
             with patch.object(sys, 'argv', arguments_mps), \
                     patch.object(wma.gpu.config, 'cuda_available', return_value=False), \
                     patch.object(wma.gpu.config, 'mps_available', return_value=True), \
+                    patch.object(torch.cuda, 'device',
+                                 side_effect=AssertionError('must not enter CUDA device on MPS')), \
                     patch.object(torch.cuda, 'Stream',
                                  side_effect=AssertionError('must not create CUDA Stream on MPS')), \
                     patch.object(torch.cuda, 'stream',
@@ -242,7 +255,13 @@ class MultiGpuDispatchTests(unittest.TestCase):
                     reg.add_polydata(_make_polydata(6, n_points=5, seed=10 + i), f'sub{i}')
 
                 seen_devices = []
+                entered_cuda_devices = []
                 lock = threading.Lock()
+
+                def fake_cuda_device(dev):
+                    with lock:
+                        entered_cuda_devices.append(dev)
+                    return contextlib.nullcontext()
 
                 class FakeObjective:
                     def __init__(self, fixed, moving, *rest, device=None, **kwargs):
@@ -257,6 +276,8 @@ class MultiGpuDispatchTests(unittest.TestCase):
 
                 with patch.object(congeal_multisubject, 'HAVE_PLT', 0), \
                         patch.object(wma.gpu.config, 'cuda_available', return_value=True), \
+                        patch.object(torch.cuda, 'is_available', return_value=True), \
+                        patch.object(torch.cuda, 'device', side_effect=fake_cuda_device), \
                         patch.object(wma.gpu, 'visible_device_count', return_value=2), \
                         patch.object(wma.gpu, 'get_device',
                                      side_effect=lambda idx=None: torch.device('cuda', 0 if idx is None else idx)), \
@@ -265,6 +286,8 @@ class MultiGpuDispatchTests(unittest.TestCase):
                     reg.iterate()
 
                 self.assertEqual(len(seen_devices), 3)
+                self.assertEqual(set(entered_cuda_devices),
+                                 {torch.device('cuda', 0), torch.device('cuda', 1)})
                 # Map each subject by its unique mean(moving) tag to verify round-robin 0, 1, 0
                 subject_tags = []
                 for idx in range(3):
@@ -280,7 +303,7 @@ class MultiGpuDispatchTests(unittest.TestCase):
                 self.assertEqual(tag_to_device[subject_tags[2]], torch.device('cuda', 0))
                 self.assertEqual(len(reg.transforms_as_array), 3)
 
-        # Verify MPS mode runs without creating torch.cuda.Stream
+        # Verify MPS mode runs without creating torch.cuda.Stream or entering torch.cuda.device
         with tempfile.TemporaryDirectory() as tmpdir:
             reg = congeal_multisubject.MultiSubjectRegistration()
             reg.output_directory = tmpdir
@@ -309,6 +332,8 @@ class MultiGpuDispatchTests(unittest.TestCase):
             with patch.object(congeal_multisubject, 'HAVE_PLT', 0), \
                     patch.object(wma.gpu.config, 'cuda_available', return_value=False), \
                     patch.object(wma.gpu.config, 'mps_available', return_value=True), \
+                    patch.object(torch.cuda, 'device',
+                                 side_effect=AssertionError('must not enter CUDA device on MPS')), \
                     patch.object(torch.cuda, 'Stream',
                                  side_effect=AssertionError('must not create CUDA Stream on MPS')), \
                     patch.object(torch.cuda, 'stream',
@@ -317,6 +342,84 @@ class MultiGpuDispatchTests(unittest.TestCase):
                 reg.iterate()
 
             self.assertEqual(seen_mps, [mps_dev, mps_dev])
+
+    def test_congeal_multisubject_prerenders_on_main_thread_for_gpu_workers(self):
+        torch = self._require_torch()
+        saved_cfg = {name: getattr(wma.gpu.config, name)
+                     for name in ('requested', 'float32', 'devices', 'allow_mps')}
+        self.addCleanup(lambda: [setattr(wma.gpu.config, k, v) for k, v in saved_cfg.items()])
+
+        for mode, n_gpus in (('Affine', 2), ('Nonrigid', 2), ('Affine', 1)):
+            with self.subTest(mode=mode, n_gpus=n_gpus), tempfile.TemporaryDirectory() as tmpdir:
+                reg = congeal_multisubject.MultiSubjectRegistration()
+                reg.output_directory = tmpdir
+                reg.random_seed = 42
+                reg.render = True
+                reg.mode = mode
+                reg.nonrigid_grid_resolution = 3
+                reg.maxfun = 4
+                reg.mean_brain_size = 8
+                reg.subject_brain_size = 4
+                reg.points_per_fiber = 5
+                reg.parallel_jobs = 2
+                for i in range(3):
+                    reg.add_polydata(_make_polydata(6, n_points=5, seed=30 + i), f'sub{i}')
+
+                render_threads = []
+                render_names = []
+                worker_threads = []
+                seen_devices = []
+                lock = threading.Lock()
+
+                class FakeRenderer:
+                    def __init__(self):
+                        self.magnification = 1
+
+                    def save_views(self, outdir, prefix):
+                        render_names.append((outdir, prefix))
+
+                def fake_render(pd, n_fibers, verbose=False):
+                    render_threads.append(threading.current_thread())
+                    return FakeRenderer()
+
+                class FakeObjective:
+                    def __init__(self, fixed, moving, *rest, device=None, **kwargs):
+                        with lock:
+                            worker_threads.append(threading.current_thread())
+                            seen_devices.append(device)
+
+                    def __call__(self, param, *args, **kwargs):
+                        return float(np.sum(np.asarray(param) ** 2))
+
+                with patch.object(congeal_multisubject, 'HAVE_PLT', 0), \
+                        patch.object(wma.render, 'render', side_effect=fake_render), \
+                        patch.object(wma.gpu.config, 'cuda_available', return_value=True), \
+                        patch.object(torch.cuda, 'is_available', return_value=True), \
+                        patch.object(torch.cuda, 'device', side_effect=lambda _d: contextlib.nullcontext()), \
+                        patch.object(torch.cuda, 'Stream', return_value=MagicMock()), \
+                        patch.object(torch.cuda, 'stream', side_effect=lambda _s: contextlib.nullcontext()), \
+                        patch.object(wma.gpu, 'visible_device_count', return_value=n_gpus), \
+                        patch.object(wma.gpu, 'get_device',
+                                     side_effect=lambda idx=None: torch.device('cuda', 0 if idx is None else idx)), \
+                        patch.object(registration, 'AffineObjective', FakeObjective), \
+                        patch.object(bspline, 'NonrigidObjective', FakeObjective):
+                    reg.iterate()
+
+                self.assertEqual(len(render_threads), 3)
+                self.assertTrue(all(t is threading.main_thread() for t in render_threads))
+                expected_suffix = '_grid_003' if mode == 'Nonrigid' else ''
+                self.assertEqual(
+                    [name for _, name in render_names],
+                    [f'fixed_brain__subject_0000{i}_iteration_00001_sigma_020{expected_suffix}'
+                     for i in range(3)],
+                )
+                self.assertEqual(len(seen_devices), 3)
+                self.assertTrue(all(t is not threading.main_thread() for t in worker_threads))
+                if n_gpus == 2:
+                    self.assertEqual(set(seen_devices),
+                                     {torch.device('cuda', 0), torch.device('cuda', 1)})
+                else:
+                    self.assertEqual(set(seen_devices), {torch.device('cuda', 0)})
 
     @unittest.skipUnless(wma.gpu.available() and _cuda_device_count() >= 2,
                          'Two CUDA GPUs are required')

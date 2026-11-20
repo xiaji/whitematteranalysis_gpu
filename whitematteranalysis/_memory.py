@@ -6,7 +6,7 @@ from threading import Lock
 import numpy
 
 _core = getattr(numpy, '_core', None)
-if _core is None:
+if _core is None or not hasattr(_core, 'multiarray'):
     _core = numpy.core
 _set_hugepage = getattr(_core.multiarray, '_set_madvise_hugepage', None)
 
