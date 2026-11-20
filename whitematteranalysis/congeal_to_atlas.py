@@ -125,8 +125,29 @@ class SubjectToAtlasRegistration:
                 polydata, self.fiber_length, max_length_mm=self.fiber_length_max,
                 verbose=False)
             geometry = wma.filter._lines_offsets_connectivity(polydata)
-            cached = self._preprocessed[role] = (key, indices, geometry)
+            geom_valid = self._validate_geometry(geometry, polydata.GetNumberOfLines())
+            cached = self._preprocessed[role] = (key, indices, geometry, geom_valid)
         return cached[1]
+
+    @staticmethod
+    def _validate_geometry(geometry, num_lines):
+        if geometry is None:
+            return False
+        offsets, conn, points = geometry
+        if len(offsets) - 1 != num_lines:
+            return False
+        if points.ndim != 2 or points.shape[1] < 3:
+            return False
+        if num_lines == 0:
+            return True
+        if offsets[0] < 0 or offsets[-1] > len(conn):
+            return False
+        line_lengths = offsets[1:] - offsets[:-1]
+        if not bool(numpy.all(line_lengths >= 1)):
+            return False
+        if len(conn) > 0 and (int(conn.min()) < 0 or int(conn.max()) >= len(points)):
+            return False
+        return True
 
     @SmallPages()
     def _sample_preprocessed_polydata(self, polydata, role, sample_count, seed):
@@ -152,6 +173,51 @@ class SubjectToAtlasRegistration:
             polydata, fiber_mask, preserve_point_data=False,
             preserve_cell_data=False, verbose=False)
 
+    @SmallPages()
+    def _sample_preprocessed_fiber_array(self, polydata, role, sample_count, seed):
+        """Sample preprocessed fibers directly into a (3, K, P) float64 array."""
+        eligible = self._preprocessed_indices(polydata, role)
+        num_lines = polydata.GetNumberOfLines()
+        num_points = polydata.GetNumberOfPoints()
+        points_per_fiber = int(self.points_per_fiber)
+        if num_lines == 0 or num_points == 0:
+            return numpy.zeros((3, 0, points_per_fiber), dtype=numpy.float64)
+
+        cached = self._preprocessed[role]
+        geometry = cached[2]
+        geom_valid = cached[3] if len(cached) > 3 else self._validate_geometry(geometry, num_lines)
+        if geometry is None or not geom_valid or points_per_fiber < 2:
+            sampled = self._sample_preprocessed_polydata(polydata, role, sample_count, seed)
+            fibers = wma.fibers.FiberArray()
+            fibers.convert_from_polydata(sampled, points_per_fiber)
+            return numpy.array([fibers.fiber_array_r, fibers.fiber_array_a, fibers.fiber_array_s])
+
+        if eligible.size < sample_count:
+            selected = eligible
+        else:
+            numpy.random.seed(seed)
+            selected = eligible[numpy.random.permutation(eligible.size)[:sample_count]]
+
+        keep = numpy.sort(selected)
+        if keep.size == 0:
+            return numpy.zeros((3, 0, points_per_fiber), dtype=numpy.float64)
+
+        offsets, conn, points = geometry
+        starts = offsets[:-1][keep]
+        chunk_lengths = offsets[1:][keep] - starts
+        steps = (chunk_lengths.astype(numpy.float64) - 1.0) / (points_per_fiber - 1.0)
+        positions = numpy.arange(points_per_fiber, dtype=numpy.float64) * steps[:, numpy.newaxis]
+        local_ids = numpy.rint(positions).astype(numpy.int64)
+        global_ids = conn[starts[:, numpy.newaxis] + local_ids]
+
+        # Match filter.mask's float32 point storage rounding before FiberArray float64 upcast.
+        pts = points[global_ids].astype(numpy.float32, copy=False)
+        out = numpy.empty((3, keep.size, points_per_fiber), dtype=numpy.float64)
+        out[0] = pts[:, :, 0]
+        out[1] = pts[:, :, 1]
+        out[2] = pts[:, :, 2]
+        return out
+
     def iterate(self):
         self.total_iterations += 1
 
@@ -162,22 +228,14 @@ class SubjectToAtlasRegistration:
             os.makedirs(outdir)
 
         print("filtering and downsampling atlas")
-        mean_brain = self._sample_preprocessed_polydata(
+        fixed = self._sample_preprocessed_fiber_array(
             self.atlas_polydata, 'atlas', self.mean_brain_size,
             self.random_seed + self.total_iterations)
 
-        mean_fibers = wma.fibers.FiberArray()
-        mean_fibers.convert_from_polydata(mean_brain, self.points_per_fiber)
-        fixed = numpy.array([mean_fibers.fiber_array_r,mean_fibers.fiber_array_a,mean_fibers.fiber_array_s])
-        
         print("filtering and downsampling subject")
-        subject_brain = self._sample_preprocessed_polydata(
+        moving = self._sample_preprocessed_fiber_array(
             self.subject_polydata, 'subject', self.subject_brain_size,
             self.random_seed + self.total_iterations)
-
-        fibers = wma.fibers.FiberArray()
-        fibers.convert_from_polydata(subject_brain, self.points_per_fiber)
-        moving = numpy.array([fibers.fiber_array_r,fibers.fiber_array_a,fibers.fiber_array_s])
 
         subject_idx = 1
         iteration_count = self.total_iterations
@@ -253,14 +311,16 @@ class SubjectToAtlasRegistration:
         # set_subject retains the full input, before registration-only filtering.
         pd = self.subject_polydata
 
-        transformer = vtk.vtkTransformPolyDataFilter()
-        if (vtk.vtkVersion().GetVTKMajorVersion() >= 6.0):
-            transformer.SetInputData(pd)
+        if self.mode == "Nonrigid":
+            transformer = vtk.vtkTransformPolyDataFilter()
+            if (vtk.vtkVersion().GetVTKMajorVersion() >= 6.0):
+                transformer.SetInputData(pd)
+            else:
+                transformer.SetInput(pd)
+            transformer.SetTransform(self.transform)
+            transformer.Update()
+            pd2 = transformer.GetOutput()
         else:
-            transformer.SetInput(pd)
-        transformer.SetTransform(self.transform)
-        transformer.Update()
-
-        pd2 = transformer.GetOutput()
+            pd2 = wma.transform.apply_affine_to_polydata(pd, self.transform)
         wma.io.write_polydata(pd2, out_fname)
 

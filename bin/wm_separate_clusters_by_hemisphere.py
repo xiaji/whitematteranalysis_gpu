@@ -23,6 +23,7 @@ from vtk.util.numpy_support import vtk_to_numpy
 from joblib import Parallel, delayed
 
 import whitematteranalysis as wma
+from whitematteranalysis._hemisphere import split_polydata
 
 
 
@@ -128,19 +129,6 @@ def _process_cluster(fname, outdir):
         raise RuntimeError("Hemisphere labels are missing or incomplete: " + fname)
 
     split_polydata(pd, mask_location, fname_base, outdir)
-
-
-def split_polydata(pd, mask_location, fname_base, outdir):
-    """Write the three hemisphere subsets from an already labeled polydata."""
-    masks = {1: mask_location == 1, 2: mask_location == 2, 3: mask_location == 3}
-    geometry = wma.filter._lines_offsets_connectivity(pd)
-    for location, folder in ((1, 'tracts_left_hemisphere'),
-                             (2, 'tracts_right_hemisphere'),
-                             (3, 'tracts_commissural')):
-        output = wma.filter.mask(pd, masks[location], preserve_point_data=True,
-                                 preserve_cell_data=True, verbose=False,
-                                 _geometry=geometry)
-        wma.io.write_polydata(output, os.path.join(outdir, folder, fname_base))
 
 
 def main():

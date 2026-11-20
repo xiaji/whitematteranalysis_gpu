@@ -10,11 +10,21 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from joblib import Parallel, delayed, effective_n_jobs
+import vtk
+
+_repo_root = Path(__file__).resolve().parents[1]
+if (_repo_root / 'whitematteranalysis').is_dir():
+    _repo_str = str(_repo_root)
+    if _repo_str not in sys.path:
+        sys.path.insert(0, _repo_str)
 
 import whitematteranalysis as wma
+from whitematteranalysis._hemisphere import read_mask_location_from_vtk, split_polydata
+from whitematteranalysis._memory import SmallPages
 
 
 def _build_arg_parser():
@@ -23,7 +33,8 @@ def _build_arg_parser():
     parser.add_argument('-v', '--version', action='version', version='1.0')
     parser.add_argument('inputDirectory', help='Directory of input VTK/VTP files.')
     parser.add_argument('outputDirectory', help='Directory of transformed results.')
-    parser.add_argument('Slicer', help='Path of 3D Slicer.')
+    parser.add_argument('Slicer', nargs='?', default=None,
+                        help="Path of 3D Slicer, or 'none'/'auto' for pure-Python linear hardening.")
     transforms = parser.add_mutually_exclusive_group(required=True)
     transforms.add_argument('-t', dest='transform_file', help='One transform for all input files.')
     transforms.add_argument('-ts', dest='transform_folder', help='Sorted transforms matching sorted input files.')
@@ -32,6 +43,10 @@ def _build_arg_parser():
                         help='Number of Slicer workers. A shared transform uses one batch per worker.')
     parser.add_argument('--split-output-directory', default=None,
                         help='Also write hemisphere subsets from each hardened file.')
+    parser.add_argument('--pure-python', action='store_true', dest='pure_python',
+                        help='Apply linear ITK .tfm transforms directly in Python (tensor-free polydatas only).')
+    parser.add_argument('-no_xvfb', '--no-xvfb', action='store_true', dest='no_xvfb',
+                        help='Disable automatic xvfb-run wrapper on headless Linux.')
     parser.add_argument('--profile', action='store_true',
                         help='Keep worker logs and JSON timings after successful processing.')
     parser.add_argument('--input-catalogue',
@@ -42,7 +57,8 @@ def _build_arg_parser():
 
 
 def _run_slicer(polydata, transform, inverse, slicer_path, helper, outdir, partition,
-                partitions, log, split_output_dir=None, profile_output=None, input_status=None):
+                partitions, log, split_output_dir=None, profile_output=None, input_status=None,
+                no_xvfb=False):
     command = [str(slicer_path), '--no-main-window', '--disable-modules',
                '--python-script', helper,
                str(polydata), str(transform), str(int(inverse)), str(outdir),
@@ -54,6 +70,16 @@ def _run_slicer(polydata, transform, inverse, slicer_path, helper, outdir, parti
     if input_status is not None:
         command.extend(['--input-status', str(input_status)])
     command.extend(['--python-code', 'slicer.app.quit()'])
+    use_xvfb = (
+        not no_xvfb
+        and sys.platform.startswith('linux')
+        and not os.environ.get('DISPLAY')
+        and os.environ.get('WMA_NO_XVFB', '').strip().lower() not in ('1', 'true', 'yes', 'on')
+    )
+    if use_xvfb:
+        xvfb = shutil.which('xvfb-run')
+        if xvfb:
+            command = [xvfb, '-a'] + command
     environment = os.environ.copy()
     environment.pop('PYTHONPATH', None)
     for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
@@ -103,11 +129,87 @@ def _run_prepared(runs, workers, command, status, inputdir, expected):
     return prepare_seconds
 
 
+def _split_hardened_polydata(polydata, out_name, split_output_dir):
+    found, labels = read_mask_location_from_vtk(polydata)
+    if not found:
+        raise RuntimeError('HemisphereLocation is missing from transformed file: ' + str(out_name))
+    if (labels == 0).sum() > 1:
+        raise RuntimeError('Hemisphere labels are incomplete: ' + str(out_name))
+    split_polydata(polydata, labels, os.path.basename(str(out_name)), str(split_output_dir))
+
+
+def _run_pure_python(inputs, transform_paths, inverse, outdir, workers,
+                     split_output_dir=None, allow_fallback=False):
+    matrix_cache = {}
+    for tf_path in transform_paths:
+        key = str(tf_path)
+        if key not in matrix_cache:
+            mat = wma.transform.read_itk_affine_matrix_ras(key, inverse=inverse)
+            if mat is None:
+                if allow_fallback:
+                    return False
+                raise RuntimeError(
+                    'Pure-Python hardening requires linear ITK affine .tfm transforms; '
+                    'unsupported transform: ' + key)
+            matrix_cache[key] = mat
+
+    if allow_fallback:
+        for pd_path in inputs:
+            if wma.transform.has_tensor_arrays(wma.io.read_polydata(str(pd_path))):
+                return False
+
+    def _harden_one(item):
+        pd_path, tf_path = item
+        out_name = outdir / Path(pd_path).name
+        if out_name.exists():
+            if split_output_dir is None:
+                return
+            split_files = [split_output_dir / folder / Path(pd_path).name
+                           for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere',
+                                          'tracts_commissural')]
+            if all(path.is_file() for path in split_files):
+                return
+            with SmallPages():
+                _split_hardened_polydata(wma.io.read_polydata(str(out_name)), out_name, split_output_dir)
+            return
+
+        with SmallPages():
+            pd = wma.io.read_polydata(str(pd_path))
+            if wma.transform.has_tensor_arrays(pd):
+                raise RuntimeError(
+                    'Pure-Python hardening cannot rotate tensor/vector/normal arrays; '
+                    'use 3D Slicer with SlicerDMRI: ' + str(pd_path))
+            if pd.GetNumberOfCells() == 0:
+                if os.path.splitext(str(out_name))[1] == os.path.splitext(str(pd_path))[1]:
+                    shutil.copyfile(str(pd_path), str(out_name))
+                else:
+                    wma.io.write_polydata(pd, str(out_name))
+                hardened = pd
+            else:
+                hardened = wma.transform.apply_affine_to_polydata(pd, matrix_cache[str(tf_path)])
+                if out_name.suffix == '.vtp':
+                    space = vtk.vtkStringArray()
+                    space.SetName('SPACE')
+                    space.InsertNextValue('RAS')
+                    hardened.GetFieldData().AddArray(space)
+                wma.io.write_polydata(hardened, str(out_name))
+            if split_output_dir is not None:
+                _split_hardened_polydata(hardened, out_name, split_output_dir)
+
+    items = list(zip(inputs, transform_paths))
+    if workers <= 1:
+        for item in items:
+            _harden_one(item)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_harden_one, items))
+    return True
+
+
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
-    inputdir, outdir, slicer_path = map(Path, (args.inputDirectory, args.outputDirectory, args.Slicer))
-    inputdir, outdir, slicer_path = inputdir.resolve(), outdir.resolve(), slicer_path.resolve()
+    inputdir, outdir = map(lambda p: Path(p).resolve(), (args.inputDirectory, args.outputDirectory))
     split_output_dir = (Path(args.split_output_directory).resolve()
                         if args.split_output_directory else None)
     if bool(args.input_catalogue) != bool(args.prepare_command):
@@ -117,8 +219,25 @@ def main():
         parser.error('Input catalogue does not exist: ' + str(catalogue))
     if not args.prepare_command and not inputdir.is_dir():
         parser.error('Input directory does not exist: ' + str(inputdir))
-    if not slicer_path.is_file():
-        parser.error('Slicer executable does not exist: ' + str(slicer_path))
+
+    slicer_arg = args.Slicer
+    slicer_mode_keyword = slicer_arg.lower() if isinstance(slicer_arg, str) else None
+    if not args.pure_python and slicer_arg is None:
+        parser.error('Slicer executable is required unless --pure-python or Slicer=none/auto is given.')
+
+    pure_python_requested = args.pure_python or slicer_mode_keyword == 'none'
+    auto_requested = (not pure_python_requested) and slicer_mode_keyword == 'auto'
+
+    slicer_path = None
+    if not pure_python_requested:
+        if auto_requested:
+            found_slicer = shutil.which('Slicer')
+            slicer_path = Path(found_slicer).resolve() if found_slicer else None
+        else:
+            slicer_path = Path(slicer_arg).resolve()
+            if not slicer_path.is_file():
+                parser.error('Slicer executable does not exist: ' + str(slicer_path))
+
     outdir.mkdir(parents=True, exist_ok=True)
     if split_output_dir is not None:
         for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
@@ -135,24 +254,54 @@ def main():
         transforms = wma.io.list_transform_files(str(transform_path))
         if len(inputs) != len(transforms):
             parser.error('The input and transform file counts must match.')
+        transform_list = transforms
         tasks = [(polydata, transform, 0, 1) for polydata, transform in zip(inputs, transforms)]
     else:
         transform_path = Path(args.transform_file).resolve()
         if not transform_path.is_file():
             parser.error('Transform file does not exist: ' + str(transform_path))
+        transform_list = [transform_path] * len(inputs)
         tasks = [(inputdir, transform_path, index, workers) for index in range(workers)] if inputs else []
-    print('Harden %d files with %d Slicer worker(s).' % (len(inputs), workers), flush=True)
+
     if not tasks:
         return
-    marker = outdir/'transform_complete.log'
+
+    marker = outdir / 'transform_complete.log'
     if marker.exists():
         marker.unlink()
+
+    if pure_python_requested or auto_requested:
+        print('Harden %d files with pure-Python affine (%d worker(s)).' % (len(inputs), workers), flush=True)
+        expected = {Path(path).name for path in inputs}
+        if args.prepare_command:
+            subprocess.run(args.prepare_command, check=True)
+            actual = {Path(path).name for path in wma.io.list_vtk_files(str(inputdir))}
+            if actual != expected:
+                raise RuntimeError('Prepared input filenames do not match the catalogue.')
+        if _run_pure_python(inputs, transform_list, args.inverse_transform, outdir,
+                            workers, split_output_dir, allow_fallback=auto_requested):
+            actual = {Path(path).name for path in wma.io.list_vtk_files(str(outdir))}
+            if not expected.issubset(actual):
+                raise RuntimeError('Transformed files are missing in ' + str(outdir))
+            if split_output_dir is not None:
+                for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
+                    split_files = {Path(path).name for path in wma.io.list_vtk_files(str(split_output_dir / folder))}
+                    if not expected.issubset(split_files):
+                        raise RuntimeError('Hemisphere outputs are missing from %s' % folder)
+            marker.write_text('Transforms completed for %d files.\n' % len(inputs))
+            print('Transforms completed for %d files.' % len(inputs), flush=True)
+            return
+        if slicer_path is None or not slicer_path.is_file():
+            raise RuntimeError('Slicer executable is required for non-linear transforms or tensor-bearing inputs.')
+
+    print('Harden %d files with %d Slicer worker(s).' % (len(inputs), workers), flush=True)
     logs = Path(tempfile.mkdtemp(prefix='wma-harden-', dir=str(outdir)))
     print('Slicer worker logs: ' + str(logs), flush=True)
     status = logs / 'input.status' if args.prepare_command else None
+    xvfb_kw = {'no_xvfb': True} if args.no_xvfb else {}
     runs = [partial(_run_slicer, polydata, transform, args.inverse_transform, slicer_path, helper,
             outdir, index, count, logs/('worker_%04d.log' % task), split_output_dir,
-            logs/('worker_%04d.json' % task) if args.profile else None, status)
+            logs/('worker_%04d.json' % task) if args.profile else None, status, **xvfb_kw)
         for task, (polydata, transform, index, count) in enumerate(tasks)]
     expected = {Path(path).name for path in inputs}
     started = time.perf_counter()

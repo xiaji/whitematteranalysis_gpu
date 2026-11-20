@@ -118,3 +118,24 @@ def assess_polydata(polydata, cluster_index, location_data=None,
 
     write_mask_location_to_vtk(polydata, labels)
     return polydata, labels, True
+
+
+def split_polydata_subsets(pd, mask_location):
+    """Return (left_pd, right_pd, commissural_pd) subsets for an already labeled polydata."""
+    masks = {1: mask_location == 1, 2: mask_location == 2, 3: mask_location == 3}
+    geometry = wma.filter._lines_offsets_connectivity(pd)
+    return tuple(
+        wma.filter.mask(pd, masks[location], preserve_point_data=True,
+                        preserve_cell_data=True, verbose=False,
+                        _geometry=geometry)
+        for location in (1, 2, 3)
+    )
+
+
+def split_polydata(pd, mask_location, fname_base, outdir):
+    """Write the three hemisphere subsets from an already labeled polydata."""
+    import os
+    subsets = split_polydata_subsets(pd, mask_location)
+    folders = ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural')
+    for folder, output in zip(folders, subsets):
+        wma.io.write_polydata(output, os.path.join(outdir, folder, fname_base))
