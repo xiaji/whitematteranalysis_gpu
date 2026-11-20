@@ -7,12 +7,6 @@ if triton is not None:
     from triton.language.extra.cuda import libdevice
 
     @triton.jit
-    def _exp(x, DTYPE: tl.constexpr):
-        if DTYPE == tl.float32:
-            return libdevice.expf(x)
-        return libdevice.exp(x)
-
-    @triton.jit
     def _values(F, Q, fi, qi, p, mask, P: tl.constexpr,
                 REVERSE: tl.constexpr, THRESHOLD2: tl.constexpr, METHOD: tl.constexpr,
                 BILATERAL: tl.constexpr = False, INV_SIGMA: tl.constexpr = 0.,
@@ -45,8 +39,8 @@ if triton is not None:
             reflected = libdevice.sqrt_rn(reflected)
         elif METHOD == 'StrictSimilarity':
             inv = tl.full((), INV_SIGMA, DTYPE)
-            d = _exp(-d * inv, DTYPE)
-            reflected = _exp(-reflected * inv, DTYPE)
+            d = libdevice.exp(-d * inv)
+            reflected = libdevice.exp(-reflected * inv)
         return d, reflected
 
     @triton.jit
@@ -119,7 +113,7 @@ if triton is not None:
             else:
                 result = tl.minimum(result, reflected, propagate_nan=tl.PropagateNan.ALL)
         if GAUSSIAN:
-            result = _exp(-result * tl.full((), INV_GAUSSIAN, DTYPE), DTYPE)
+            result = libdevice.exp(-result * tl.full((), INV_GAUSSIAN, DTYPE))
         tl.store(Output + pair, result, pair < COUNT)
 
     @triton.jit
@@ -287,7 +281,7 @@ if triton is not None:
                 reflected = _reduce_orientations(ra, rb, P, WIDTH, STEPS, 'MeanSquared', BLOCK_N, DTYPE)
                 mean_dist = tl.minimum(mean_dist, reflected, propagate_nan=tl.PropagateNan.ALL)
             d_sq = mean_dist * mean_dist
-            sim = _exp(-d_sq * inv_sigma, DTYPE)
+            sim = libdevice.exp(-d_sq * inv_sigma)
             sim_acc += tl.sum(tl.where(valid, sim, zero), axis=0)
             if COMPUTE_SQRT:
                 dist_acc += tl.sum(tl.where(valid, mean_dist, zero), axis=0)

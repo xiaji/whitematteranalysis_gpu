@@ -143,9 +143,25 @@ class GPUMemoryTests(unittest.TestCase):
             gpu_config.config.max_vram_gib = 2.0
             self.assertEqual(gpu_memory.effective_free_vram(mps_device), 2 << 30)
 
+        has_real_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+        mps_patch = (
+            patch.multiple(torch.backends.mps, is_available=lambda: True)
+            if not has_real_mps and hasattr(torch.backends, 'mps')
+            else None
+        )
+        cache_patch = (
+            patch.object(torch.mps, 'empty_cache', return_value=None)
+            if not has_real_mps and hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache')
+            else None
+        )
         with patch.object(torch.cuda, 'empty_cache',
                           side_effect=AssertionError('must not call cuda.empty_cache on MPS')):
-            gpu_memory.empty_cache(mps_device)
+            if mps_patch is not None:
+                with mps_patch, cache_patch as mps_cache_mock:
+                    gpu_memory.empty_cache(mps_device)
+                    mps_cache_mock.assert_called_once_with()
+            else:
+                gpu_memory.empty_cache(mps_device)
             gpu_memory.empty_cache(torch.device('cpu'))
 
     def test_tiled_host_apis_fall_back_in_bounded_cpu_batches_on_tile_1_oom(self):

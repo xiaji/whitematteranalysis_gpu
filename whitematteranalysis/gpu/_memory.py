@@ -57,7 +57,10 @@ def empty_cache(device=None) -> None:
     dev_type = _device_type(device)
     if dev_type == 'cuda':
         torch.cuda.empty_cache()
-    elif dev_type == 'mps' and hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+    elif (dev_type == 'mps' and hasattr(torch, 'mps')
+            and hasattr(torch.mps, 'empty_cache')
+            and hasattr(torch.backends, 'mps')
+            and torch.backends.mps.is_available()):
         torch.mps.empty_cache()
 
 

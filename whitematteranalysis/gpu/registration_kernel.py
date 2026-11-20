@@ -10,12 +10,6 @@ except ImportError:
 
 if triton is not None:
     @triton.jit
-    def _exp(x, DTYPE: tl.constexpr):
-        if DTYPE == tl.float32:
-            return libdevice.expf(x)
-        return libdevice.exp(x)
-
-    @triton.jit
     def _affine_points(Moving, Matrix, Output, COUNT, BLOCK: tl.constexpr,
                        DTYPE: tl.constexpr = tl.float64):
         point = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
@@ -103,7 +97,7 @@ if triton is not None:
         reverse = tl.reshape(reverse, (BLOCK,)) * inv
         if PROBABILITY:
             distance = tl.minimum(forward, reverse, propagate_nan=tl.PropagateNan.ALL)
-            values = _exp(-distance * tl.full((), INV_SIGMA, DTYPE), DTYPE)
+            values = libdevice.exp(-distance * tl.full((), INV_SIGMA, DTYPE))
             tl.store(Forward + pair, values, pair < COUNT)
         else:
             tl.store(Forward + pair, forward, pair < COUNT)
@@ -160,7 +154,7 @@ if triton is not None:
                 rev_acc += (rdx * rdx + rdy * rdy) + rdz * rdz
 
             d = tl.minimum(fwd_acc * inv, rev_acc * inv, propagate_nan=tl.PropagateNan.ALL)
-            prob = _exp(-d * inv_sigma, DTYPE)
+            prob = libdevice.exp(-d * inv_sigma)
             prob = tl.where(valid_m[:, None] & valid_f[None, :], prob, zero)
             row_acc += tl.sum(prob, axis=1)
 

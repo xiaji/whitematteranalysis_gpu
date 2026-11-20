@@ -236,8 +236,8 @@ class TransformModuleTests(unittest.TestCase):
                 '#Insight Transform File V1.0\n'
                 '# Transform 0\n'
                 'Transform: MatrixOffsetTransformBase_double_3_3\n'
-                'Parameters: ' + ' '.join(repr(x) for x in list(A.ravel()) + list(t)) + '\n'
-                'FixedParameters: ' + ' '.join(repr(x) for x in c) + '\n'
+                'Parameters: ' + ' '.join(repr(float(x)) for x in list(A.ravel()) + list(t)) + '\n'
+                'FixedParameters: ' + ' '.join(repr(float(x)) for x in c) + '\n'
             )
 
             m_inv = wma.transform.read_itk_affine_matrix_ras(str(centered_tfm), inverse=True)

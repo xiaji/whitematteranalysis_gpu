@@ -66,11 +66,11 @@ def _make_tract_polydata(lines_coords, tags=None, tensors=False, hemi_labels=Non
     return polydata
 
 
-def _bundle_coords(center_x, center_z, n_fibers, n_pts=21, step=3.0, commissural=False, seed=0):
+def _bundle_coords(center_x, center_z, n_fibers, n_pts=21, step=3.0, commissural=False, seed=0, jitter_scale=0.35):
     rng = np.random.RandomState(seed)
     fibers = []
     for _ in range(n_fibers):
-        jitter = rng.normal(scale=0.35, size=(1, 3))
+        jitter = rng.normal(scale=jitter_scale, size=(1, 3))
         if commissural:
             xs = np.linspace(-step * (n_pts - 1) / 2.0, step * (n_pts - 1) / 2.0, n_pts)
             coords = np.column_stack([
@@ -95,10 +95,12 @@ def _build_synthetic_org_atlas(atlas_root):
     reg_dir.mkdir(parents=True)
     fc_dir.mkdir(parents=True)
 
-    # Three well-separated anatomical groups: left, right, commissural
-    left_fibers = _bundle_coords(-35.0, 0.0, 40, n_pts=21, step=3.0, seed=1)
-    right_fibers = _bundle_coords(35.0, 0.0, 40, n_pts=21, step=3.0, seed=2)
-    comm_fibers = _bundle_coords(0.0, 35.0, 40, n_pts=21, step=3.0, commissural=True, seed=3)
+    # Three well-separated anatomical groups: left, right, commissural.
+    # Spread fibers inside each bundle so the 115x115 Nystrom A matrix stays
+    # well-conditioned across NumPy/LAPACK versions (avoids PSD complex noise).
+    left_fibers = _bundle_coords(-35.0, 0.0, 40, n_pts=21, step=3.0, seed=1, jitter_scale=1.0)
+    right_fibers = _bundle_coords(35.0, 0.0, 40, n_pts=21, step=3.0, seed=2, jitter_scale=1.0)
+    comm_fibers = _bundle_coords(0.0, 35.0, 40, n_pts=21, step=3.0, commissural=True, seed=3, jitter_scale=1.0)
     all_atlas_fibers = left_fibers + right_fibers + comm_fibers
     atlas_pd = _make_tract_polydata(all_atlas_fibers)
     wma.io.write_polydata(atlas_pd, str(reg_dir / 'registration_atlas.vtk'))
@@ -111,12 +113,12 @@ def _build_synthetic_org_atlas(atlas_root):
         atlas_pd,
         number_of_clusters=3,
         number_of_eigenvectors=3,
-        sigma=30.0,
+        sigma=25.0,
         threshold=0.0,
         number_of_jobs=1,
         use_nystrom=True,
         nystrom_mask=nystrom_mask,
-        distance_method='Mean',
+        distance_method='MeanSquared',
         outlier_std_threshold=np.inf,
         bilateral=False,
         use_gpu=False,

@@ -267,7 +267,12 @@ import whitematteranalysis as wma
 mods = [m.name for m in pkgutil.walk_packages(wma.__path__, 'whitematteranalysis.')]
 assert len(mods) >= 33, f'Unexpected module count: {len(mods)}'
 for mod in sorted(mods):
-    importlib.import_module(mod)
+    try:
+        importlib.import_module(mod)
+    except ModuleNotFoundError as exc:
+        if mod == 'whitematteranalysis.tract_measurement' and exc.name == 'xlrd':
+            continue
+        raise
 
 assert wma.gpu.linalg.torch is None
 evals, _ = wma.gpu.linalg.eigh(np.diag([2.0, 3.0]))
