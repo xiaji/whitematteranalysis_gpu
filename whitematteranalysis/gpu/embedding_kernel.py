@@ -7,9 +7,10 @@ if triton is not None:
     @triton.jit
     def _normalize(B, A, C, Output, COUNT, N,
                    AS: tl.constexpr, CS: tl.constexpr, BLOCK: tl.constexpr):
-        offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        offset = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
         mask = offset < COUNT
-        row, column = offset // N, offset % N
+        n_i64 = tl.zeros((), dtype=tl.int64) + N
+        row, column = offset // n_i64, offset % n_i64
         values = tl.load(B + offset, mask, other=0.)
         a = tl.load(A + row * AS, mask, other=0.)
         c = tl.load(C + column * CS, mask, other=0.)
@@ -25,7 +26,7 @@ def normalized_similarities(B, a, c, in_place=False, return_col_sums=False):
     """
     import torch
 
-    if (triton is None or not B.is_cuda or B.dtype != torch.float64
+    if (triton is None or not B.is_cuda or B.dtype not in (torch.float64, torch.float32)
             or B.numel() < 1 << 20
             or not (B.is_contiguous() or B.t().is_contiguous())):
         if in_place:

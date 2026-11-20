@@ -136,6 +136,8 @@ class RegisterTractography:
         # (environment variables / command line). Set True or False to
         # override for this registration only.
         self.use_gpu = None
+        self.gpu_device = None
+        self.gpu_float32 = None
         self._gpu_objective = None
         self._cpu_executor = None
 
@@ -170,7 +172,8 @@ class RegisterTractography:
         elif self._using_gpu():
             import whitematteranalysis.gpu as _gpu
             obj = _gpu.registration.objective_value(
-                self.fixed, self.moving, current_x, self.mode, self.sigma)
+                self.fixed, self.moving, current_x, self.mode, self.sigma,
+                device=self.gpu_device, gpu_float32=self.gpu_float32)
         elif self._using_cpu_fast():
             import whitematteranalysis.gpu as _gpu
             moving = _gpu.cpu_backend.transform_fiber_array(self.moving, current_x, self.mode)
@@ -260,7 +263,8 @@ class RegisterTractography:
         # release them on success or failure before the next scale/subject.
         if self._using_gpu():
             self._gpu_objective = wma.gpu.registration.AffineObjective(
-                self.fixed, self.moving)
+                self.fixed, self.moving,
+                device=self.gpu_device, gpu_float32=self.gpu_float32)
         elif self._using_cpu_fast() and wma.gpu.cpu_backend.cpu_threads() > 1:
             from concurrent.futures import ThreadPoolExecutor
             self._cpu_executor = ThreadPoolExecutor(

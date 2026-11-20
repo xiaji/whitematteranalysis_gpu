@@ -112,23 +112,28 @@ class _CoefficientGrid:
 class NonrigidObjective:
     """Fixed geometry and GPU inputs owned by one nonrigid optimization."""
     def __init__(self, fixed, moving, resolution, device=None):
-        self.device = device if device is not None else get_device()
-        self.fixed = registration._prepare_fixed(fixed, self.device, torch.float64)
+        self.device = (device if hasattr(device, 'type')
+                       else (torch.device(device) if device is not None else get_device()))
+        self._dtype = torch.float32 if self.device.type == 'mps' else torch.float64
+        self.fixed = registration._prepare_fixed(fixed, self.device, self._dtype)
         self.resolution = resolution
         self.shape = moving.shape
-        if registration_kernel.triton is not None:
+        self._use_triton = (registration_kernel.triton is not None
+                            and self.device.type == 'cuda')
+        if self._use_triton:
             self.coefficients = _CoefficientGrid(resolution)
             geometry = _sampling_geometry(moving, resolution)
             self.points, self.indices, self.weights, self.invalid = (
                 torch.as_tensor(a, device=self.device) for a in geometry)
         else:
             self.moving = moving
-        self.workspace = registration._ObjectiveWorkspace(self.fixed, moving.shape[1]) if self.fixed.is_cuda else None
+        self.workspace = (registration._ObjectiveWorkspace(self.fixed, moving.shape[1])
+                          if self.fixed.device.type in ('cuda', 'mps') else None)
 
     def transform(self, displacement):
-        if registration_kernel.triton is None:
+        if not self._use_triton:
             moved = transform_fiber_array_numpy(self.moving, displacement)
-            return registration._prepare_fixed(moved, self.device, torch.float64)
+            return registration._prepare_fixed(moved, self.device, self._dtype)
         coefficients = torch.as_tensor(self.coefficients(displacement), device=self.device)
         output = torch.empty_like(self.points)
         with torch.cuda.device(self.device):

@@ -16,7 +16,7 @@ from .config import float32_enabled, get_device
 
 
 @lru_cache(maxsize=4)
-def _implementation(backend, float32, device_index):
+def _implementation(backend, float32, device_index, device_type='cuda'):
     files = ('fibers.py', 'filter.py', 'io.py', 'similarity.py', 'gpu/_memory.py',
              'gpu/fiber_tensors.py', 'gpu/cpu_backend.py', 'gpu/distance.py',
              'gpu/distance_kernel.py', 'gpu/registration_kernel.py', 'gpu/atlas_cache.py')
@@ -30,17 +30,20 @@ def _implementation(backend, float32, device_index):
     if backend == 'gpu':
         import torch
         from . import distance_kernel
-        versions += [torch.__version__, torch.version.cuda,
-                     getattr(distance_kernel.triton, '__version__', None),
-                     torch.cuda.get_device_name(device_index),
-                     torch.cuda.get_device_capability(device_index)]
+        if device_type == 'cuda':
+            versions += [torch.__version__, torch.version.cuda,
+                         getattr(distance_kernel.triton, '__version__', None),
+                         torch.cuda.get_device_name(device_index),
+                         torch.cuda.get_device_capability(device_index)]
+        else:
+            versions += [torch.__version__, device_type]
     else:
         import scipy
         versions.append(scipy.__version__)
     return versions
 
 
-def _cache_file(filename, sigmasq, method, bilateral, backend):
+def _cache_file(filename, sigmasq, method, bilateral, backend, device=None):
     directory = os.environ.get('WMA_ATLAS_CACHE')
     if directory and directory.lower() in ('off', '0', 'false'):
         return None
@@ -49,16 +52,23 @@ def _cache_file(filename, sigmasq, method, bilateral, backend):
         directory = str(Path(base or Path.home() / '.cache') / 'whitematteranalysis' / 'atlas-outliers')
     source = Path(filename).resolve()
     stat = source.stat()
+    if backend == 'gpu':
+        dev = device if device is not None else get_device()
+        dev_type = dev.type if hasattr(dev, 'type') else str(dev).split(':', 1)[0]
+        dev_index = dev.index if (hasattr(dev, 'index') and dev_type == 'cuda') else None
+    else:
+        dev_type = 'cpu'
+        dev_index = None
     identity = [str(source), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
                 15, float(sigmasq), str(method), bool(bilateral),
                 _implementation(backend, float32_enabled() if backend == 'gpu' else False,
-                                get_device().index if backend == 'gpu' else None)]
+                                dev_index, dev_type)]
     key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
     return Path(directory).expanduser() / (key + '.npz')
 
 
 def load_reference(filename, sigmasq, method='Mean', bilateral=True,
-                   backend='gpu', tile_bytes=None):
+                   backend='gpu', tile_bytes=None, device=None):
     """Return (N,15,3) atlas coordinates and exact leave-one-out probabilities.
 
     Keys include reference identity, numerical parameters, precision, backend,
@@ -68,7 +78,8 @@ def load_reference(filename, sigmasq, method='Mean', bilateral=True,
     from .. import io, similarity
 
     probability_dtype = np.dtype(np.float32 if backend == 'gpu' and float32_enabled() else np.float64)
-    path = _cache_file(filename, sigmasq, method, bilateral, backend)
+    dev = (device if device is not None else get_device()) if backend == 'gpu' else None
+    path = _cache_file(filename, sigmasq, method, bilateral, backend, device=dev)
     if path is not None:
         try:
             with path.open('rb') as source, np.load(source, allow_pickle=False) as saved:
@@ -89,8 +100,9 @@ def load_reference(filename, sigmasq, method='Mean', bilateral=True,
                          if tile_bytes is not None else None)
             similarity_sums = similarity_row_sums_from_arrays(
                 coordinates, coordinates, 0., distance_method=method,
-                bilateral=bilateral, sigmasq=sigmasq, tile_rows=tile_rows)
-            probabilities = (similarity_sums - 1.) / len(coordinates)
+                bilateral=bilateral, sigmasq=sigmasq, tile_rows=tile_rows,
+                device=dev)
+            probabilities = ((similarity_sums - 1.) / len(coordinates)).astype(probability_dtype, copy=False)
         else:
             from .cpu_backend import _distance_matrix as matrix
             kwargs = dict(number_of_jobs=1)

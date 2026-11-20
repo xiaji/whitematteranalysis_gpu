@@ -78,7 +78,7 @@ class DistanceKernelTests(unittest.TestCase):
     def test_strict_probability_scales(self):
         import torch
         rng = np.random.RandomState(48)
-        for points in (1, 3, 15, 20, 32, 50):
+        for points in (1, 3, 15, 20, 32, 50, 64, 128):
             fixed = torch.tensor(rng.normal(size=(37, points, 3)), dtype=torch.float64, device='cuda')
             moving = fixed[:5].clone()
             for sigma in (1e-5, 100., 1e6, 0., -1., float('inf'), float('nan')):
@@ -93,7 +93,7 @@ class DistanceKernelTests(unittest.TestCase):
     def test_eager_equivalence(self):
         import torch
         rng = np.random.RandomState(42)
-        for points in (1, 2, 3, 7, 10, 15, 16, 20, 31, 32, 50):
+        for points in (1, 2, 3, 7, 10, 15, 16, 20, 31, 32, 50, 64, 128):
             for dtype in (torch.float64, torch.float32):
                 fixed = torch.tensor(rng.normal(size=(37, points, 3)) * 40., dtype=dtype, device='cuda')
                 moving = torch.tensor(rng.normal(size=(5, points, 3)) * 40., dtype=dtype, device='cuda')
@@ -106,6 +106,59 @@ class DistanceKernelTests(unittest.TestCase):
                                 expected = distance._fiber_block_distances(moving, fixed, threshold, method, 6400., bilateral)
                             self.assertTrue(torch.equal(actual, expected))
                 self.assertTrue(torch.equal(moving, before))
+
+    def test_triton_p_boundary_and_float32_similarity_row_sums(self):
+        import torch
+        if distance_kernel.triton is None:
+            self.skipTest('Triton is unavailable')
+        rng = np.random.RandomState(91)
+        for points in (1, 15, 32, 50, 64, 128):
+            for dtype in (torch.float64, torch.float32):
+                fixed = torch.tensor(rng.normal(size=(37, points, 3)) * 18., dtype=dtype, device='cuda')
+                queries = torch.tensor(rng.normal(size=(13, points, 3)) * 18., dtype=dtype, device='cuda')
+                if points <= 64:
+                    with patch.object(distance_kernel, 'fiber_distances', wraps=distance_kernel.fiber_distances) as spy:
+                        distance._fiber_block_distances(queries, fixed, 0.1, 'Mean', 400.)
+                        self.assertEqual(spy.call_count, 1)
+                else:
+                    with patch.object(distance_kernel, 'fiber_distances',
+                                      side_effect=AssertionError('P > 64 must use PyTorch eager fallback')):
+                        distance._fiber_block_distances(queries, fixed, 0.1, 'Mean', 400.)
+
+                for bilateral, sqrt_sums in product((False, True), (False, True)):
+                    with patch.object(distance_kernel, 'triton', None):
+                        eager_dists = distance._fiber_block_distances(
+                            queries, fixed, 0.5, 'Mean', 400., bilateral=bilateral)
+                    expected_sim = torch.exp(-eager_dists / 400.).sum(dim=1)
+                    expected_dist = eager_dists.sqrt().sum(dim=1) if sqrt_sums else None
+                    if points <= 64:
+                        actual_sim, actual_dist = distance_kernel.similarity_row_sums(
+                            queries, fixed, 0.5, 400., bilateral=bilateral,
+                            sqrt_distance_sums=sqrt_sums)
+                    else:
+                        q_np = queries.cpu().numpy()
+                        f_np = fixed.cpu().numpy()
+                        with patch.object(distance_kernel, 'similarity_row_sums',
+                                          side_effect=AssertionError('P > 64 must use PyTorch fallback')):
+                            res = distance.similarity_row_sums_from_arrays(
+                                q_np, f_np, 0.5, distance_method='Mean',
+                                bilateral=bilateral, sigmasq=400.,
+                                gpu_float32=(dtype == torch.float32),
+                                tile_rows=64, sqrt_distance_sums=sqrt_sums)
+                        if sqrt_sums:
+                            actual_sim = torch.as_tensor(res[0])
+                            actual_dist = torch.as_tensor(res[1])
+                        else:
+                            actual_sim = torch.as_tensor(res)
+                            actual_dist = None
+                    tol = 2e-5 if dtype == torch.float32 else 1e-13
+                    np.testing.assert_allclose(
+                        actual_sim.cpu().numpy(), expected_sim.cpu().numpy(),
+                        rtol=tol, atol=tol)
+                    if sqrt_sums:
+                        np.testing.assert_allclose(
+                            actual_dist.cpu().numpy(), expected_dist.cpu().numpy(),
+                            rtol=tol, atol=tol)
 
     def test_special_values_and_strides(self):
         import torch
@@ -191,3 +244,46 @@ class DistanceSimilarityCpuTests(unittest.TestCase):
             triton_rows = distance._choose_tile_rows(50000, 2000, 15, torch.float64, torch.device('cpu'), triton_2d=True)
         self.assertLess(eager_rows, triton_rows)
         self.assertEqual(triton_rows, 16384)
+
+    def test_explicit_device_and_iter_triton_2d_checks(self):
+        torch = self._require_torch()
+        from test_atlas_blocks import polydata
+
+        pd_n, pd_m = polydata(5), polydata(4)
+        cpu_dev = torch.device('cpu')
+        with patch.object(distance, 'get_device', side_effect=AssertionError('explicit device must skip get_device')):
+            blocks = list(distance.iter_rectangular_similarity(
+                pd_n, pd_m, 0.0, 20.0, distance_method='Mean',
+                gpu_float32=True, tile_rows=2, device=cpu_dev))
+            self.assertEqual(sum(b.shape[1] for _, b in blocks), 5)
+            self.assertEqual(blocks[0][1].dtype, torch.float32)
+
+            rng = np.random.RandomState(55)
+            q = rng.normal(size=(5, 15, 3))
+            f = rng.normal(size=(4, 15, 3))
+            sums = distance.similarity_row_sums_from_arrays(
+                q, f, 0.0, distance_method='Mean', sigmasq=400.,
+                gpu_float32=True, device=cpu_dev)
+            self.assertEqual(sums.dtype, np.float32)
+
+        # Verify iter_rectangular_similarity passes triton_2d=False when sigma<=0 or sigmasq<=0 or non-CUDA
+        seen_triton_2d = []
+        orig_choose = distance._choose_tile_rows
+        def recording_choose(*args, **kwargs):
+            seen_triton_2d.append(kwargs.get('triton_2d', False))
+            return orig_choose(*args, **kwargs)
+        with patch.object(distance_kernel, 'triton', object()), \
+                patch.object(distance, '_choose_tile_rows', side_effect=recording_choose):
+            list(distance.iter_rectangular_similarity(
+                pd_n, pd_m, 0.0, 0.0, distance_method='Mean', sigmasq=400., device=cpu_dev))
+            list(distance.iter_rectangular_similarity(
+                pd_n, pd_m, 0.0, 20.0, distance_method='Mean', sigmasq=0.0, device=cpu_dev))
+        self.assertEqual(seen_triton_2d, [False, False])
+
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            mps_dev = torch.device('mps')
+            mps_blocks = list(distance.iter_rectangular_similarity(
+                pd_n, pd_m, 0.0, 20.0, distance_method='Mean',
+                gpu_float32=True, tile_rows=3, device=mps_dev))
+            self.assertEqual(mps_blocks[0][1].device.type, 'mps')
+            self.assertEqual(mps_blocks[0][1].dtype, torch.float32)

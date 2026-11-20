@@ -19,9 +19,14 @@ arguments in bin/ scripts) or through environment variables:
     WMA_GPU_MAX_VRAM_GIB
                       optional upper bound (GiB) on free VRAM assumed by
                       GPU tile sizing (default: unset, use full free VRAM).
+    WMA_GPU_STRICT    '1' to force bit-exact per-pair registration reduction
+                      parity with eager PyTorch (default '0', fused 2D kernel).
+    WMA_GPU_MPS       '1' to opt in to Apple Silicon MPS eager float32 when
+                      CUDA is unavailable and float32 is enabled (default '0').
 
 """
 
+import math
 import os
 
 
@@ -33,6 +38,10 @@ class GPUConfig:
         self.requested = None
         # float32 fast mode. Default False: float64, matches CPU results.
         self.float32 = False
+        # Strict registration reduction parity mode (WMA_GPU_STRICT).
+        self.strict = False
+        # Opt-in Apple Silicon MPS backend (WMA_GPU_MPS, requires float32).
+        self.allow_mps = False
         # List of CUDA device indices to use, or None for all visible ones.
         self.devices = None
         # Override for the number of query fibers per computation tile.
@@ -57,6 +66,14 @@ class GPUConfig:
         try:
             import torch
             return torch.cuda.is_available()
+        except Exception:
+            return False
+
+    def mps_available(self):
+        """True if torch imports and Apple Silicon MPS is available."""
+        try:
+            import torch
+            return hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
         except Exception:
             return False
 
@@ -88,6 +105,24 @@ def set_float32(on):
     config.float32 = bool(on)
 
 
+def set_strict(on):
+    config.strict = bool(on)
+
+
+def strict_enabled(requested=None):
+    return config.strict if requested is None else bool(requested)
+
+
+def mps_available():
+    return config.mps_available()
+
+
+def _mps_active():
+    return (not config.cuda_available()
+            and bool(config.allow_mps and config.float32)
+            and mps_available())
+
+
 def set_devices(devices):
     """Set the list of CUDA device indices to use (int list or '0,1' string)."""
     if isinstance(devices, str):
@@ -116,6 +151,8 @@ def use_gpu(requested=None):
     if r is False:
         return False
     available = config.cuda_available()
+    if not available and config.allow_mps and config.float32:
+        available = mps_available()
     if r is True and not available:
         raise RuntimeError(
             "GPU acceleration was explicitly requested, but CUDA is unavailable. "
@@ -136,6 +173,8 @@ def torch_module():
 def get_device(index=None):
     """Return the torch device this process should compute on."""
     torch = torch_module()
+    if _mps_active():
+        return torch.device('mps')
     idx = config.device_index if index is None else index
     if config.devices:
         idx = config.devices[idx % len(config.devices)]
@@ -144,6 +183,8 @@ def get_device(index=None):
 
 def visible_device_count():
     torch = torch_module()
+    if _mps_active():
+        return 1
     if config.devices:
         return len(config.devices)
     return torch.cuda.device_count()
@@ -151,7 +192,9 @@ def visible_device_count():
 
 def _from_env():
     set_gpu(os.environ.get('WMA_GPU', 'auto'))
-    set_float32(os.environ.get('WMA_GPU_FLOAT32', '0') in ('1', 'true', 'yes', 'on'))
+    set_float32(os.environ.get('WMA_GPU_FLOAT32', '0').strip().lower() in ('1', 'true', 'yes', 'on'))
+    set_strict(os.environ.get('WMA_GPU_STRICT', '0').strip().lower() in ('1', 'true', 'yes', 'on'))
+    config.allow_mps = os.environ.get('WMA_GPU_MPS', '0').strip().lower() in ('1', 'true', 'yes', 'on')
     devices = os.environ.get('WMA_GPU_DEVICES')
     if devices:
         set_devices(devices)
@@ -173,7 +216,7 @@ def _from_env():
     if max_vram is not None and max_vram != '':
         try:
             value = float(max_vram)
-            if value > 0:
+            if math.isfinite(value) and value > 0:
                 config.max_vram_gib = value
         except ValueError:
             pass

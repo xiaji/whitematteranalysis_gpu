@@ -600,14 +600,58 @@ def spectral_atlas_label(input_polydata, atlas, number_of_jobs=2,
     sz = atlas.nystrom_polydata.GetNumberOfLines()
 
     if gpu.use_gpu(use_gpu):
-        # Stream similarity and embedding blocks; retain only CPU results.
-        print(f"<{os.path.basename(__file__)}> Computing rectangular similarity matrix on GPU (fused embedding).")
-        blocks = gpu.distance.iter_rectangular_similarity(
-            input_polydata, atlas.nystrom_polydata,
-            atlas.threshold, atlas.sigma, distance_method=atlas.distance_method,
-            bilateral=atlas.bilateral, gpu_float32=gpu_float32)
-        embed, cluster_idx, dist, row_sum, b_col_sums = \
-            gpu.linalg.atlas_label_embedding_blocks(blocks, atlas, number_fibers)
+        n_gpus = gpu.visible_device_count()
+        base_dev = gpu.get_device()
+        if n_gpus > 1 and number_fibers >= 16384 and base_dev.type != 'mps':
+            from concurrent.futures import ThreadPoolExecutor
+            import contextlib
+            import torch
+
+            print(f"<{os.path.basename(__file__)}> Computing rectangular similarity matrix across {n_gpus} GPUs (fused embedding).")
+            queries = gpu.fiber_tensors.polydata_to_numpy(input_polydata, 15)
+            fixed = gpu.fiber_tensors.polydata_to_numpy(atlas.nystrom_polydata, 15)
+            bounds = numpy.linspace(0, number_fibers, n_gpus + 1, dtype=numpy.int64)
+            shards = [(i, int(bounds[i]), int(bounds[i + 1]))
+                      for i in range(n_gpus) if bounds[i + 1] > bounds[i]]
+
+            def _label_shard(item):
+                gpu_idx, start, end = item
+                dev = gpu.get_device(gpu_idx)
+                ctx = (torch.cuda.device(dev)
+                       if dev.type == 'cuda' and torch.cuda.is_available()
+                       else contextlib.nullcontext())
+                with ctx:
+                    blocks = gpu.distance._iter_rectangular_similarity_arrays(
+                        queries[start:end], fixed,
+                        atlas.threshold, atlas.sigma,
+                        distance_method=atlas.distance_method,
+                        bilateral=atlas.bilateral,
+                        gpu_float32=gpu_float32,
+                        device=dev)
+                    return gpu.linalg.atlas_label_embedding_blocks(
+                        blocks, atlas, end - start,
+                        gpu_float32=gpu_float32, device=dev)
+
+            with ThreadPoolExecutor(max_workers=len(shards)) as executor:
+                shard_results = list(executor.map(_label_shard, shards))
+
+            prefix_len = len(atlas.row_sum_1)
+            embed = numpy.concatenate([r[0] for r in shard_results], axis=0)
+            cluster_idx = numpy.concatenate([r[1] for r in shard_results], axis=0)
+            dist = numpy.concatenate([r[2] for r in shard_results], axis=0)
+            row_sum = numpy.concatenate(
+                [atlas.row_sum_1] + [r[3][prefix_len:] for r in shard_results], axis=0)
+            b_col_sums = numpy.concatenate([r[4] for r in shard_results], axis=0)
+        else:
+            # Stream similarity and embedding blocks; retain only CPU results.
+            print(f"<{os.path.basename(__file__)}> Computing rectangular similarity matrix on GPU (fused embedding).")
+            blocks = gpu.distance.iter_rectangular_similarity(
+                input_polydata, atlas.nystrom_polydata,
+                atlas.threshold, atlas.sigma, distance_method=atlas.distance_method,
+                bilateral=atlas.bilateral, gpu_float32=gpu_float32)
+            embed, cluster_idx, dist, row_sum, b_col_sums = \
+                gpu.linalg.atlas_label_embedding_blocks(
+                    blocks, atlas, number_fibers, gpu_float32=gpu_float32)
 
     elif gpu.config.cpu_fast_enabled() and gpu.fiber_tensors.distance_supported(
             atlas.distance_method):

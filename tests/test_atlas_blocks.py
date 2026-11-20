@@ -168,3 +168,84 @@ class AtlasBlocksCpuTests(unittest.TestCase):
             empty = linalg.atlas_label_embedding_blocks(iter(()), atlas, 0)
             self.assertEqual(empty[0].shape, (0, 3))
             np.testing.assert_array_equal(empty[3], atlas.row_sum_1)
+
+    def test_float32_and_mps_never_construct_float64_on_device(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+        rng = np.random.RandomState(44)
+        atlas = types.SimpleNamespace(number_of_eigenvectors=3,
+            row_sum_1=np.ones(11), row_sum_matrix=rng.uniform(0, .1, 11),
+            e_vec=rng.uniform(.1, 1, (11, 11)), e_val=np.arange(1., 12.),
+            e_vec_norm=np.ones(11), centroids=rng.uniform(0, 2, (5, 3)))
+        full64 = torch.rand((11, 15), dtype=torch.float64)
+        with patch.object(linalg, 'get_device', return_value=torch.device('cpu')):
+            ref = linalg.atlas_label_embedding(full64.clone(), atlas)
+
+        full32 = full64.to(torch.float32)
+        orig_empty = torch.empty
+        orig_as_tensor = torch.as_tensor
+        orig_to = torch.Tensor.to
+
+        def guard_empty(*args, **kwargs):
+            if kwargs.get('dtype') == torch.float64:
+                raise AssertionError('torch.empty(float64) called in float32 mode')
+            return orig_empty(*args, **kwargs)
+
+        def guard_as_tensor(data, *args, **kwargs):
+            if kwargs.get('dtype') == torch.float64:
+                raise AssertionError('torch.as_tensor(float64) called in float32 mode')
+            return orig_as_tensor(data, *args, **kwargs)
+
+        def guard_to(tensor, *args, **kwargs):
+            if kwargs.get('dtype') == torch.float64 or torch.float64 in args:
+                raise AssertionError('Tensor.to(float64) called in float32 mode')
+            return orig_to(tensor, *args, **kwargs)
+
+        blocks = [(s, full32[:, s:s + 4].clone()) for s in range(0, 15, 4)]
+        with patch.object(linalg, 'get_device', return_value=torch.device('cpu')), \
+                patch.object(torch, 'empty', side_effect=guard_empty), \
+                patch.object(torch, 'as_tensor', side_effect=guard_as_tensor), \
+                patch.object(torch.Tensor, 'to', guard_to):
+            actual = linalg.atlas_label_embedding_blocks(
+                iter(blocks), atlas, 15, gpu_float32=True)
+
+        self.assertEqual(actual[0].dtype, np.float32)
+        self.assertEqual(actual[1].dtype, np.int32)
+        self.assertEqual(actual[2].dtype, np.float32)
+        self.assertEqual(actual[4].dtype, np.float32)
+        np.testing.assert_allclose(actual[0], ref[0], rtol=1e-5, atol=1e-5)
+        np.testing.assert_array_equal(actual[1], ref[1])
+        np.testing.assert_allclose(actual[2], ref[2], rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(actual[3], ref[3], rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(actual[4], ref[4], rtol=1e-5, atol=1e-5)
+
+        mps_dev = torch.device('mps')
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            mps_blocks = [(s, full32[:, s:s + 4].to(mps_dev)) for s in range(0, 15, 4)]
+            with patch.object(linalg, 'get_device', return_value=mps_dev), \
+                    patch.object(torch, 'empty', side_effect=guard_empty), \
+                    patch.object(torch, 'as_tensor', side_effect=guard_as_tensor), \
+                    patch.object(torch.Tensor, 'to', guard_to):
+                mps_actual = linalg.atlas_label_embedding_blocks(
+                    iter(mps_blocks), atlas, 15, gpu_float32=True)
+            np.testing.assert_allclose(mps_actual[0], ref[0], rtol=1e-5, atol=1e-5)
+            np.testing.assert_array_equal(mps_actual[1], ref[1])
+        else:
+            # Verify mocked mps device path also never constructs float64 tensors
+            mock_blocks = [(s, full32[:, s:s + 4].clone()) for s in range(0, 15, 4)]
+            with patch.object(linalg, 'get_device', return_value=mps_dev), \
+                    patch.object(torch, 'empty', side_effect=lambda *a, **kw: (
+                        (_ for _ in ()).throw(AssertionError('float64 on mps')) if kw.get('dtype') == torch.float64
+                        else orig_empty(*a, **{**kw, 'device': torch.device('cpu')}))), \
+                    patch.object(torch, 'as_tensor', side_effect=lambda d, *a, **kw: (
+                        (_ for _ in ()).throw(AssertionError('float64 on mps')) if kw.get('dtype') == torch.float64
+                        else orig_as_tensor(d, *a, **{**kw, 'device': torch.device('cpu')}))), \
+                    patch.object(torch.Tensor, 'to', lambda t, *a, **kw: (
+                        (_ for _ in ()).throw(AssertionError('float64 on mps')) if kw.get('dtype') == torch.float64
+                        else orig_to(t, *a, **{k: (torch.device('cpu') if v == mps_dev else v) for k, v in kw.items()}))):
+                mock_actual = linalg.atlas_label_embedding_blocks(
+                    iter(mock_blocks), atlas, 15, gpu_float32=True)
+            np.testing.assert_allclose(mock_actual[0], ref[0], rtol=1e-5, atol=1e-5)
+            np.testing.assert_array_equal(mock_actual[1], ref[1])

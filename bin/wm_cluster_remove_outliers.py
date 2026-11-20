@@ -178,7 +178,7 @@ def main():
     print("Standard deviation for fiber outlier removal after clustering (accurate local probability): ", cluster_outlier_std_threshold)
     backend = 'gpu' if wma.gpu.use_gpu() else ('cpu' if wma.gpu.config.cpu_fast_enabled() else None)
 
-    def outlier_removal_one_cluster(ca, cs, outdir, c, location_data):
+    def outlier_removal_one_cluster(ca, cs, outdir, c, location_data, device=None):
 
         def write_output(polydata, path):
             if location_data is not None:
@@ -206,7 +206,7 @@ def main():
             from whitematteranalysis.gpu.atlas_cache import load_reference
             atlas_array, total_similarity_atlas = load_reference(
                 ca, cluster_local_sigma * cluster_local_sigma,
-                distance_method, bilateral, backend)
+                distance_method, bilateral, backend, device=device)
             number_fibers_in_atlas_cluster = len(atlas_array)
         else:
             pd_atlas = wma.io.read_polydata(ca)
@@ -240,7 +240,7 @@ def main():
                 (similarity_sums, distance_sums) = wma.gpu.distance.similarity_row_sums_from_arrays(
                     subject_array, atlas_array, 0., distance_method=distance_method,
                     bilateral=bilateral, sigmasq=cluster_local_sigma * cluster_local_sigma,
-                    sqrt_distance_sums=True)
+                    sqrt_distance_sums=True, device=device)
                 total_similarity_subject = similarity_sums / number_fibers_in_atlas_cluster
                 cluster_mean_distances = distance_sums / number_fibers_in_atlas_cluster
                 (total_similarity_subject, total_similarity_atlas,
@@ -325,24 +325,41 @@ def main():
             ]
         else:
             from concurrent.futures import ThreadPoolExecutor
+            import contextlib
             import threading
             import torch
 
             max_workers = max(1, os.cpu_count() or 1) if number_of_jobs < 0 else number_of_jobs
-            device = wma.gpu.get_device()
+            base_device = wma.gpu.get_device()
+            n_gpus = wma.gpu.visible_device_count() if base_device.type != 'mps' else 1
             thread_local = threading.local()
 
-            def _run_on_stream(task):
-                c, ca, cs = task
-                stream = getattr(thread_local, 'stream', None)
-                if stream is None:
-                    stream = torch.cuda.Stream(device=device)
-                    thread_local.stream = stream
-                with torch.cuda.stream(stream):
-                    return outlier_removal_one_cluster(ca, cs, outdir, c, location_data)
+            def _run_on_device(item):
+                task_idx, (c, ca, cs) = item
+                dev = wma.gpu.get_device(task_idx % n_gpus) if n_gpus > 1 else base_device
+                dev_ctx = (torch.cuda.device(dev)
+                           if dev.type == 'cuda' and torch.cuda.is_available()
+                           else contextlib.nullcontext())
+                with dev_ctx:
+                    if dev.type == 'cuda':
+                        streams = getattr(thread_local, 'streams', None)
+                        if streams is None:
+                            streams = {}
+                            thread_local.streams = streams
+                        key = dev.index
+                        stream = streams.get(key)
+                        if stream is None:
+                            stream = torch.cuda.Stream(device=dev)
+                            streams[key] = stream
+                        stream_ctx = torch.cuda.stream(stream)
+                    else:
+                        stream_ctx = contextlib.nullcontext()
+                    with stream_ctx:
+                        return outlier_removal_one_cluster(
+                            ca, cs, outdir, c, location_data, device=dev)
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                logtrs = list(executor.map(_run_on_stream, tasks))
+                logtrs = list(executor.map(_run_on_device, enumerate(tasks)))
     else:
         logtrs = Parallel(n_jobs=number_of_jobs, verbose=0)(
                 delayed(outlier_removal_one_cluster)(

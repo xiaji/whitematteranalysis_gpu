@@ -135,6 +135,50 @@ class CentroidKernelTests(unittest.TestCase):
                 with self.assertRaises(IndexError):
                     distance_kernel.nearest_centroids(q_in, empty_c)
 
+    def test_split_c_nearest_centroids_matches_cdist_min(self):
+        import torch
+        if distance_kernel.triton is None:
+            self.skipTest('Triton is unavailable')
+        torch.manual_seed(2026)
+        nq, nc = 130, 600  # nq * nc = 78000 >= 65536, nc % BLOCK_C != 0
+        for dimensions in (1, 10, 16, 32):
+            for dtype in (torch.float64, torch.float32):
+                with self.subTest(dimensions=dimensions, dtype=dtype):
+                    query = torch.randn((nq, dimensions), dtype=dtype, device='cuda')
+                    centroids = torch.randn((nc, dimensions), dtype=dtype, device='cuda')
+                    actual_d, actual_i = distance_kernel.nearest_centroids(query, centroids)
+                    expected_d, expected_i = torch.cdist(
+                        query, centroids, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+                    self.assertEqual(actual_d.dtype, dtype)
+                    self.assertEqual(actual_i.dtype, torch.int64)
+                    self.assertTrue(torch.equal(actual_i, expected_i))
+                    torch.testing.assert_close(actual_d, expected_d, rtol=0., atol=0., equal_nan=True)
+
+                    # Cross-split exact ties (first centroid wins across splits 0, 1, final)
+                    tie_q = torch.zeros((nq, dimensions), dtype=dtype, device='cuda')
+                    tie_c = torch.ones((nc, dimensions), dtype=dtype, device='cuda')
+                    tie_c[3] = 0.
+                    tie_c[70] = 0.
+                    tie_c[580] = 0.
+                    actual_d, actual_i = distance_kernel.nearest_centroids(tie_q, tie_c)
+                    expected_d, expected_i = torch.cdist(
+                        tie_q, tie_c, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+                    self.assertTrue(torch.equal(actual_i, expected_i))
+                    torch.testing.assert_close(actual_d, expected_d, rtol=0., atol=0., equal_nan=True)
+
+                    # Cross-split NaNs and Infs
+                    nan_q = torch.zeros((nq, dimensions), dtype=dtype, device='cuda')
+                    nan_c = torch.ones((nc, dimensions), dtype=dtype, device='cuda')
+                    nan_q[0, 0] = float('nan')
+                    nan_q[1, 0] = float('inf')
+                    nan_c[75, 0] = float('nan')
+                    nan_c[585, 0] = float('nan')
+                    actual_d, actual_i = distance_kernel.nearest_centroids(nan_q, nan_c)
+                    expected_d, expected_i = torch.cdist(
+                        nan_q, nan_c, compute_mode='donot_use_mm_for_euclid_dist').min(1)
+                    self.assertTrue(torch.equal(actual_i, expected_i))
+                    torch.testing.assert_close(actual_d, expected_d, rtol=0., atol=0., equal_nan=True)
+
 
 class CentroidKernelApiTests(unittest.TestCase):
     def test_nearest_centroids_symbol_and_cpu_fallback(self):

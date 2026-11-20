@@ -107,6 +107,42 @@ class AtlasCacheTests(unittest.TestCase):
         with patch.object(wma.io, 'read_polydata', side_effect=AssertionError('cache miss')):
             load(0)
 
+    def test_mps_cache_avoids_cuda_device_queries(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+        mps_device = torch.device('mps')
+        mps_real = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+        atlas_cache._implementation.cache_clear()
+        with patch.object(wma.gpu.config, 'float32', True), \
+                patch.object(atlas_cache, 'get_device', return_value=mps_device), \
+                patch.object(torch.cuda, 'get_device_name',
+                             side_effect=AssertionError('must not query CUDA device name on MPS')), \
+                patch.object(torch.cuda, 'get_device_capability',
+                             side_effect=AssertionError('must not query CUDA capability on MPS')), \
+                patch.object(torch.cuda, 'mem_get_info',
+                             side_effect=AssertionError('must not query CUDA mem_get_info on MPS')), \
+                patch.object(torch.cuda, 'empty_cache',
+                             side_effect=AssertionError('must not call cuda.empty_cache on MPS')):
+            if mps_real:
+                arrays, probabilities = atlas_cache.load_reference(
+                    self.source, 400., 'Mean', True, backend='gpu')
+            else:
+                fake_sums = np.ones(80, dtype=np.float32) * 10.
+                with patch.object(wma.gpu.distance, 'similarity_row_sums_from_arrays',
+                                  return_value=fake_sums):
+                    arrays, probabilities = atlas_cache.load_reference(
+                        self.source, 400., 'Mean', True, backend='gpu')
+            self.assertEqual(probabilities.dtype, np.float32)
+            self.assertEqual(probabilities.shape, (80,))
+            self.assertEqual(len(list(self.cache.glob('*.npz'))), 1)
+            with patch.object(wma.io, 'read_polydata', side_effect=AssertionError('cache miss')):
+                cached_arrays, cached_probs = atlas_cache.load_reference(
+                    self.source, 400., 'Mean', True, backend='gpu')
+            np.testing.assert_array_equal(cached_arrays, arrays)
+            np.testing.assert_array_equal(cached_probs, probabilities)
+
 
 if __name__ == '__main__':
     unittest.main()

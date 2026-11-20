@@ -118,6 +118,7 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
 
         # GPU inputs and B-spline sampling geometry live for one compute call.
         self.use_gpu = None
+        self.gpu_device = None
         self._gpu_objective = None
         self._cpu_executor = None
 
@@ -140,7 +141,9 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
             obj = self._gpu_objective(scaled_current_x, self.sigma)
         elif self._using_gpu():
             from .gpu.bspline import NonrigidObjective
-            objective = NonrigidObjective(self.fixed, self.moving, self.nonrigid_grid_resolution)
+            objective = NonrigidObjective(
+                self.fixed, self.moving, self.nonrigid_grid_resolution,
+                device=self.gpu_device)
             obj = objective(scaled_current_x, self.sigma)
         else:
             moving = self.transform_fiber_array_numpy(self.moving, scaled_current_x)
@@ -245,7 +248,8 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
         if self._using_gpu():
             from .gpu.bspline import NonrigidObjective
             self._gpu_objective = NonrigidObjective(
-                self.fixed, self.moving, self.nonrigid_grid_resolution)
+                self.fixed, self.moving, self.nonrigid_grid_resolution,
+                device=self.gpu_device)
         elif self._using_cpu_fast() and wma.gpu.cpu_backend.cpu_threads() > 1:
             from concurrent.futures import ThreadPoolExecutor
             self._cpu_executor = ThreadPoolExecutor(

@@ -21,13 +21,19 @@ fibers (~1e-15 relative difference in float64).
 
 import numpy
 
-from .config import get_device
-from . import registration_kernel
+from .config import get_device, float32_enabled, strict_enabled
+from . import registration_kernel, _memory
 
 try:
     import torch
 except ImportError:
     torch = None
+
+
+def _resolve_device(device=None):
+    if device is None:
+        return get_device()
+    return device if hasattr(device, 'type') else torch.device(device)
 
 
 def transform_matrix_from_vtk(transform, mode=[1, 1, 1, 1]):
@@ -44,27 +50,31 @@ def transform_matrix_from_vtk(transform, mode=[1, 1, 1, 1]):
     return M.reshape(4, 4)
 
 
-def transform_fiber_array(in_array, transform, mode=[1, 1, 1, 1], device=None):
+def transform_fiber_array(in_array, transform, mode=[1, 1, 1, 1], device=None,
+                          gpu_float32=None):
     """Batched transform_fiber_array_numpy.
 
     in_array: (3, N, P) float64 numpy array (R, A, S on the first axis).
-    Returns a (3, N, P) float64 numpy array, the same layout.
+    Returns a (3, N, P) float64/float32 numpy array, the same layout.
     """
 
-    return _transform_fiber_tensor(in_array, transform, mode, device).cpu().numpy()
+    return _transform_fiber_tensor(
+        in_array, transform, mode, device, gpu_float32=gpu_float32).cpu().numpy()
 
 
-def _transform_fiber_tensor(in_array, transform, mode, device):
-    """Apply the affine transform and retain its float64 result on device."""
+def _transform_fiber_tensor(in_array, transform, mode, device, gpu_float32=None):
+    """Apply the affine transform and retain its result on device."""
     if torch is None:
         raise RuntimeError("torch is not available, cannot use the GPU registration backend.")
 
+    _memory.disable_tf32()
     M = transform_matrix_from_vtk(transform, mode)
-    dev = device if device is not None else get_device()
+    dev = _resolve_device(device)
+    dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
 
-    t = torch.as_tensor(in_array, dtype=torch.float64, device=dev)
+    t = torch.as_tensor(in_array, dtype=dtype, device=dev)
     x, y, z = t.unbind(0)
-    Mt = torch.from_numpy(M).to(dev)
+    Mt = torch.as_tensor(M, dtype=dtype, device=dev)
 
     # same accumulation order as vtkMatrix4x4::MultiplyPoint
     out_x = Mt[0, 0] * x + Mt[0, 1] * y + Mt[0, 2] * z + Mt[0, 3]
@@ -81,7 +91,8 @@ def _prepare_fixed(fixed, device, dtype):
     return torch.as_tensor(F, dtype=dtype, device=device)
 
 
-def inner_loop_objective(fixed, moving, sigmasq, device=None, chunk_rows=None):
+def inner_loop_objective(fixed, moving, sigmasq, device=None, chunk_rows=None,
+                         gpu_float32=None):
     """Batched inner_loop_objective.
 
     fixed: (3, N, P) numpy array.
@@ -92,11 +103,9 @@ def inner_loop_objective(fixed, moving, sigmasq, device=None, chunk_rows=None):
     if torch is None:
         raise RuntimeError("torch is not available, cannot use the GPU registration backend.")
 
-    dev = device if device is not None else get_device()
-    # the registration objective is MeanSquared in float64 on CPU; keep
-    # float64 here regardless of the WMA_GPU_FLOAT32 fast mode so the
-    # optimization trajectory is not perturbed more than necessary
-    dtype = torch.float64
+    _memory.disable_tf32()
+    dev = _resolve_device(device)
+    dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
 
     F = _prepare_fixed(fixed, dev, dtype)
 
@@ -109,23 +118,23 @@ def inner_loop_objective(fixed, moving, sigmasq, device=None, chunk_rows=None):
 
 
 def _choose_chunk_rows(F, n_moving, dev):
-    bytes_per_row = max(1, F.shape[0] * F.shape[1] * 8 * 6)
-    try:
-        free_bytes, _total = torch.cuda.mem_get_info(dev)
-    except Exception:
-        free_bytes = 4 << 30
+    itemsize = 8 if F.dtype == torch.float64 else 4
+    bytes_per_row = max(1, F.shape[0] * F.shape[1] * itemsize * 6)
+    free_bytes = _memory.effective_free_vram(dev)
     return max(1, min(n_moving, int(int(free_bytes * 0.5) // bytes_per_row), 8192))
 
 
 class _ObjectiveWorkspace:
-    """Pinned probability storage and adaptive tiles for one optimizer."""
+    """Host probability storage and adaptive tiles for one optimizer."""
     def __init__(self, fixed, moving_count):
         self.chunk_rows = _choose_chunk_rows(fixed, moving_count, fixed.device)
-        self.probability = torch.empty(moving_count, dtype=torch.float64, pin_memory=True)
+        self.probability = torch.empty(
+            moving_count, dtype=fixed.dtype, pin_memory=(fixed.device.type == 'cuda'))
 
 
 def _inner_loop_objective(F, M, sigmasq, dev, chunk_rows=None, workspace=None):
     """Entropy for prepared (N, P, 3) tensors; retain the CPU reduction."""
+    dev = _resolve_device(dev)
     n_fixed = F.shape[0]
     n_moving = M.shape[0]
     if chunk_rows is not None and chunk_rows < 1:
@@ -134,18 +143,19 @@ def _inner_loop_objective(F, M, sigmasq, dev, chunk_rows=None, workspace=None):
     if chunk_rows is None:
         chunk_rows = workspace.chunk_rows if workspace is not None else _choose_chunk_rows(F, n_moving, dev)
 
-    probability = torch.empty(n_moving, dtype=torch.float64, device=dev)
-
+    probability = None
     s = 0
     while s < n_moving:
         e = min(s + chunk_rows, n_moving)
         try:
             q = M[s:e].to(dev)
             prob = _pairwise_probability(F, q, sigmasq)
-        except torch.cuda.OutOfMemoryError:
+        except Exception as exc:
+            if not _memory.is_gpu_oom(exc):
+                raise
             if e - s == 1:
                 raise
-            torch.cuda.empty_cache()
+            _memory.empty_cache(dev)
             chunk_rows = max(1, (e - s) // 2)
             if workspace is not None:
                 workspace.chunk_rows = chunk_rows
@@ -154,13 +164,21 @@ def _inner_loop_objective(F, M, sigmasq, dev, chunk_rows=None, workspace=None):
         if s == 0 and e == n_moving:
             probability = prob
         else:
+            if probability is None:
+                probability = torch.empty(n_moving, dtype=F.dtype, device=dev)
             probability[s:e] = prob
         s = e
 
+    if probability is None:
+        probability = torch.empty(0, dtype=F.dtype, device=dev)
+
     # register_two_subjects.py:315-329: floor before dividing by n_fixed
     if workspace is not None:
-        workspace.probability.copy_(probability, non_blocking=True)
-        torch.cuda.current_stream(dev).synchronize()
+        if dev.type == 'cuda':
+            workspace.probability.copy_(probability, non_blocking=True)
+            torch.cuda.current_stream(dev).synchronize()
+        else:
+            workspace.probability.copy_(probability)
         return float(workspace.probability.add_(1e-20).div_(float(n_fixed)).log_().neg_().sum())
     probability = probability.cpu()
     probability = probability + 1e-20
@@ -182,25 +200,30 @@ def _squared_point_distances(F, q):
 
 
 def _pairwise_probability(F, q, sigmasq):
-    """Fuse point arithmetic, preserving PyTorch's point/fiber reductions."""
-    if registration_kernel.triton is not None and F.is_cuda:
-        if F.shape[1] <= 32:
-            return registration_kernel.pairwise_probabilities(F, q, sigmasq).sum(-1)
-        dist_forward, dist_reverse = registration_kernel.mean_squared_distances(F, q)
-    else:
-        points = float(F.shape[1])
-        dist_forward = _squared_point_distances(F, q).sum(-1) / points
-        dist_reverse = _squared_point_distances(F, q.flip(1)).sum(-1) / points
+    """Fuse point arithmetic and optional 2D cross-fiber sum."""
+    if (registration_kernel.triton is not None and F.is_cuda and q.is_cuda
+            and F.dtype == q.dtype and F.dtype in (torch.float64, torch.float32)
+            and F.is_contiguous() and q.is_contiguous()
+            and 1 <= F.shape[1] <= 64):
+        if not strict_enabled():
+            return registration_kernel.pairwise_probability_sums(F, q, sigmasq)
+        return registration_kernel.pairwise_probabilities(F, q, sigmasq).sum(-1)
+    points = float(F.shape[1])
+    dist_forward = _squared_point_distances(F, q).sum(-1) / points
+    dist_reverse = _squared_point_distances(F, q.flip(1)).sum(-1) / points
     torch.minimum(dist_forward, dist_reverse, out=dist_forward)
     return dist_forward.neg_().div_(sigmasq).exp_().sum(-1)
 
 
-def objective_value(fixed, moving, transform, mode, sigma, device=None):
+def objective_value(fixed, moving, transform, mode, sigma, device=None,
+                    gpu_float32=None):
     """Convenience: transform the moving brain then compute the entropy,
     equivalent to RegisterTractography.objective_function."""
 
-    moved = _transform_fiber_tensor(moving, transform, mode, device)
-    return inner_loop_objective(fixed, moved, sigma * sigma, device=device)
+    moved = _transform_fiber_tensor(
+        moving, transform, mode, device, gpu_float32=gpu_float32)
+    return inner_loop_objective(
+        fixed, moved, sigma * sigma, device=device, gpu_float32=gpu_float32)
 
 
 class AffineObjective:
@@ -210,20 +233,25 @@ class AffineObjective:
     No source NumPy arrays are retained or modified.
     """
 
-    def __init__(self, fixed, moving, device=None):
-        self.device = device if device is not None else get_device()
-        self.fixed = _prepare_fixed(fixed, self.device, torch.float64)
-        self.moving = torch.as_tensor(moving, dtype=torch.float64, device=self.device)
-        if registration_kernel.triton is not None and self.moving.is_cuda:
+    def __init__(self, fixed, moving, device=None, gpu_float32=None):
+        _memory.disable_tf32()
+        self.device = _resolve_device(device)
+        self.dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
+        self.fixed = _prepare_fixed(fixed, self.device, self.dtype)
+        self.moving = torch.as_tensor(moving, dtype=self.dtype, device=self.device)
+        if (registration_kernel.triton is not None and self.moving.is_cuda
+                and self.dtype in (torch.float64, torch.float32)):
             self.moving = self.moving.contiguous()
-            self.host_matrix = torch.empty((4, 4), dtype=torch.float64, pin_memory=True)
-            self.matrix = torch.empty((4, 4), dtype=torch.float64, device=self.device)
+            self.host_matrix = torch.empty((4, 4), dtype=self.dtype, pin_memory=True)
+            self.matrix = torch.empty((4, 4), dtype=self.dtype, device=self.device)
             self.transformed = torch.empty((moving.shape[1], moving.shape[2], 3),
-                                           dtype=torch.float64, device=self.device)
-        self.workspace = _ObjectiveWorkspace(self.fixed, moving.shape[1]) if self.fixed.is_cuda else None
+                                           dtype=self.dtype, device=self.device)
+        self.workspace = (_ObjectiveWorkspace(self.fixed, moving.shape[1])
+                          if self.fixed.device.type in ('cuda', 'mps') else None)
 
     def __call__(self, transform, mode, sigma):
-        if registration_kernel.triton is not None and self.moving.is_cuda:
+        if (registration_kernel.triton is not None and self.moving.is_cuda
+                and self.dtype in (torch.float64, torch.float32)):
             matrix = transform_matrix_from_vtk(transform, mode)
             # The preceding call returned a host scalar, so the optimizer can
             # safely reuse these buffers for its next sequential evaluation.
@@ -232,6 +260,8 @@ class AffineObjective:
             registration_kernel.affine_transform(self.moving, self.matrix, self.transformed)
             moved = self.transformed
         else:
-            moved = _transform_fiber_tensor(self.moving, transform, mode, self.device)
+            moved = _transform_fiber_tensor(
+                self.moving, transform, mode, self.device,
+                gpu_float32=(self.dtype == torch.float32))
             moved = moved.permute(1, 2, 0).contiguous()
         return _inner_loop_objective(self.fixed, moved, sigma * sigma, self.device, workspace=self.workspace)

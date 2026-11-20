@@ -122,8 +122,11 @@ class RegistrationTests(unittest.TestCase):
 
         if registration_kernel.triton is None:
             self.skipTest('Triton is not installed')
+        prev_strict = wma.gpu.config.strict_enabled()
+        wma.gpu.config.set_strict(True)
+        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
         rng = np.random.RandomState(2026)
-        for points in (1, 2, 3, 7, 8, 10, 15, 16, 20, 31, 32, 50):
+        for points in (1, 2, 3, 7, 8, 10, 15, 16, 20, 31, 32, 50, 64):
             with self.subTest(points=points):
                 fixed = gpu._prepare_fixed(
                     rng.normal(size=(3, 257, points)) * 40., 'cuda', torch.float64)
@@ -151,6 +154,9 @@ class RegistrationTests(unittest.TestCase):
 
         if registration_kernel.triton is None or torch.cuda.device_count() < 2:
             self.skipTest('Triton and two visible devices are required')
+        prev_strict = wma.gpu.config.strict_enabled()
+        wma.gpu.config.set_strict(True)
+        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
         previous = torch.cuda.current_device()
         selected = (previous + 1) % torch.cuda.device_count()
         fixed = torch.ones((7, 10, 3), dtype=torch.float64, device=selected)
@@ -197,6 +203,9 @@ class RegistrationTests(unittest.TestCase):
                 gpu._inner_loop_objective(fixed, moving, 100., 'cuda', 1)
 
     def test_optimizer_reuses_data_and_refreshes_samples(self):
+        prev_strict = wma.gpu.config.strict_enabled()
+        wma.gpu.config.set_strict(True)
+        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
         rng = np.random.RandomState(123)
         reg = RegisterTractography()
         reg.fixed = rng.normal(size=(3, 31, 10)) * 20
@@ -220,9 +229,10 @@ class RegistrationTests(unittest.TestCase):
                     self.assertIsNone(reg._gpu_objective)
                     actual_values = reg.objective_function_values.copy()
                     # Run the same optimizer with the preceding stateless GPU path.
-                    def stateless(fixed, moving):
+                    def stateless(fixed, moving, device=None, gpu_float32=None):
                         return lambda x, mode, sigma: gpu.objective_value(
-                            fixed, moving, x, mode, sigma)
+                            fixed, moving, x, mode, sigma,
+                            device=device, gpu_float32=gpu_float32)
                     reg.objective_function_values.clear()
                     with patch.object(gpu, 'AffineObjective', side_effect=stateless), \
                             patch.object(registration_kernel, 'triton', None):
@@ -251,6 +261,46 @@ class RegistrationTests(unittest.TestCase):
         x = reg.initial_transform * reg.transform_scaling
         self.assertEqual(reg.objective_function(x), gpu.objective_value(
             reg.fixed, reg.moving, x, reg.mode, reg.sigma))
+
+    def test_fused_pairwise_probability_sums_float32_and_p50(self):
+        import torch
+        if registration_kernel.triton is None:
+            self.skipTest('Triton is not installed')
+        prev_strict = wma.gpu.config.strict_enabled()
+        wma.gpu.config.set_strict(False)
+        self.addCleanup(wma.gpu.config.set_strict, prev_strict)
+
+        rng = np.random.RandomState(2027)
+        for points in (1, 15, 32, 50, 64):
+            for dtype in (torch.float64, torch.float32):
+                with self.subTest(points=points, dtype=dtype):
+                    fixed = gpu._prepare_fixed(
+                        rng.normal(size=(3, 700, points)) * 40., 'cuda', dtype)
+                    moving = gpu._prepare_fixed(
+                        rng.normal(size=(3, 37, points)) * 40., 'cuda', dtype)
+                    for sigmasq in (100., 400.):
+                        actual = gpu._pairwise_probability(fixed, moving, sigmasq)
+                        self.assertEqual(actual.dtype, dtype)
+                        self.assertEqual(actual.shape, (37,))
+                        with patch.object(registration_kernel, 'triton', None):
+                            expected = gpu._pairwise_probability(fixed, moving, sigmasq)
+                        tol = 1e-5 if dtype == torch.float32 else 1e-13
+                        torch.testing.assert_close(actual, expected, rtol=tol, atol=tol)
+
+        # Verify P=50 & gpu_float32=True end-to-end via AffineObjective and inner_loop_objective
+        f50 = rng.normal(size=(3, 257, 50)) * 40.
+        m50 = rng.normal(size=(3, 19, 50)) * 40.
+        x = np.array([2., -1., 1., 1., -1., 0.5, 1.01, .99, 1.0,
+                      0., 0., 0., 0., 0., 0.])
+        val64 = gpu.objective_value(f50, m50, x, [1] * 4, 20., gpu_float32=False)
+        with patch.object(registration_kernel, 'triton', None):
+            ref64 = gpu.objective_value(f50, m50, x, [1] * 4, 20., gpu_float32=False)
+        np.testing.assert_allclose(val64, ref64, rtol=1e-13, atol=1e-13)
+
+        obj32 = gpu.AffineObjective(f50, m50, gpu_float32=True)
+        val32 = obj32(x, [1] * 4, 20.)
+        self.assertEqual(obj32.fixed.dtype, torch.float32)
+        self.assertAlmostEqual(val32, ref64, delta=max(1e-3, abs(ref64) * 1e-4))
 
 
 class CPURegistrationTests(unittest.TestCase):
@@ -295,6 +345,75 @@ class CPURegistrationTests(unittest.TestCase):
         np.testing.assert_array_equal(actual, expected)
         np.testing.assert_array_equal(values, reg.objective_function_values)
         self.assertIsNone(reg._gpu_objective)
+
+    def test_gpu_float32_lazy_allocation_and_device_forwarding_cpu(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+        import tempfile
+        from whitematteranalysis.gpu import bspline
+        from whitematteranalysis.register_two_subjects_nonrigid_bsplines import (
+            RegisterTractographyNonrigid)
+
+        rng = np.random.RandomState(404)
+        fixed = rng.normal(size=(3, 19, 50)) * 20.
+        moving = rng.normal(size=(3, 7, 50)) * 20.
+        x = np.array([1., -2., 0.5, 0., 0., 0., 1., 1., 1., 0., 0., 0., 0., 0., 0.])
+        cpu_dev = torch.device('cpu')
+
+        val64 = gpu.objective_value(fixed, moving, x, [1] * 4, 20., device=cpu_dev, gpu_float32=False)
+        obj32 = gpu.AffineObjective(fixed, moving, device=cpu_dev, gpu_float32=True)
+        self.assertEqual(obj32.fixed.dtype, torch.float32)
+        val32 = obj32(x, [1] * 4, 20.)
+        self.assertAlmostEqual(val32, val64, delta=max(1e-3, abs(val64) * 1e-4))
+        self.assertAlmostEqual(
+            gpu.inner_loop_objective(fixed, moving, 400., device=cpu_dev, gpu_float32=True),
+            gpu.inner_loop_objective(fixed, moving, 400., device=cpu_dev, gpu_float32=False),
+            delta=max(1e-3, abs(val64) * 1e-4))
+
+        # Single-chunk _inner_loop_objective must not pre-allocate probability
+        expected_untransformed = gpu.inner_loop_objective(
+            fixed, moving, 400., device=cpu_dev, gpu_float32=False)
+        F_t = gpu._prepare_fixed(fixed, cpu_dev, torch.float64)
+        M_t = gpu._prepare_fixed(moving, cpu_dev, torch.float64)
+        with patch.object(torch, 'empty', side_effect=AssertionError('extra probability allocation')) as empty_spy:
+            single_val = gpu._inner_loop_objective(F_t, M_t, 400., cpu_dev, chunk_rows=len(M_t))
+        empty_spy.assert_not_called()
+        self.assertEqual(single_val, expected_untransformed)
+
+        # RegisterTractography and RegisterTractographyNonrigid forward gpu_device
+        reg = RegisterTractography()
+        reg.fixed, reg.moving = fixed, moving
+        reg.use_gpu, reg.maxfun = True, 2
+        reg.gpu_device = cpu_dev
+        with patch.object(wma.gpu.config, 'cuda_available', return_value=True), \
+                patch.object(gpu, 'AffineObjective', wraps=gpu.AffineObjective) as affine_spy:
+            reg.compute()
+        self.assertEqual(affine_spy.call_args.kwargs.get('device'), cpu_dev)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nreg = RegisterTractographyNonrigid()
+            nreg.nonrigid_grid_resolution = 3
+            nreg.initialize_nonrigid_grid()
+            nreg.initial_transform = nreg.displacement_field_numpy.copy()
+            nreg.output_directory = tmpdir
+            nreg.fixed = fixed[:, :, :10]
+            nreg.moving = moving[:, :3, :10]
+            nreg.use_gpu, nreg.maxfun = True, 2
+            nreg.gpu_device = cpu_dev
+            with patch.object(wma.gpu.config, 'cuda_available', return_value=True), \
+                    patch.object(bspline, 'NonrigidObjective', wraps=bspline.NonrigidObjective) as nonrigid_spy:
+                nreg.compute()
+            self.assertEqual(nonrigid_spy.call_args.kwargs.get('device'), cpu_dev)
+
+        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            mps_dev = torch.device('mps')
+            obj_mps = gpu.AffineObjective(fixed, moving, device=mps_dev, gpu_float32=True)
+            self.assertEqual(obj_mps.fixed.device.type, 'mps')
+            self.assertEqual(obj_mps.fixed.dtype, torch.float32)
+            mps_val = obj_mps(x, [1] * 4, 20.)
+            self.assertAlmostEqual(mps_val, val32, delta=max(1e-4, abs(val32) * 1e-4))
 
 
 if __name__ == '__main__':

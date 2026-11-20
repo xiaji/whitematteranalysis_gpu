@@ -126,6 +126,28 @@ class GPUMemoryTests(unittest.TestCase):
         self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
         self.assertFalse(torch.backends.cudnn.allow_tf32)
 
+    def test_mps_device_guards_skip_cuda_calls(self):
+        import importlib
+        torch = self._require_torch()
+        from whitematteranalysis.gpu import _memory as gpu_memory
+
+        gpu_config = importlib.import_module('whitematteranalysis.gpu.config')
+        prev_cap = gpu_config.config.max_vram_gib
+        self.addCleanup(setattr, gpu_config.config, 'max_vram_gib', prev_cap)
+
+        mps_device = torch.device('mps')
+        gpu_config.config.max_vram_gib = None
+        with patch.object(torch.cuda, 'mem_get_info',
+                          side_effect=AssertionError('must not query CUDA on MPS')):
+            self.assertEqual(gpu_memory.effective_free_vram(mps_device), 4 << 30)
+            gpu_config.config.max_vram_gib = 2.0
+            self.assertEqual(gpu_memory.effective_free_vram(mps_device), 2 << 30)
+
+        with patch.object(torch.cuda, 'empty_cache',
+                          side_effect=AssertionError('must not call cuda.empty_cache on MPS')):
+            gpu_memory.empty_cache(mps_device)
+            gpu_memory.empty_cache(torch.device('cpu'))
+
     def test_tiled_host_apis_fall_back_in_bounded_cpu_batches_on_tile_1_oom(self):
         import numpy as np
         torch = self._require_torch()

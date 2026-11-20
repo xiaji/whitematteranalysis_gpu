@@ -97,15 +97,22 @@ def _reduce_points(d2, distance_method, threshold, sigmasq, points_per_fiber):
     return d
 
 
+def _resolve_device(device=None):
+    if device is None:
+        return get_device()
+    return device if hasattr(device, 'type') else torch.device(device)
+
+
 def _fiber_block_distances(q, f, threshold, distance_method, sigmasq, bilateral=False,
                            similarity_sigmasq=None):
     """One block of query fibers vs all fixed fibers, both directions,
     (b, m) result. Matches similarity.fiber_distance, including bilateral mode."""
 
     points_per_fiber = q.shape[1]
-    if (distance_kernel.triton is not None and q.is_cuda and q.dtype == f.dtype == torch.float64
+    if (distance_kernel.triton is not None and q.is_cuda
+            and q.dtype == f.dtype and q.dtype in (torch.float64, torch.float32)
             and q.is_contiguous() and f.is_contiguous()
-            and points_per_fiber <= 32
+            and 1 <= points_per_fiber <= 64
             and distance_method in SUPPORTED_DISTANCE_METHODS
             and (distance_method != 'StrictSimilarity' or sigmasq > 0)
             and (similarity_sigmasq is None or similarity_sigmasq > 0)):
@@ -200,7 +207,7 @@ def _distance_matrix(Xn, Xm, threshold, distance_method='Hausdorff',
         except Exception as exc:
             if not _memory.is_gpu_oom(exc):
                 raise
-            torch.cuda.empty_cache()
+            _memory.empty_cache(device)
             if e - s == 1:
                 _warn_cpu_fallback('_distance_matrix', s, n)
                 from .cpu_backend import _distance_matrix as cpu_distance_matrix
@@ -325,7 +332,7 @@ def nearest_neighbor_distances_from_fiber_array(fiber_array, k=3,
         except Exception as exc:
             if not _memory.is_gpu_oom(exc):
                 raise
-            torch.cuda.empty_cache()
+            _memory.empty_cache(device)
             if e - s == 1:
                 _warn_cpu_fallback('nearest_neighbor_distances_from_fiber_array', s, n)
                 from .cpu_backend import _distance_matrix as cpu_distance_matrix
@@ -359,7 +366,8 @@ def nearest_neighbor_distances_from_fiber_array(fiber_array, k=3,
 def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
                                     distance_method='Mean', bilateral=False,
                                     sigmasq=400., gpu_float32=None,
-                                    tile_rows=None, sqrt_distance_sums=False):
+                                    tile_rows=None, sqrt_distance_sums=False,
+                                    device=None):
     """Reduce query-to-reference similarities on the GPU, one query row at a time.
 
     This is for outlier scores, which need the sum across reference fibers but
@@ -404,7 +412,7 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
         return similarity_sums
 
     _memory.disable_tf32()
-    device = get_device()
+    device = _resolve_device(device)
     fixed = torch.as_tensor(X_fixed, dtype=dtype, device=device)
     rows = _choose_tile_rows(X_queries.shape[0], X_fixed.shape[0],
                              X_queries.shape[1], dtype, device,
@@ -416,8 +424,8 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
         try:
             queries = torch.as_tensor(X_queries[start:end], dtype=dtype, device=device)
             if (distance_kernel.triton is not None and queries.is_cuda and fixed.is_cuda
-                    and dtype == torch.float64
-                    and distance_method == 'Mean' and 0 < queries.shape[1] <= 32
+                    and dtype in (torch.float64, torch.float32)
+                    and distance_method == 'Mean' and 1 <= queries.shape[1] <= 64
                     and sigmasq > 0 and queries.is_contiguous() and fixed.is_contiguous()):
                 sim_sum, distance_sum = distance_kernel.similarity_row_sums(
                     queries, fixed, threshold, sigmasq,
@@ -436,7 +444,7 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
         except Exception as exc:
             if not _memory.is_gpu_oom(exc):
                 raise
-            torch.cuda.empty_cache()
+            _memory.empty_cache(device)
             if end - start == 1:
                 _warn_cpu_fallback('similarity_row_sums_from_arrays', start, n_queries)
                 from .cpu_backend import _distance_matrix as cpu_distance_matrix
@@ -618,19 +626,22 @@ def rectangular_similarity_tensor(input_polydata_n, input_polydata_m, threshold,
     return out.t()
 
 
-def iter_rectangular_similarity(input_polydata_n, input_polydata_m, threshold,
-                               sigma, distance_method='Hausdorff', bilateral=False,
-                               sigmasq=6400, points_per_fiber=15,
-                               gpu_float32=None, tile_rows=None):
-    """Yield (start, (atlas_sample, input_block)) GPU similarity blocks."""
+def _iter_rectangular_similarity_arrays(queries, fixed, threshold,
+                                        sigma, distance_method='Hausdorff', bilateral=False,
+                                        sigmasq=6400, gpu_float32=None, tile_rows=None,
+                                        device=None):
+    """Yield (start, (atlas_sample, input_block)) GPU similarity blocks from fiber arrays."""
     _memory.disable_tf32()
-    device = get_device()
+    device = _resolve_device(device)
     dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
-    queries = fiber_tensors.polydata_to_numpy(input_polydata_n, points_per_fiber)
-    fixed = fiber_tensors.polydata_to_numpy(input_polydata_m, points_per_fiber)
+    points_per_fiber = queries.shape[1]
     fixed = torch.as_tensor(fixed, dtype=dtype, device=device)
     triton_2d = (distance_kernel.triton is not None
-                 and dtype == torch.float64 and points_per_fiber <= 32)
+                 and fixed.is_cuda
+                 and dtype in (torch.float64, torch.float32)
+                 and 1 <= points_per_fiber <= 64
+                 and distance_method in SUPPORTED_DISTANCE_METHODS
+                 and sigmasq > 0 and sigma > 0)
     rows = _choose_tile_rows(len(queries), len(fixed), points_per_fiber,
                              dtype, device, override=tile_rows,
                              triton_2d=triton_2d)
@@ -649,16 +660,30 @@ def iter_rectangular_similarity(input_polydata_n, input_polydata_m, threshold,
             if end - start == 1:
                 raise
             rows = max(1, (end - start) // 2)
-            torch.cuda.empty_cache()
+            _memory.empty_cache(device)
             continue
         yield start, block.t()
         del block
         start = end
 
 
+def iter_rectangular_similarity(input_polydata_n, input_polydata_m, threshold,
+                                sigma, distance_method='Hausdorff', bilateral=False,
+                                sigmasq=6400, points_per_fiber=15,
+                                gpu_float32=None, tile_rows=None, device=None):
+    """Yield (start, (atlas_sample, input_block)) GPU similarity blocks."""
+    queries = fiber_tensors.polydata_to_numpy(input_polydata_n, points_per_fiber)
+    fixed = fiber_tensors.polydata_to_numpy(input_polydata_m, points_per_fiber)
+    yield from _iter_rectangular_similarity_arrays(
+        queries, fixed, threshold, sigma, distance_method=distance_method,
+        bilateral=bilateral, sigmasq=sigmasq, gpu_float32=gpu_float32,
+        tile_rows=tile_rows, device=device)
+
+
 def _similarity_tensor_block(queries, fixed, threshold, sigma, method, bilateral, sigmasq):
     if torch.is_tensor(queries):
-        queries = queries.to(device=fixed.device, dtype=fixed.dtype, non_blocking=True)
+        queries = queries.to(device=fixed.device, dtype=fixed.dtype,
+                             non_blocking=(fixed.device.type == 'cuda'))
     else:
         queries = torch.as_tensor(queries, dtype=fixed.dtype, device=fixed.device)
     return _fiber_block_distances(queries, fixed, threshold, method, sigmasq, bilateral,
@@ -709,7 +734,7 @@ def total_similarity_matrix_strict(X_queries, X_fixed, reflect_mask, threshold,
         except Exception as exc:
             if not _memory.is_gpu_oom(exc):
                 raise
-            torch.cuda.empty_cache()
+            _memory.empty_cache(device)
             if e - s == 1:
                 _warn_cpu_fallback('total_similarity_matrix_strict', s, n)
                 from .cpu_backend import _distance_matrix as cpu_distance_matrix

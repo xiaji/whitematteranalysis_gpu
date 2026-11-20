@@ -287,12 +287,54 @@ class MultiSubjectRegistration:
                    for (fixed, moving, initial_transform, mode, sigma, subject_idx, iteration_count, output_directory, step_size, maxfun, render, grid_resolution) in zip(mean_list, subject_list, self.transforms_as_array, mode_list, sigma_list, subj_idx_list, iteration_list, outdir_list, stepsize_list, maxfun_list, render_list, grid_resolution_list)]
 
         if wma.gpu.use_gpu():
-            # single-GPU mode: subjects are processed sequentially in
-            # this process, one after another on the same device
-            # (deterministic order, no subprocess bootstrapping)
-            print("Using GPU acceleration for registration (single device, subjects sequential).")
-            ret = [congeal_multisubject_inner_loop(*args, use_gpu=True)
-                   for args in arglist]
+            from concurrent.futures import ThreadPoolExecutor
+            import contextlib
+            import threading
+            import torch
+
+            base_dev = wma.gpu.get_device()
+            n_gpus = wma.gpu.visible_device_count() if base_dev.type != 'mps' else 1
+            if base_dev.type == 'mps' or len(arglist) <= 1 or (n_gpus <= 1 and self.parallel_jobs == 1):
+                print("Using GPU acceleration for registration (single device, subjects sequential).")
+                ret = [congeal_multisubject_inner_loop(*args, use_gpu=True, device=base_dev)
+                       for args in arglist]
+            elif n_gpus > 1:
+                print(f"Using GPU acceleration for registration ({n_gpus} devices, round-robin workers).")
+                ret = [None] * len(arglist)
+                workers = min(n_gpus, len(arglist))
+
+                def _run_gpu_worker(gpu_idx):
+                    worker_dev = wma.gpu.get_device(gpu_idx)
+                    dev_ctx = (torch.cuda.device(worker_dev)
+                               if worker_dev.type == 'cuda' and torch.cuda.is_available()
+                               else contextlib.nullcontext())
+                    with dev_ctx:
+                        for subj_i in range(gpu_idx, len(arglist), n_gpus):
+                            ret[subj_i] = congeal_multisubject_inner_loop(
+                                *arglist[subj_i], use_gpu=True, device=worker_dev)
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    list(executor.map(_run_gpu_worker, range(workers)))
+            else:
+                workers = 2 if self.parallel_jobs < 0 else min(max(1, self.parallel_jobs), 2)
+                print(f"Using GPU acceleration for registration (single device, {workers} CUDA streams).")
+                thread_local = threading.local()
+
+                def _run_stream(args):
+                    if base_dev.type == 'cuda':
+                        stream = getattr(thread_local, 'stream', None)
+                        if stream is None:
+                            stream = torch.cuda.Stream(device=base_dev)
+                            thread_local.stream = stream
+                        ctx = torch.cuda.stream(stream)
+                    else:
+                        ctx = contextlib.nullcontext()
+                    with ctx:
+                        return congeal_multisubject_inner_loop(
+                            *args, use_gpu=True, device=base_dev)
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    ret = list(executor.map(_run_stream, arglist))
         else:
             ret = Parallel(
                 n_jobs=self.parallel_jobs, verbose=self.parallel_verbose)(
@@ -472,7 +514,7 @@ class MultiSubjectRegistration:
             print("WRITE TXFORMS:", elapsed_time)
 
 
-def congeal_multisubject_inner_loop(mean, subject, initial_transform, mode, sigma, subject_idx, iteration_count, output_directory, step_size, maxfun, render, grid_resolution, use_gpu=None):
+def congeal_multisubject_inner_loop(mean, subject, initial_transform, mode, sigma, subject_idx, iteration_count, output_directory, step_size, maxfun, render, grid_resolution, use_gpu=None, device=None):
 
     """This is the code executed by each subprocess that launches the
 
@@ -518,6 +560,8 @@ def congeal_multisubject_inner_loop(mean, subject, initial_transform, mode, sigm
     # GPU acceleration of transforms and objective functions.
     if use_gpu is not None:
         register.use_gpu = use_gpu
+    if device is not None:
+        register.gpu_device = device
 
     # Run the current iteration of optimization.    
     register.compute()
