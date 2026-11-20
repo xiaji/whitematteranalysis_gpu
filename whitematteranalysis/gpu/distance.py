@@ -280,6 +280,19 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
             return similarity_sums, distance_sums
         return similarity_sums
 
+    if (not float32_enabled(gpu_float32) and config.cpu_fast_enabled()
+            and X_queries.shape[0] * X_fixed.shape[0] < config.min_pair_work
+            and tile_rows is None):
+        from .cpu_backend import _distance_matrix as cpu_distance_matrix
+        distances = cpu_distance_matrix(
+            X_queries, X_fixed, threshold, distance_method=distance_method,
+            bilateral=bilateral, sigmasq=sigmasq, number_of_jobs=1)
+        similarity_sums = numpy.sum(numpy.exp(-distances / sigmasq), axis=1)
+        if sqrt_distance_sums:
+            distance_sums = numpy.sum(numpy.sqrt(distances), axis=1)
+            return similarity_sums, distance_sums
+        return similarity_sums
+
     device = get_device()
     fixed = torch.as_tensor(X_fixed, dtype=dtype, device=device)
     rows = _choose_tile_rows(X_queries.shape[0], X_fixed.shape[0],
@@ -290,11 +303,22 @@ def similarity_row_sums_from_arrays(X_queries, X_fixed, threshold,
         end = min(start + rows, X_queries.shape[0])
         try:
             queries = torch.as_tensor(X_queries[start:end], dtype=dtype, device=device)
-            distances = _fiber_block_distances(
-                queries, fixed, threshold, distance_method, sigmasq, bilateral)
-            similarities = torch.exp(-distances / sigmasq)
-            sim_sum = similarities.sum(dim=1)
-            if sqrt_distance_sums:
+            if (distance_kernel.triton is not None and dtype == torch.float64
+                    and distance_method == 'Mean' and queries.shape[1] <= 32
+                    and sigmasq > 0 and queries.is_contiguous() and fixed.is_contiguous()):
+                sim_sum, distance_sum = distance_kernel.similarity_row_sums(
+                    queries, fixed, threshold, sigmasq,
+                    bilateral=bilateral, sqrt_distance_sums=sqrt_distance_sums)
+            elif not sqrt_distance_sums:
+                similarities = _fiber_block_distances(
+                    queries, fixed, threshold, distance_method, sigmasq, bilateral,
+                    similarity_sigmasq=sigmasq)
+                sim_sum = similarities.sum(dim=1)
+            else:
+                distances = _fiber_block_distances(
+                    queries, fixed, threshold, distance_method, sigmasq, bilateral)
+                similarities = torch.exp(-distances / sigmasq)
+                sim_sum = similarities.sum(dim=1)
                 distance_sum = distances.sqrt().sum(dim=1)
         except torch.cuda.OutOfMemoryError:
             if end - start == 1:
@@ -338,7 +362,8 @@ def refine_outlier_probabilities_from_arrays(X_subject, X_atlas,
     mean_atlas = numpy.mean(total_atlas)
     std_atlas = numpy.std(total_atlas)
     cutoff = mean_atlas - std_threshold * std_atlas
-    band = 64. * numpy.finfo(numpy.float64).eps * (1. + abs(std_threshold))
+    band = max(64. * numpy.finfo(numpy.float64).eps,
+               4e-13 * max(1.0, abs(mean_atlas), abs(std_atlas))) * (1. + abs(std_threshold))
     candidates = numpy.flatnonzero(numpy.isfinite(total_subject) &
                                    (numpy.abs(total_subject - cutoff) <= band))
     if candidates.size == 0 or len(X_atlas) == 0:

@@ -118,6 +118,48 @@ if triton is not None:
         result = libdevice.sqrt_rn(tl.reshape(values, (BLOCK,)))
         tl.store(Output + pair, result, pair < COUNT)
 
+    @triton.jit
+    def _similarity_row_sums(F, Q, SimOut, DistOut, NF, NQ,
+                             P: tl.constexpr, WIDTH: tl.constexpr, STEPS: tl.constexpr,
+                             THRESHOLD2: tl.constexpr, BLOCK_N: tl.constexpr,
+                             BILATERAL: tl.constexpr = False, INV_SIGMA: tl.constexpr = 0.,
+                             COMPUTE_SQRT: tl.constexpr = False):
+        qi = tl.program_id(0)
+        p = tl.arange(0, WIDTH)[None, :]
+        qi_col = tl.zeros((BLOCK_N, 1), dtype=tl.int32) + qi
+        zero = tl.full((), 0., tl.float64)
+        inv_sigma = tl.full((), INV_SIGMA, tl.float64)
+        sim_acc = zero
+        dist_acc = zero
+        for base in range(0, NF, BLOCK_N):
+            fi_vec = base + tl.arange(0, BLOCK_N)
+            valid = fi_vec < NF
+            fi = fi_vec[:, None]
+            mask = valid[:, None]
+            a, ra = _values(F, Q, fi, qi_col, p, mask, P, False, THRESHOLD2, 'Mean', BILATERAL)
+            b, rb = _values(F, Q, fi, qi_col, p, mask, P, True, THRESHOLD2, 'Mean', BILATERAL)
+            if P > WIDTH:
+                mask2 = mask & (p + WIDTH < P)
+                a2, ra2 = _values(F, Q, fi, qi_col, p + WIDTH, mask2, P, False, THRESHOLD2, 'Mean', BILATERAL)
+                b2, rb2 = _values(F, Q, fi, qi_col, p + WIDTH, mask2, P, True, THRESHOLD2, 'Mean', BILATERAL)
+                a, b = a + a2, b + b2
+                if BILATERAL:
+                    ra, rb = ra + ra2, rb + rb2
+            # _values already took per-point sqrt; using 'MeanSquared' here reduces
+            # and divides by P without squaring, giving unsquared mean_dist directly.
+            mean_dist = _reduce_orientations(a, b, P, WIDTH, STEPS, 'MeanSquared', BLOCK_N)
+            if BILATERAL:
+                reflected = _reduce_orientations(ra, rb, P, WIDTH, STEPS, 'MeanSquared', BLOCK_N)
+                mean_dist = tl.minimum(mean_dist, reflected, propagate_nan=tl.PropagateNan.ALL)
+            d_sq = mean_dist * mean_dist
+            sim = libdevice.exp(-d_sq * inv_sigma)
+            sim_acc += tl.sum(tl.where(valid, sim, zero), axis=0)
+            if COMPUTE_SQRT:
+                dist_acc += tl.sum(tl.where(valid, mean_dist, zero), axis=0)
+        tl.store(SimOut + qi, sim_acc, qi < NQ)
+        if COMPUTE_SQRT:
+            tl.store(DistOut + qi, dist_acc, qi < NQ)
+
 
 def centroid_distances(queries, centroids):
     """Direct Euclidean distances for contiguous float64 CUDA vectors, 1<=D<=32."""
@@ -157,3 +199,39 @@ def fiber_distances(queries, fixed, threshold, method, bilateral=False, sigmasq=
             INV_GAUSSIAN=1. / similarity_sigmasq if similarity_sigmasq is not None else 0.,
             num_warps=1, enable_fp_fusion=False)
     return output
+
+
+def similarity_row_sums(queries, fixed, threshold, sigmasq, bilateral=False,
+                        sqrt_distance_sums=False):
+    """Fused float64 Mean-distance similarity (and optional sqrt-distance) row sums."""
+    import torch
+
+    nq = queries.shape[0]
+    nf = fixed.shape[0]
+    if nq == 0:
+        sim_sums = torch.empty((0,), dtype=fixed.dtype, device=fixed.device)
+        dist_sums = (torch.empty((0,), dtype=fixed.dtype, device=fixed.device)
+                     if sqrt_distance_sums else None)
+        return sim_sums, dist_sums
+    if nf == 0:
+        sim_sums = torch.zeros((nq,), dtype=fixed.dtype, device=fixed.device)
+        dist_sums = (torch.zeros((nq,), dtype=fixed.dtype, device=fixed.device)
+                     if sqrt_distance_sums else None)
+        return sim_sums, dist_sums
+
+    sim_sums = torch.empty((nq,), dtype=fixed.dtype, device=fixed.device)
+    dist_sums = (torch.empty((nq,), dtype=fixed.dtype, device=fixed.device)
+                 if sqrt_distance_sums else None)
+    points = fixed.shape[1]
+    steps = points.bit_length() - 1
+    block_n = 64
+    with torch.cuda.device(fixed.device):
+        _similarity_row_sums[(nq,)](
+            fixed, queries, sim_sums, dist_sums if sqrt_distance_sums else sim_sums,
+            nf, nq,
+            P=points, WIDTH=1 << steps, STEPS=steps,
+            THRESHOLD2=threshold * threshold, BLOCK_N=block_n,
+            BILATERAL=bilateral, INV_SIGMA=1. / sigmasq,
+            COMPUTE_SQRT=sqrt_distance_sums,
+            num_warps=4, enable_fp_fusion=False)
+    return sim_sums, dist_sums

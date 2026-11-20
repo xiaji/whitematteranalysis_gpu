@@ -13,6 +13,9 @@ arguments in bin/ scripts) or through environment variables:
     WMA_GPU_DEVICES   comma separated device ids to use, e.g. "0,1".
                       Default: all visible CUDA devices.
     WMA_GPU_TILE      override the number of query fibers per GPU tile.
+    WMA_GPU_MIN_PAIR_WORK
+                      minimum query*fixed pair count to dispatch to CUDA
+                      (default 4096; smaller clusters use cpu_backend).
 
 """
 
@@ -31,6 +34,9 @@ class GPUConfig:
         self.devices = None
         # Override for the number of query fibers per computation tile.
         self.tile_rows = None
+        # Minimum query*fixed pair count to dispatch to CUDA; smaller
+        # clusters route to cpu_backend to avoid GPU launch overhead.
+        self.min_pair_work = 4096
         # CUDA device index used by THIS process (single-GPU mode: 0,
         # or the first entry of WMA_GPU_DEVICES).
         self.device_index = 0
@@ -148,6 +154,14 @@ def _from_env():
     if tile:
         try:
             config.tile_rows = int(tile)
+        except ValueError:
+            pass
+    min_pair_work = os.environ.get('WMA_GPU_MIN_PAIR_WORK')
+    if min_pair_work is not None and min_pair_work != '':
+        try:
+            value = int(min_pair_work)
+            if value >= 0:
+                config.min_pair_work = value
         except ValueError:
             pass
 

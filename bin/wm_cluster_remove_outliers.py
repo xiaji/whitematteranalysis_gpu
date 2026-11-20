@@ -316,14 +316,42 @@ def main():
 
         return log_str
 
-    logtrs = Parallel(n_jobs=number_of_jobs, verbose=0)(
-            delayed(outlier_removal_one_cluster)(
-                ca,
-                cs,
-                outdir, 
-                c,
-                location_data)
-            for c, ca, cs in zip(range(1, number_ac+1), atlas_clusters, subject_clusters))
+    tasks = list(zip(range(1, number_ac + 1), atlas_clusters, subject_clusters))
+    if backend == 'gpu':
+        if number_of_jobs == 1:
+            logtrs = [
+                outlier_removal_one_cluster(ca, cs, outdir, c, location_data)
+                for c, ca, cs in tasks
+            ]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            import threading
+            import torch
+
+            max_workers = max(1, os.cpu_count() or 1) if number_of_jobs < 0 else number_of_jobs
+            device = wma.gpu.get_device()
+            thread_local = threading.local()
+
+            def _run_on_stream(task):
+                c, ca, cs = task
+                stream = getattr(thread_local, 'stream', None)
+                if stream is None:
+                    stream = torch.cuda.Stream(device=device)
+                    thread_local.stream = stream
+                with torch.cuda.stream(stream):
+                    return outlier_removal_one_cluster(ca, cs, outdir, c, location_data)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                logtrs = list(executor.map(_run_on_stream, tasks))
+    else:
+        logtrs = Parallel(n_jobs=number_of_jobs, verbose=0)(
+                delayed(outlier_removal_one_cluster)(
+                    ca,
+                    cs,
+                    outdir,
+                    c,
+                    location_data)
+                for c, ca, cs in tasks)
 
     
     log_file = open(fname_progress, 'a')
