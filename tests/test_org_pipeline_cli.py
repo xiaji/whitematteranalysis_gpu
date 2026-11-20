@@ -103,36 +103,24 @@ def _build_synthetic_org_atlas(atlas_root):
     atlas_pd = _make_tract_polydata(all_atlas_fibers)
     wma.io.write_polydata(atlas_pd, str(reg_dir / 'registration_atlas.vtk'))
 
-    import contextlib
     # Build a valid Nystrom spectral atlas over these 3 bundles
     nystrom_mask = np.ones(len(all_atlas_fibers), dtype=bool)
     nystrom_mask[115:] = False  # 115 in A (>= 100), 5 in B
     np.random.seed(42)
-    try:
-        import torch
-        has_torch = torch is not None
-    except ImportError:
-        has_torch = False
-    spectral_ctx = (
-        contextlib.nullcontext() if has_torch
-        else patch.object(wma.cluster.gpu, 'linalg',
-                          types.SimpleNamespace(eigh=np.linalg.eigh), create=True)
+    out_pd, cluster_idx, _, _, _, atlas, _ = wma.cluster.spectral(
+        atlas_pd,
+        number_of_clusters=3,
+        number_of_eigenvectors=3,
+        sigma=30.0,
+        threshold=0.0,
+        number_of_jobs=1,
+        use_nystrom=True,
+        nystrom_mask=nystrom_mask,
+        distance_method='Mean',
+        outlier_std_threshold=np.inf,
+        bilateral=False,
+        use_gpu=False,
     )
-    with spectral_ctx:
-        out_pd, cluster_idx, _, _, _, atlas, _ = wma.cluster.spectral(
-            atlas_pd,
-            number_of_clusters=3,
-            number_of_eigenvectors=3,
-            sigma=30.0,
-            threshold=0.0,
-            number_of_jobs=1,
-            use_nystrom=True,
-            nystrom_mask=nystrom_mask,
-            distance_method='Mean',
-            outlier_std_threshold=np.inf,
-            bilateral=False,
-            use_gpu=False,
-        )
     atlas.save(str(fc_dir), 'atlas')
 
     cluster_pds = wma.cluster.mask_all_clusters(
@@ -331,6 +319,63 @@ class FakeTransformLogic:
         return 1
 
 
+def _assert_native_roundtrip_points(test_case, vtp_path, native_fibers, atol=5e-4):
+    pd = wma.io.read_polydata(str(vtp_path))
+    if pd.GetNumberOfLines() == 0:
+        return 0
+    tags = vtk_to_numpy(pd.GetPointData().GetArray('fiber_tag'))
+    pts = vtk_to_numpy(pd.GetPoints().GetData())
+    lines = pd.GetLines()
+    lines.InitTraversal()
+    id_list = vtk.vtkIdList()
+    checked = 0
+    while lines.GetNextCell(id_list):
+        pids = [id_list.GetId(i) for i in range(id_list.GetNumberOfIds())]
+        tag = int(round(float(tags[pids[0]])))
+        test_case.assertGreater(tag, 0, f'Unexpected tag {tag} in {vtp_path}')
+        expected = np.asarray(native_fibers[tag - 1], dtype=np.float64)
+        np.testing.assert_allclose(
+            pts[pids], expected, atol=atol,
+            err_msg=f'Point round-trip mismatch in {vtp_path} for fiber {tag}',
+        )
+        checked += 1
+    return checked
+
+
+def _mock_slicer_hardening(in_dir, out_dir, tfm_path, slicer_path, jobs,
+                           inverse=True, split_output_dir=None, no_xvfb=False):
+    from whitematteranalysis._hemisphere import read_mask_location_from_vtk, split_polydata
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if split_output_dir is not None:
+        split_output_dir = Path(split_output_dir)
+        for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
+            (split_output_dir / folder).mkdir(parents=True, exist_ok=True)
+    mat = wma.transform.read_itk_affine_matrix_ras(str(tfm_path), inverse=inverse)
+    for pd_file in wma.io.list_vtk_files(str(in_dir)):
+        name = Path(pd_file).name
+        out_file = out_dir / name
+        if out_file.exists():
+            hardened = wma.io.read_polydata(str(out_file))
+        else:
+            pd = wma.io.read_polydata(pd_file)
+            hardened = (wma.transform.apply_affine_to_polydata(pd, mat)
+                        if pd.GetNumberOfCells() > 0 else pd)
+            wma.io.write_polydata(hardened, str(out_file))
+        if split_output_dir is not None:
+            split_files = [
+                split_output_dir / folder / name
+                for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural')
+            ]
+            if not all(p.is_file() for p in split_files):
+                found, labels = read_mask_location_from_vtk(hardened)
+                assert found and (labels == 0).sum() <= 1
+                split_polydata(hardened, labels, name, str(split_output_dir))
+    (out_dir / 'transform_complete.log').write_text('mocked\n')
+    return 'mock_slicer_model_node'
+
+
 class ORGPipelineCLITests(unittest.TestCase):
     def test_single_process_org_cli_end_to_end_and_short_fiber_exclusion(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -343,8 +388,9 @@ class ORGPipelineCLITests(unittest.TestCase):
             long_comm = _bundle_coords(0.0, 35.0, 6, n_pts=21, step=3.0, commissural=True, seed=12)
             # Short fibers (< 40 mm: 6 points * 3.0 mm = 18 mm)
             short_fibers = _bundle_coords(-35.0, 0.0, 5, n_pts=6, step=3.0, seed=13)
-            all_fibers = long_left + long_right + long_comm + short_fibers
-            tags = [1.0] * (len(long_left) + len(long_right) + len(long_comm)) + [-999.0] * len(short_fibers)
+            long_fibers = long_left + long_right + long_comm
+            all_fibers = long_fibers + short_fibers
+            tags = [float(i + 1) for i in range(len(long_fibers))] + [-999.0] * len(short_fibers)
             subj_pd = _make_tract_polydata(all_fibers, tags=tags)
             subj_path = root / 'sub-synth.vtp'
             wma.io.write_polydata(subj_pd, str(subj_path))
@@ -385,7 +431,7 @@ class ORGPipelineCLITests(unittest.TestCase):
             self.assertEqual(qc['hardening_backend'], 'pure_python_affine')
             self.assertEqual(qc['input_fibers'], len(all_fibers))
             self.assertEqual(qc['registered_fibers'], len(all_fibers))
-            self.assertEqual(qc['filtered_fibers'], len(long_left) + len(long_right) + len(long_comm))
+            self.assertEqual(qc['filtered_fibers'], len(long_fibers))
             self.assertEqual(qc['excluded_short_fibers'], len(short_fibers))
             self.assertEqual(qc['anatomical_tracts_written'], 3)
             self.assertFalse(list(out_root.glob('.staging_*')))
@@ -393,9 +439,10 @@ class ORGPipelineCLITests(unittest.TestCase):
             self.assertFalse((case_dir / 'FiberClustering').exists())
             self.assertFalse((case_dir / 'TractRegistration').exists())
 
-            # Verify --keep-intermediates 2 + --no-atomic-publish + linear -t pre-transform
+            # Verify --keep-intermediates 2 + --no-atomic-publish + linear -t pre-transform round-trip
             tx = vtk.vtkTransform()
-            tx.Translate(2.5, -1.5, 3.0)
+            tx.Translate(25.0, -30.0, 40.0)
+            tx.RotateZ(20.0)
             pre_tfm = Path(wma.io.write_transforms_to_itk_format([tx], str(root), ['pre'])[0])
             out_keep2 = root / 'out_keep2'
             proc2 = subprocess.run(
@@ -425,6 +472,18 @@ class ORGPipelineCLITests(unittest.TestCase):
             self.assertTrue((keep2_case / 'FiberClustering' / 'SeparatedClusters' / 'hemisphere_separation_complete.log').is_file())
             self.assertTrue((keep2_case / 'AnatomicalTracts' / 'anatomical_tracts_complete.log').is_file())
             self.assertTrue((keep2_case / 'qc_summary.json').is_file())
+            checked_tracts = sum(
+                _assert_native_roundtrip_points(self, keep2_case / 'AnatomicalTracts' / tract, long_fibers)
+                for tract in ('T_AF_left.vtp', 'T_AF_right.vtp', 'T_CC1.vtp')
+            )
+            self.assertGreater(checked_tracts, 0)
+            sep_root = keep2_case / 'FiberClustering' / 'SeparatedClusters'
+            checked_sep = sum(
+                _assert_native_roundtrip_points(self, sep_vtp, long_fibers)
+                for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural')
+                for sep_vtp in sorted((sep_root / folder).glob('cluster_*.vtp'))
+            )
+            self.assertGreater(checked_sep, 0)
 
     def test_atomic_publish_cleans_up_staging_on_assembly_failure(self):
         org_cli = _load_module('wm_apply_ORG_atlas_test', ORG_CLI_PATH)
@@ -629,6 +688,184 @@ class ORGPipelineCLITests(unittest.TestCase):
                 # keep_intermediates=2 calls write_polydatas_parallel 6 times (init, outrem, tfm, 3x sep)
                 self.assertEqual(len(recorded_write_calls), 6)
                 self.assertTrue(all(call == (jobs, True) for call in recorded_write_calls), recorded_write_calls)
+
+    def test_non_tier1_pretransform_keep1_roundtrip_and_no_atomic_rerun_cleanup(self):
+        org_cli = _load_module('wm_apply_ORG_atlas_nontier1', ORG_CLI_PATH)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            atlas_root = root / 'ORG-Atlas'
+            _build_synthetic_org_atlas(atlas_root)
+
+            fake_slicer = root / 'FakeSlicer'
+            fake_slicer.write_text('#!/bin/sh\nexit 0\n')
+
+            fibers1 = (
+                _bundle_coords(-35.0, 0.0, 5, n_pts=21, step=3.0, seed=50)
+                + _bundle_coords(35.0, 0.0, 5, n_pts=21, step=3.0, seed=51)
+                + _bundle_coords(0.0, 35.0, 5, n_pts=21, step=3.0, commissural=True, seed=52)
+            )
+            tags1 = [float(i + 1) for i in range(len(fibers1))]
+            subj_path = root / 'sub-nontier1.vtp'
+            wma.io.write_polydata(_make_tract_polydata(fibers1, tags=tags1, tensors=True), str(subj_path))
+
+            tx = vtk.vtkTransform()
+            tx.Translate(30.0, -25.0, 15.0)
+            tx.RotateZ(15.0)
+            pre_tfm = Path(wma.io.write_transforms_to_itk_format([tx], str(root), ['pre'])[0])
+
+            out_keep1 = root / 'out_keep1'
+            with patch.object(org_cli, '_invoke_slicer_hardening', side_effect=_mock_slicer_hardening), \
+                    patch.object(sys, 'argv', [
+                        str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_keep1),
+                        '-a', str(atlas_root), '-s', str(fake_slicer), '-t', str(pre_tfm),
+                        '-r', 'rig', '-j', '1', '-gpu', 'off', '--keep-intermediates', '1']):
+                org_cli.main()
+
+            keep1_case = out_keep1 / 'sub-nontier1'
+            sep_dir = keep1_case / 'FiberClustering' / 'SeparatedClusters'
+            self.assertTrue((sep_dir / 'hemisphere_separation_complete.log').is_file())
+            qc1 = json.loads((keep1_case / 'qc_summary.json').read_text())
+            self.assertEqual(qc1['hardening_backend'], 'mock_slicer_model_node')
+            self.assertTrue(qc1['has_tensor_arrays'])
+
+            checked_tracts = sum(
+                _assert_native_roundtrip_points(self, keep1_case / 'AnatomicalTracts' / tract, fibers1)
+                for tract in ('T_AF_left.vtp', 'T_AF_right.vtp', 'T_CC1.vtp')
+            )
+            self.assertEqual(checked_tracts, qc1['retained_clustered_fibers'])
+            checked_sep = sum(
+                _assert_native_roundtrip_points(self, sep_vtp, fibers1)
+                for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural')
+                for sep_vtp in sorted((sep_dir / folder).glob('cluster_*.vtp'))
+            )
+            self.assertEqual(checked_sep, qc1['retained_clustered_fibers'])
+
+            # Rerun twice into the same --no-atomic-publish --keep-intermediates 2 directory
+            # with changed input fibers while hardening mock skips existing files.
+            out_rerun = root / 'out_rerun'
+            with patch.object(org_cli, '_invoke_slicer_hardening', side_effect=_mock_slicer_hardening), \
+                    patch.object(sys, 'argv', [
+                        str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_rerun),
+                        '-a', str(atlas_root), '-s', str(fake_slicer),
+                        '-r', 'rig', '-j', '1', '-gpu', 'off',
+                        '--keep-intermediates', '2', '--no-atomic-publish']):
+                org_cli.main()
+
+            fibers2 = (
+                _bundle_coords(-35.0, 0.0, 4, n_pts=21, step=3.0, seed=60)
+                + _bundle_coords(35.0, 0.0, 4, n_pts=21, step=3.0, seed=61)
+                + _bundle_coords(0.0, 35.0, 4, n_pts=21, step=3.0, commissural=True, seed=62)
+            )
+            tags2 = [float(1001 + i) for i in range(len(fibers2))]
+            wma.io.write_polydata(_make_tract_polydata(fibers2, tags=tags2, tensors=True), str(subj_path))
+
+            with patch.object(org_cli, '_invoke_slicer_hardening', side_effect=_mock_slicer_hardening), \
+                    patch.object(sys, 'argv', [
+                        str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_rerun),
+                        '-a', str(atlas_root), '-s', str(fake_slicer),
+                        '-r', 'rig', '-j', '1', '-gpu', 'off',
+                        '--keep-intermediates', '2', '--no-atomic-publish']):
+                org_cli.main()
+
+            rerun_case = out_rerun / 'sub-nontier1'
+            qc_rerun = json.loads((rerun_case / 'qc_summary.json').read_text())
+            self.assertEqual(qc_rerun['input_fibers'], len(fibers2))
+            for tract in ('T_AF_left.vtp', 'T_AF_right.vtp', 'T_CC1.vtp'):
+                t_pd = wma.io.read_polydata(str(rerun_case / 'AnatomicalTracts' / tract))
+                self.assertGreater(t_pd.GetNumberOfLines(), 0)
+                tag_arr = vtk_to_numpy(t_pd.GetPointData().GetArray('fiber_tag'))
+                self.assertTrue(np.all(tag_arr >= 1001.0), f'Stale run-1 fibers leaked into {tract}: {tag_arr}')
+
+    def test_symlink_case_id_zero_atlas_cluster_empty_schema_and_slicer_which(self):
+        org_cli = _load_module('wm_apply_ORG_atlas_edge_cases', ORG_CLI_PATH)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            atlas_root = root / 'ORG-Atlas'
+            _build_synthetic_org_atlas(atlas_root)
+
+            fibers = (
+                _bundle_coords(-35.0, 0.0, 5, n_pts=21, step=3.0, seed=70)
+                + _bundle_coords(35.0, 0.0, 5, n_pts=21, step=3.0, seed=71)
+                + _bundle_coords(0.0, 35.0, 5, n_pts=21, step=3.0, commissural=True, seed=72)
+            )
+            real_subj = root / 'tractography.vtp'
+            wma.io.write_polydata(_make_tract_polydata(fibers), str(real_subj))
+            sym_subj = root / 'sub-alias.vtp'
+            os.symlink(str(real_subj), str(sym_subj))
+
+            # Clear cluster_00001.vtp to 0 fibers to verify n_atlas == 0 retains subject fibers in QC & logs
+            fc_dir = atlas_root / 'ORG-800FC-100HCP'
+            empty_cluster = vtk.vtkPolyData()
+            empty_cluster.SetPoints(vtk.vtkPoints())
+            empty_cluster.SetLines(vtk.vtkCellArray())
+            wma.io.write_polydata(empty_cluster, str(fc_dir / 'cluster_00001.vtp'))
+
+            out_sym = root / 'out_sym'
+            with patch.object(sys, 'argv', [
+                str(ORG_CLI_PATH), '-i', str(sym_subj), '-o', str(out_sym),
+                '-a', str(atlas_root), '-r', 'rig', '-j', '1', '-gpu', 'off',
+                '--keep-intermediates', '2']):
+                org_cli.main()
+
+            sym_case = out_sym / 'sub-alias'
+            self.assertTrue(sym_case.is_dir())
+            self.assertFalse((out_sym / 'tractography').exists())
+            qc_sym = json.loads((sym_case / 'qc_summary.json').read_text())
+            self.assertEqual(qc_sym['case_id'], 'sub-alias')
+            self.assertEqual(qc_sym['retained_clustered_fibers'], len(fibers))
+            self.assertEqual(qc_sym['nonempty_clusters'], 3)
+            log_lines = (
+                sym_case / 'FiberClustering' / 'OutlierRemovedClusters' /
+                'sub-alias_outlier_removed' / 'cluster_log.txt'
+            ).read_text().splitlines()
+            row1 = log_lines[1].split('\t')
+            self.assertGreater(int(row1[1]), 0)
+            self.assertEqual(row1[2], row1[1])
+
+            # _empty_like_schema handles vtkStringArray in PointData/CellData when filtered_fibers == 0
+            str_pd = _make_tract_polydata(fibers[:2])
+            s_pt = vtk.vtkStringArray()
+            s_pt.SetName('PointLabel')
+            for _ in range(str_pd.GetNumberOfPoints()):
+                s_pt.InsertNextValue('pt')
+            str_pd.GetPointData().AddArray(s_pt)
+            s_cell = vtk.vtkStringArray()
+            s_cell.SetName('CellLabel')
+            for _ in range(str_pd.GetNumberOfLines()):
+                s_cell.InsertNextValue('cell')
+            str_pd.GetCellData().AddArray(s_cell)
+            empty_schema = org_cli._empty_like_schema(str_pd)
+            self.assertIsInstance(empty_schema.GetPointData().GetAbstractArray('PointLabel'), vtk.vtkStringArray)
+            self.assertIsInstance(empty_schema.GetCellData().GetAbstractArray('CellLabel'), vtk.vtkStringArray)
+
+            empty_subj = root / 'sub-emptyfilter.vtp'
+            wma.io.write_polydata(_make_tract_polydata(fibers[:2], tags=[1.0, 2.0]), str(empty_subj))
+            out_empty = root / 'out_empty'
+            with patch.object(sys, 'argv', [
+                str(ORG_CLI_PATH), '-i', str(empty_subj), '-o', str(out_empty),
+                '-a', str(atlas_root), '-r', 'rig', '-l', '500', '-j', '1', '-gpu', 'off']):
+                org_cli.main()
+            qc_empty = json.loads((out_empty / 'sub-emptyfilter' / 'qc_summary.json').read_text())
+            self.assertEqual(qc_empty['filtered_fibers'], 0)
+            self.assertEqual(qc_empty['retained_clustered_fibers'], 0)
+
+            # Bare executable name supplied to -s resolves via shutil.which
+            bin_dir = root / 'path_bin'
+            bin_dir.mkdir()
+            slicer_bin = bin_dir / 'FakeSlicerOnPath'
+            slicer_bin.write_text('#!/bin/sh\nexit 0\n')
+            slicer_bin.chmod(0o755)
+            tensor_subj = root / 'sub-path-slicer.vtp'
+            wma.io.write_polydata(_make_tract_polydata(fibers, tensors=True), str(tensor_subj))
+            out_which = root / 'out_which'
+            with patch.dict(os.environ, {'PATH': f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"}), \
+                    patch.object(org_cli, '_invoke_slicer_hardening', side_effect=_mock_slicer_hardening) as mock_harden, \
+                    patch.object(sys, 'argv', [
+                        str(ORG_CLI_PATH), '-i', str(tensor_subj), '-o', str(out_which),
+                        '-a', str(atlas_root), '-s', 'FakeSlicerOnPath',
+                        '-r', 'rig', '-j', '1', '-gpu', 'off']):
+                org_cli.main()
+            self.assertEqual(Path(mock_harden.call_args.args[3]).resolve(), slicer_bin.resolve())
 
 
 if __name__ == '__main__':

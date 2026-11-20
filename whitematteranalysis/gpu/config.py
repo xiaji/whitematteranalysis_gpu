@@ -26,6 +26,7 @@ arguments in bin/ scripts) or through environment variables:
 
 """
 
+import argparse
 import math
 import os
 
@@ -222,18 +223,53 @@ def _from_env():
             pass
 
 
+class _TrackStoreAction(argparse.Action):
+    """Record explicit CLI assignment alongside the parsed option value."""
+
+    def __init__(self, option_strings, dest, flag_name=None, **kwargs):
+        self._flag_name = flag_name
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        if self._flag_name:
+            setattr(namespace, self._flag_name, True)
+
+
+class _TrackStoreTrueAction(argparse.Action):
+    """Record explicit boolean flag assignment without altering default value."""
+
+    def __init__(self, option_strings, dest, flag_name=None, **kwargs):
+        self._flag_name = flag_name
+        kwargs.setdefault('nargs', 0)
+        kwargs.setdefault('default', False)
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, True)
+        if self._flag_name:
+            setattr(namespace, self._flag_name, True)
+
+
 def add_gpu_arguments(parser):
     """Add the standard GPU options to an argparse parser used by bin/
     scripts. Apply them with apply_gpu_arguments(args) after parsing."""
 
+    parser.set_defaults(
+        _gpu_explicit_tracked=True,
+        _gpu_mode_explicit=False,
+        _gpu_float32_explicit=False,
+    )
     parser.add_argument(
-        '-gpu', action='store', dest='gpuMode', default='auto',
+        '-gpu', action=_TrackStoreAction, flag_name='_gpu_mode_explicit',
+        dest='gpuMode', default='auto',
         choices=['auto', 'on', 'off'],
         help='GPU acceleration for fiber distance computations: auto '
              '(default, use GPU when available), on, off. Results match '
              'the CPU implementation.')
     parser.add_argument(
-        '-gpu_float32', action='store_true', dest='gpuFloat32',
+        '-gpu_float32', action=_TrackStoreTrueAction, flag_name='_gpu_float32_explicit',
+        dest='gpuFloat32',
         help='(Fast mode.) Compute GPU distances in float32 instead of '
              'float64. Faster, but distances deviate from the CPU '
              'float64 results by about 1e-6 relative precision, which '
@@ -248,8 +284,14 @@ def add_gpu_arguments(parser):
 def apply_gpu_arguments(args):
     """Apply the options created by add_gpu_arguments to the global config."""
 
-    set_gpu(getattr(args, 'gpuMode', 'auto'))
-    set_float32(getattr(args, 'gpuFloat32', False))
+    if getattr(args, '_gpu_explicit_tracked', False):
+        if getattr(args, '_gpu_mode_explicit', False):
+            set_gpu(getattr(args, 'gpuMode', 'auto'))
+        if getattr(args, '_gpu_float32_explicit', False):
+            set_float32(getattr(args, 'gpuFloat32', False))
+    else:
+        set_gpu(getattr(args, 'gpuMode', 'auto'))
+        set_float32(getattr(args, 'gpuFloat32', False))
     devices = getattr(args, 'gpuDevices', None)
     if devices:
         set_devices(devices)

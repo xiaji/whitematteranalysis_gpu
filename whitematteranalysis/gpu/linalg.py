@@ -42,11 +42,13 @@ def eigh(M):
     """eigh for a symmetric (m, m) float64 matrix.
 
     Returns (e_val, e_vec) as float64 numpy arrays. Uses LAPACK unless
-    the WMA_GPU_EIGH flag is set and a GPU is available.
+    the WMA_GPU_EIGH flag is set and a CUDA GPU is available.
     """
 
-    if eigh_enabled() and config.cuda_available():
+    if torch is not None and eigh_enabled() and config.cuda_available():
         dev = get_device()
+        if dev.type == 'mps':
+            return numpy.linalg.eigh(M)
         Mt = torch.as_tensor(M, dtype=torch.float64, device=dev)
         e_val, e_vec = torch.linalg.eigh(Mt)
         return e_val.cpu().numpy(), e_vec.cpu().numpy()
@@ -65,7 +67,8 @@ def _resolve_dtype(dtype=None, gpu_float32=None):
     return torch.float32 if float32_enabled(gpu_float32) else torch.float64
 
 
-def _as_gpu(np_array, dev, dtype=torch.float64):
+def _as_gpu(np_array, dev, dtype=None):
+    dtype = _resolve_dtype(dtype)
     return torch.as_tensor(numpy.ascontiguousarray(np_array),
                            dtype=dtype, device=dev)
 
@@ -75,8 +78,10 @@ def nystrom_row_sum_2(B, row_sum_matrix):
 
         row_sum_2 = B.sum(0) + row_sum_matrix @ B
 
-    B: (m, n) float64. Returns float64 numpy (n,).
+    B: (m, n) float64. Returns numpy (n,).
     """
+    if torch is None:
+        raise RuntimeError("torch is not available, cannot use the GPU linalg backend.")
 
     dev = get_device()
     Bg = _as_gpu(B, dev)
@@ -89,8 +94,10 @@ def nystrom_embed_B(B, e_vec, e_val):
 
         V2 = (B.T @ e_vec) @ diag(1/e_val)
 
-    B: (m, n) float64. Returns V2 as float64 numpy (n, m).
+    B: (m, n) float64. Returns V2 as numpy (n, m).
     """
+    if torch is None:
+        raise RuntimeError("torch is not available, cannot use the GPU linalg backend.")
 
     dev = get_device()
     Bg = _as_gpu(B, dev)
@@ -110,6 +117,8 @@ def atlas_label_embedding(B, atlas, gpu_float32=None, device=None):
     Returns (embed, cluster_idx, dist, row_sum, B_col_sums) where
     row_sum and B_col_sums feed _format_output_polydata.
     """
+    if torch is None:
+        raise RuntimeError("torch is not available, cannot use the GPU linalg backend.")
     _memory.disable_tf32()
     dev = _resolve_device(device)
     target_dtype = _resolve_dtype(gpu_float32=gpu_float32)
@@ -202,6 +211,8 @@ def _atlas_embedding_block(B, atlas, prepared, device=None, dtype=None):
 @SmallPages()
 def atlas_label_embedding_blocks(blocks, atlas, number_fibers, gpu_float32=None, device=None):
     """Embed each input block without retaining the full similarity or V matrices."""
+    if torch is None:
+        raise RuntimeError("torch is not available, cannot use the GPU linalg backend.")
     _memory.disable_tf32()
     dev = _resolve_device(device)
     target_dtype = _resolve_dtype(gpu_float32=gpu_float32)

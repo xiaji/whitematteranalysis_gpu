@@ -235,6 +235,77 @@ class GPUMemoryTests(unittest.TestCase):
                 self.assertTrue(all(b < big_n for b in seen_batch_rows), seen_batch_rows)
                 self.assertEqual(sum(seen_batch_rows), big_n)
 
+    def test_rectangular_similarity_tensor_mps_empty_cache_and_strict_float32(self):
+        import numpy as np
+        import vtk
+        from vtk.util.numpy_support import numpy_to_vtk
+        torch = self._require_torch()
+        from whitematteranalysis.gpu import _memory as gpu_memory, distance
+
+        def _make_pd(arr):
+            pd = vtk.vtkPolyData()
+            pts = vtk.vtkPoints()
+            pts.SetData(numpy_to_vtk(arr.reshape(-1, 3), deep=True))
+            lines = vtk.vtkCellArray()
+            for i in range(arr.shape[0]):
+                lines.InsertNextCell(arr.shape[1])
+                for j in range(arr.shape[1]):
+                    lines.InsertCellPoint(i * arr.shape[1] + j)
+            pd.SetPoints(pts)
+            pd.SetLines(lines)
+            return pd
+
+        rng = np.random.RandomState(61)
+        Xn = rng.normal(size=(5, 7, 3))
+        Xm = rng.normal(size=(4, 7, 3))
+        pd_n, pd_m = _make_pd(Xn), _make_pd(Xm)
+        mps_device = torch.device('mps')
+        has_real_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+        target_dev = mps_device if has_real_mps else torch.device('cpu')
+
+        orig_block = distance._fiber_block_distances
+        seen_sizes = []
+
+        def oom_above_two(q, *args, **kwargs):
+            seen_sizes.append(len(q))
+            if len(q) > 2:
+                raise RuntimeError('MPS out of memory')
+            return orig_block(q, *args, **kwargs)
+
+        with patch.object(distance, 'get_device', return_value=mps_device if has_real_mps else target_dev), \
+                patch.object(torch.cuda, 'empty_cache',
+                             side_effect=AssertionError('must not call cuda.empty_cache on MPS')), \
+                patch.object(gpu_memory, 'empty_cache', wraps=gpu_memory.empty_cache) as empty_spy, \
+                patch.object(distance, '_fiber_block_distances', side_effect=oom_above_two):
+            if not has_real_mps:
+                # Simulate dev.type == 'mps' for empty_cache even when MPS backend is absent
+                with patch.object(distance, 'get_device', return_value=mps_device), \
+                        patch.object(torch, 'empty', side_effect=lambda *a, **kw: torch.empty(*a, **{**kw, 'device': torch.device('cpu')})), \
+                        patch.object(torch, 'as_tensor', side_effect=lambda d, *a, **kw: torch.as_tensor(d, *a, **{**kw, 'device': torch.device('cpu')})):
+                    tensor_out = distance.rectangular_similarity_tensor(
+                        pd_n, pd_m, 0., 20., gpu_float32=True, tile_rows=5)
+            else:
+                tensor_out = distance.rectangular_similarity_tensor(
+                    pd_n, pd_m, 0., 20., gpu_float32=True, tile_rows=5)
+        self.assertEqual(seen_sizes, [5, 2, 2, 1])
+        self.assertEqual(tensor_out.shape, (4, 5))
+        empty_spy.assert_called_once_with(mps_device)
+
+        # Verify total_similarity_matrix_strict(..., gpu_float32=True) never creates float64 tensors
+        orig_as_tensor = torch.as_tensor
+
+        def no_float64_as_tensor(data, *args, **kwargs):
+            if kwargs.get('dtype') == torch.float64:
+                raise AssertionError('total_similarity_matrix_strict(gpu_float32=True) requested float64')
+            return orig_as_tensor(data, *args, **kwargs)
+
+        with patch.object(distance, 'get_device', return_value=target_dev), \
+                patch.object(torch, 'as_tensor', side_effect=no_float64_as_tensor):
+            strict_out = distance.total_similarity_matrix_strict(
+                Xn, Xm, np.array([True, False, True, False, True]),
+                0., 400., gpu_float32=True, tile_rows=2, row_sum=True)
+        self.assertEqual(strict_out.dtype, np.float32)
+
 
 if __name__ == '__main__':
     unittest.main()

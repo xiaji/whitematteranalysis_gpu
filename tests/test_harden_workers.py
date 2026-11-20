@@ -372,6 +372,86 @@ class HardenWorkerTests(unittest.TestCase):
             self.assertIn('pure-Python affine', stdout_free.getvalue())
             self.assertTrue((out_free / 'transform_complete.log').is_file())
 
+    def test_pure_python_converts_space_lps_before_hardening(self):
+        with tempfile.TemporaryDirectory(prefix='wma lps harden ') as temporary:
+            root = Path(temporary)
+            source = root / 'input'
+            source.mkdir()
+
+            def _add_space(pd, space_value):
+                arr = vtk.vtkStringArray()
+                arr.SetName('SPACE')
+                arr.InsertNextValue(space_value)
+                pd.GetFieldData().AddArray(arr)
+
+            # Non-empty LPS cluster with point (10, 20, 30)
+            pd_lps = self._make_cluster_polydata(
+                [[[10.0, 20.0, 30.0], [-10.0, -20.0, 30.0]]], hemi_labels=[1.0])
+            _add_space(pd_lps, 'LPS')
+            wma.io.write_polydata(pd_lps, str(source / 'cluster_00001.vtp'))
+
+            # 0-cell / 0-point LPS polydata (must not retain stale SPACE=LPS)
+            pd_empty_lps = vtk.vtkPolyData()
+            pd_empty_lps.SetPoints(vtk.vtkPoints())
+            pd_empty_lps.SetLines(vtk.vtkCellArray())
+            _add_space(pd_empty_lps, 'lps')
+            wma.io.write_polydata(pd_empty_lps, str(source / 'cluster_00002.vtp'))
+
+            # 0-cell polydata with unreferenced points and SPACE=LPS
+            pd_pts_only_lps = vtk.vtkPolyData()
+            pts_only = vtk.vtkPoints()
+            pts_only.InsertNextPoint(10.0, 20.0, 30.0)
+            pd_pts_only_lps.SetPoints(pts_only)
+            pd_pts_only_lps.SetLines(vtk.vtkCellArray())
+            _add_space(pd_pts_only_lps, 'LPS')
+            wma.io.write_polydata(pd_pts_only_lps, str(source / 'cluster_00003.vtp'))
+
+            # Identity ITK transform -> LPS (10, 20, 30) must become RAS (-10, -20, 30)
+            id_tx = vtk.vtkTransform()
+            id_tfm = Path(wma.io.write_transforms_to_itk_format([id_tx], str(root), ['id'])[0])
+            out_id = root / 'out_id'
+            with patch('sys.argv', [
+                'wm_harden_transform.py', str(source), str(out_id), '-t', str(id_tfm), '--pure-python'
+            ]):
+                launcher.main()
+
+            out1 = wma.io.read_polydata(str(out_id / 'cluster_00001.vtp'))
+            np.testing.assert_allclose(
+                vtk_to_numpy(out1.GetPoints().GetData()),
+                np.array([[-10.0, -20.0, 30.0], [10.0, 20.0, 30.0]]),
+                atol=1e-5,
+            )
+            self.assertEqual(out1.GetFieldData().GetAbstractArray('SPACE').GetValue(0), 'RAS')
+
+            out2 = wma.io.read_polydata(str(out_id / 'cluster_00002.vtp'))
+            self.assertEqual(out2.GetNumberOfCells(), 0)
+            self.assertEqual(out2.GetFieldData().GetAbstractArray('SPACE').GetValue(0), 'RAS')
+
+            out3 = wma.io.read_polydata(str(out_id / 'cluster_00003.vtp'))
+            np.testing.assert_allclose(
+                vtk_to_numpy(out3.GetPoints().GetData()),
+                np.array([[-10.0, -20.0, 30.0]]),
+                atol=1e-5,
+            )
+            self.assertEqual(out3.GetFieldData().GetAbstractArray('SPACE').GetValue(0), 'RAS')
+
+            # Translated ITK transform applied after LPS->RAS conversion
+            shift_tx = vtk.vtkTransform()
+            shift_tx.Translate(2.0, -3.0, 4.0)
+            shift_tfm = Path(wma.io.write_transforms_to_itk_format([shift_tx], str(root), ['shift'])[0])
+            out_shift = root / 'out_shift'
+            with patch('sys.argv', [
+                'wm_harden_transform.py', str(source), str(out_shift), '-t', str(shift_tfm), '--pure-python'
+            ]):
+                launcher.main()
+            out1_shift = wma.io.read_polydata(str(out_shift / 'cluster_00001.vtp'))
+            np.testing.assert_allclose(
+                vtk_to_numpy(out1_shift.GetPoints().GetData())[0],
+                np.array([-8.0, -23.0, 34.0]),
+                atol=1e-5,
+            )
+            self.assertEqual(out1_shift.GetFieldData().GetAbstractArray('SPACE').GetValue(0), 'RAS')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -615,7 +615,7 @@ def rectangular_similarity_tensor(input_polydata_n, input_polydata_m, threshold,
                 raise
             if e - s == 1:
                 raise
-            torch.cuda.empty_cache()
+            _memory.empty_cache(device)
             tr = max(1, (e - s) // 2)
             print(f"<{__name__}> GPU out of memory, retrying with tile size {tr}")
             continue
@@ -710,7 +710,7 @@ def total_similarity_matrix_strict(X_queries, X_fixed, reflect_mask, threshold,
     out_dtype = numpy.float32 if dtype == torch.float32 else numpy.float64
 
     f = torch.as_tensor(X_fixed, dtype=dtype, device=device)
-    q_all = torch.as_tensor(X_queries, dtype=torch.float64)
+    q_all = torch.as_tensor(X_queries, dtype=dtype)
     reflect_mask = numpy.asarray(reflect_mask, dtype=bool)
     mask_gpu = torch.as_tensor(reflect_mask, dtype=torch.bool, device=device)
 

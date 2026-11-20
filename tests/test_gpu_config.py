@@ -144,6 +144,43 @@ class GPUConfigTests(unittest.TestCase):
             self.assertTrue(gpu_config.use_gpu())
             self.assertEqual(gpu_config.get_device(), torch.device('cuda', 0))
 
+    def test_apply_gpu_arguments_preserves_env_unless_explicitly_passed(self):
+        with patch.dict(os.environ, {
+            'WMA_GPU': 'off',
+            'WMA_GPU_FLOAT32': '1',
+            'WMA_GPU_MPS': '1',
+        }):
+            gpu_config._from_env()
+
+        parser = argparse.ArgumentParser()
+        gpu_config.add_gpu_arguments(parser)
+        omitted = parser.parse_args([])
+        self.assertEqual(omitted.gpuMode, 'auto')
+        self.assertFalse(omitted.gpuFloat32)
+
+        gpu_config.apply_gpu_arguments(omitted)
+        self.assertIs(gpu_config.config.requested, False)
+        self.assertTrue(gpu_config.config.float32)
+        self.assertTrue(gpu_config.config.allow_mps)
+        self.assertFalse(gpu_config.use_gpu())
+
+        # Explicit -gpu auto overrides WMA_GPU=off while still preserving WMA_GPU_FLOAT32=1
+        gpu_config.apply_gpu_arguments(parser.parse_args(['-gpu', 'auto']))
+        self.assertIsNone(gpu_config.config.requested)
+        self.assertTrue(gpu_config.config.float32)
+
+        # Explicit -gpu_float32 overrides WMA_GPU_FLOAT32=0
+        with patch.dict(os.environ, {'WMA_GPU': 'off', 'WMA_GPU_FLOAT32': '0'}):
+            gpu_config._from_env()
+        gpu_config.apply_gpu_arguments(parser.parse_args(['-gpu_float32']))
+        self.assertIs(gpu_config.config.requested, False)
+        self.assertTrue(gpu_config.config.float32)
+
+        # Manual Namespace without parser tracking retains legacy getattr behavior
+        gpu_config.apply_gpu_arguments(argparse.Namespace(gpuMode='off', gpuFloat32=False))
+        self.assertIs(gpu_config.config.requested, False)
+        self.assertFalse(gpu_config.config.float32)
+
 
 if __name__ == '__main__':
     unittest.main()

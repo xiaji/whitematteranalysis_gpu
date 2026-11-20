@@ -333,7 +333,8 @@ def _outlier_and_assess_clusters(cluster_pds, atlas_cluster_paths, atlas_bilater
             if len(numpy.where(labels == 0)[0]) > 1:
                 raise RuntimeError(f"Hemisphere labels incomplete for cluster {c_num:05d}")
             cleaned_pds[c_idx] = pd_out
-            log_rows[c_idx] = f"{c_num}\t{n_subj}\t 0 \t 0 \t 0 \t 0 \t 0 \t 0 \t 0"
+            stats[c_idx]['retained'] = n_subj
+            log_rows[c_idx] = f"{c_num}\t{n_subj}\t{n_subj}\t0\t0.0\t0\t0\t0\t0"
             return
 
         if backend:
@@ -461,26 +462,53 @@ def _empty_like_schema(template_pd):
         pts.SetDataType(template_pd.GetPoints().GetDataType())
     pd.SetPoints(pts)
     pd.SetLines(vtk.vtkCellArray())
-    for idx in range(template_pd.GetPointData().GetNumberOfArrays()):
-        arr = template_pd.GetPointData().GetAbstractArray(idx)
-        clone = vtk.vtkDataArray.CreateDataArray(arr.GetDataType())
-        clone.SetName(arr.GetName())
-        clone.SetNumberOfComponents(arr.GetNumberOfComponents())
-        pd.GetPointData().AddArray(clone)
-    for idx in range(template_pd.GetCellData().GetNumberOfArrays()):
-        arr = template_pd.GetCellData().GetAbstractArray(idx)
-        clone = vtk.vtkDataArray.CreateDataArray(arr.GetDataType())
-        clone.SetName(arr.GetName())
-        clone.SetNumberOfComponents(arr.GetNumberOfComponents())
-        pd.GetCellData().AddArray(clone)
+    for src, dst in (
+        (template_pd.GetPointData(), pd.GetPointData()),
+        (template_pd.GetCellData(), pd.GetCellData()),
+    ):
+        for idx in range(src.GetNumberOfArrays()):
+            arr = src.GetAbstractArray(idx)
+            if arr is None:
+                continue
+            clone = arr.NewInstance()
+            clone.SetName(arr.GetName())
+            clone.SetNumberOfComponents(arr.GetNumberOfComponents())
+            dst.AddArray(clone)
     return pd
+
+
+def _clean_stale_outputs(work_dir):
+    """Remove downstream outputs before an in-place --no-atomic-publish rerun."""
+    for rel in (
+        'AnatomicalTracts',
+        'anatomical_tracts_complete.log',
+        'qc_summary.json',
+        'FiberClustering/InitialClusters',
+        'FiberClustering/OutlierRemovedClusters',
+        'FiberClustering/TransformedClusters',
+        'FiberClustering/SeparatedClusters',
+        'TransformedTracts',
+        'SeparatedTracts',
+        'InvTransformedTracts',
+        'TractRegistration',
+    ):
+        target = work_dir / rel
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+    fc_dir = work_dir / 'FiberClustering'
+    if fc_dir.is_dir() and not any(fc_dir.iterdir()):
+        fc_dir.rmdir()
 
 
 def run_pipeline(args):
     t_start = time.perf_counter()
     timings = {}
 
-    input_path = Path(args.input).resolve()
+    raw_input = Path(args.input)
+    case_id = os.path.splitext(raw_input.name)[0]
+    input_path = raw_input.resolve()
     if not input_path.is_file():
         raise FileNotFoundError(f"Input tractography file does not exist: {input_path}")
 
@@ -538,14 +566,23 @@ def run_pipeline(args):
         and not has_tensors
         and (args.transform is None or pre_fwd_matrix is not None)
     )
-    slicer_path = Path(args.slicer).resolve() if args.slicer else None
+    slicer_path = None
+    if args.slicer:
+        slicer_candidate = Path(args.slicer)
+        if slicer_candidate.is_file():
+            slicer_path = slicer_candidate.resolve()
+        elif os.sep not in args.slicer and (not os.altsep or os.altsep not in args.slicer):
+            found_slicer = shutil.which(args.slicer)
+            if found_slicer:
+                slicer_path = Path(found_slicer).resolve()
+        else:
+            slicer_path = slicer_candidate.resolve()
     if not tier1_eligible:
         if slicer_path is None or not slicer_path.is_file():
             raise RuntimeError(
                 "3D Slicer (-s/--slicer) is required for nonrigid registration, "
                 "non-linear pre-transforms, or tensor-bearing tractography.")
 
-    case_id = os.path.splitext(input_path.name)[0]
     output_root = Path(args.output).resolve()
     final_dir = output_root / case_id
     if not args.no_atomic_publish:
@@ -559,6 +596,7 @@ def run_pipeline(args):
     else:
         final_dir.mkdir(parents=True, exist_ok=True)
         work_dir = final_dir
+        _clean_stale_outputs(work_dir)
 
     try:
         with tempfile.TemporaryDirectory(prefix='wma_org_work_') as tmp_scratch:
@@ -796,10 +834,13 @@ def run_pipeline(args):
 
                 tfm_dir = (work_dir / 'FiberClustering' / 'TransformedClusters' / case_id) \
                     if keep >= 2 else (scratch_dir / 'TransformedClusters')
-                sep_dir = (work_dir / 'FiberClustering' / 'SeparatedClusters') \
+                sep_final_dir = (work_dir / 'FiberClustering' / 'SeparatedClusters') \
                     if keep >= 1 else (scratch_dir / 'SeparatedClusters')
+                sep_split_dir = (scratch_dir / 'SeparatedClustersPre') \
+                    if args.transform else sep_final_dir
                 tfm_dir.mkdir(parents=True, exist_ok=True)
-                sep_dir.mkdir(parents=True, exist_ok=True)
+                sep_split_dir.mkdir(parents=True, exist_ok=True)
+                sep_final_dir.mkdir(parents=True, exist_ok=True)
 
                 if args.reg_mode == 'nonrig':
                     tmp_nonrig = tfm_dir / 'tmp'
@@ -809,25 +850,28 @@ def run_pipeline(args):
                         inverse=True, no_xvfb=args.no_xvfb)
                     hardening_backend = _invoke_slicer_hardening(
                         tmp_nonrig, tfm_dir, rig_tfm_path, slicer_path, workers,
-                        inverse=True, split_output_dir=sep_dir, no_xvfb=args.no_xvfb)
+                        inverse=True, split_output_dir=sep_split_dir, no_xvfb=args.no_xvfb)
                 else:
                     hardening_backend = _invoke_slicer_hardening(
                         outrem_work, tfm_dir, rig_tfm_path, slicer_path, workers,
-                        inverse=True, split_output_dir=sep_dir, no_xvfb=args.no_xvfb)
+                        inverse=True, split_output_dir=sep_split_dir, no_xvfb=args.no_xvfb)
 
                 if args.transform:
-                    inv_pre_root = scratch_dir / 'InvTransformedTracts'
                     for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
-                        dst_folder = inv_pre_root / folder
+                        dst_folder = sep_final_dir / folder
                         dst_folder.mkdir(parents=True, exist_ok=True)
                         _invoke_slicer_hardening(
-                            sep_dir / folder, dst_folder, pre_tfm_path, slicer_path, workers,
+                            sep_split_dir / folder, dst_folder, pre_tfm_path, slicer_path, workers,
                             inverse=True, no_xvfb=args.no_xvfb)
-                    sep_dir = inv_pre_root
+                        (dst_folder / 'transform_complete.log').unlink(missing_ok=True)
+
+                if keep >= 1:
+                    (sep_final_dir / 'hemisphere_separation_complete.log').write_text(
+                        f'Hemisphere separation completed for {number_of_clusters} clusters.\n')
 
                 for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
                     for name in atlas_cluster_names:
-                        separated_map[folder][name] = wma.io.read_polydata(str(sep_dir / folder / name))
+                        separated_map[folder][name] = wma.io.read_polydata(str(sep_final_dir / folder / name))
 
             timings['hardening_and_separation'] = time.perf_counter() - t0
 

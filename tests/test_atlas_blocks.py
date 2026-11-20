@@ -1,4 +1,8 @@
 """Streamed atlas similarities and embeddings against the previous full matrix."""
+import importlib
+import os
+import subprocess
+import sys
 import types
 import unittest
 from unittest.mock import patch
@@ -249,3 +253,136 @@ class AtlasBlocksCpuTests(unittest.TestCase):
                     iter(mock_blocks), atlas, 15, gpu_float32=True)
             np.testing.assert_allclose(mock_actual[0], ref[0], rtol=1e-5, atol=1e-5)
             np.testing.assert_array_equal(mock_actual[1], ref[1])
+
+    def test_torch_absent_imports_all_modules_and_runs_spectral(self):
+        script = """
+import importlib, pkgutil, sys
+import numpy as np
+import vtk
+from vtk.util.numpy_support import numpy_to_vtk
+
+sys.modules['torch'] = None
+import whitematteranalysis as wma
+
+mods = [m.name for m in pkgutil.walk_packages(wma.__path__, 'whitematteranalysis.')]
+assert len(mods) >= 33, f'Unexpected module count: {len(mods)}'
+for mod in sorted(mods):
+    importlib.import_module(mod)
+
+assert wma.gpu.linalg.torch is None
+evals, _ = wma.gpu.linalg.eigh(np.diag([2.0, 3.0]))
+np.testing.assert_allclose(evals, [2.0, 3.0])
+
+rng = np.random.RandomState(7)
+n_fibers = 110
+pts = vtk.vtkPoints()
+lines = vtk.vtkCellArray()
+all_coords = []
+for i in range(n_fibers):
+    cx = -30.0 if i < 55 else 30.0
+    ys = np.linspace(-20.0, 20.0, 7)
+    coords = np.column_stack([np.full(7, cx), ys, np.zeros(7)]) + rng.normal(scale=0.3, size=(1, 3))
+    start = len(all_coords)
+    all_coords.extend(coords)
+    ids = vtk.vtkIdList()
+    for pid in range(start, start + 7):
+        ids.InsertNextId(pid)
+    lines.InsertNextCell(ids)
+pts.SetData(numpy_to_vtk(np.asarray(all_coords, dtype=np.float64), deep=True))
+pd = vtk.vtkPolyData()
+pd.SetPoints(pts)
+pd.SetLines(lines)
+
+mask = np.ones(n_fibers, dtype=bool)
+mask[102:] = False
+out_pd, cidx, _, _, _, atlas, _ = wma.cluster.spectral(
+    pd, number_of_clusters=2, number_of_eigenvectors=3, sigma=30.0,
+    threshold=0.0, number_of_jobs=1, use_nystrom=True, nystrom_mask=mask,
+    distance_method='Mean', outlier_std_threshold=np.inf, bilateral=False, use_gpu=False)
+assert out_pd.GetNumberOfLines() == n_fibers
+assert len(cidx) == n_fibers
+assert atlas.centroids.shape == (2, 3)
+"""
+        proc = subprocess.run(
+            [sys.executable, '-c', script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
+        with patch.object(linalg, 'torch', None):
+            evals, evecs = linalg.eigh(np.diag([4.0, 1.0]))
+            np.testing.assert_allclose(evals, [1.0, 4.0])
+            with self.assertRaisesRegex(RuntimeError, 'torch is not available'):
+                linalg.nystrom_row_sum_2(np.ones((2, 2)), np.ones(2))
+            with self.assertRaisesRegex(RuntimeError, 'torch is not available'):
+                linalg.nystrom_embed_B(np.ones((2, 2)), evecs, evals)
+
+    def test_mps_float32_nystrom_and_eigh_avoid_float64(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+        gpu_config = importlib.import_module('whitematteranalysis.gpu.config')
+
+        saved = {
+            'requested': gpu_config.config.requested,
+            'float32': gpu_config.config.float32,
+            'allow_mps': gpu_config.config.allow_mps,
+        }
+        rng = np.random.RandomState(123)
+        B = rng.uniform(0.1, 1.0, (8, 5))
+        rm = rng.uniform(0.0, 0.2, 8)
+        A = rng.normal(size=(8, 8))
+        A = 0.5 * (A + A.T)
+        ref_evals, ref_evecs = np.linalg.eigh(A)
+        ref_row_sum = B.sum(0) + rm @ B
+        ref_V2 = (B.T @ ref_evecs) * np.divide(1.0, ref_evals)[None, :]
+
+        mps_dev = torch.device('mps')
+        has_real_mps = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+        orig_as_tensor = torch.as_tensor
+
+        def guard_as_tensor(data, *args, **kwargs):
+            if kwargs.get('dtype') == torch.float64:
+                raise AssertionError('torch.as_tensor(float64) requested on MPS/float32')
+            if not has_real_mps and kwargs.get('device') == mps_dev:
+                kwargs = {**kwargs, 'device': torch.device('cpu')}
+            return orig_as_tensor(data, *args, **kwargs)
+
+        try:
+            with patch.dict(os.environ, {
+                'WMA_GPU': 'auto',
+                'WMA_GPU_MPS': '1',
+                'WMA_GPU_FLOAT32': '1',
+                'WMA_GPU_EIGH': '1',
+            }):
+                gpu_config._from_env()
+            with patch.object(gpu_config.config, 'cuda_available', return_value=False), \
+                    patch.object(gpu_config.config, 'mps_available', return_value=True), \
+                    patch.object(torch, 'as_tensor', side_effect=guard_as_tensor), \
+                    patch.object(torch.linalg, 'eigh',
+                                 side_effect=AssertionError('torch.linalg.eigh must not run on MPS')):
+                self.assertTrue(gpu_config.use_gpu())
+                self.assertEqual(gpu_config.get_device(), mps_dev)
+                rs = linalg.nystrom_row_sum_2(B, rm)
+                V2 = linalg.nystrom_embed_B(B, ref_evecs, ref_evals)
+                evals, evecs = linalg.eigh(A)
+            np.testing.assert_allclose(rs, ref_row_sum, rtol=1e-4, atol=1e-4)
+            np.testing.assert_allclose(V2, ref_V2, rtol=1e-4, atol=1e-4)
+            np.testing.assert_array_equal(evals, ref_evals)
+            np.testing.assert_array_equal(evecs, ref_evecs)
+
+            # Even if cuda_available is mocked True, dev.type == 'mps' must fall back to numpy.linalg.eigh
+            with patch.object(gpu_config.config, 'cuda_available', return_value=True), \
+                    patch.object(linalg, 'get_device', return_value=mps_dev), \
+                    patch.object(torch, 'as_tensor', side_effect=guard_as_tensor), \
+                    patch.object(torch.linalg, 'eigh',
+                                 side_effect=AssertionError('torch.linalg.eigh must not run on MPS')):
+                evals2, evecs2 = linalg.eigh(A)
+            np.testing.assert_array_equal(evals2, ref_evals)
+            np.testing.assert_array_equal(evecs2, ref_evecs)
+        finally:
+            for k, v in saved.items():
+                setattr(gpu_config.config, k, v)

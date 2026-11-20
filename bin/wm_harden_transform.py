@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from joblib import Parallel, delayed, effective_n_jobs
+import numpy
 import vtk
 
 _repo_root = Path(__file__).resolve().parents[1]
@@ -154,6 +155,26 @@ def _load_linear_matrices(transform_paths, inverse, allow_fallback):
     return matrix_cache
 
 
+def _is_lps_polydata(polydata):
+    """Return True if polydata FieldData SPACE explicitly declares LPS coordinates."""
+    if polydata is None:
+        return False
+    field_data = polydata.GetFieldData()
+    if field_data is None:
+        return False
+    arr = field_data.GetAbstractArray('SPACE')
+    if arr is None or not hasattr(arr, 'GetValue') or arr.GetNumberOfValues() == 0:
+        return False
+    return str(arr.GetValue(0)).strip().upper() == 'LPS'
+
+
+def _set_ras_space_field(polydata):
+    space = vtk.vtkStringArray()
+    space.SetName('SPACE')
+    space.InsertNextValue('RAS')
+    polydata.GetFieldData().AddArray(space)
+
+
 def _run_pure_python(inputs, transform_paths, matrix_cache, outdir, workers,
                      split_output_dir=None, allow_fallback=False):
     cached_polydatas = {}
@@ -194,19 +215,20 @@ def _run_pure_python(inputs, transform_paths, matrix_cache, outdir, workers,
                 raise RuntimeError(
                     'Pure-Python hardening cannot rotate tensor/vector/normal arrays; '
                     'use 3D Slicer with SlicerDMRI: ' + str(pd_path))
-            if pd.GetNumberOfCells() == 0:
+            is_lps = _is_lps_polydata(pd)
+            if pd.GetNumberOfCells() == 0 and not is_lps:
                 if os.path.splitext(str(out_name))[1] == os.path.splitext(str(pd_path))[1]:
                     shutil.copyfile(str(pd_path), str(out_name))
                 else:
                     wma.io.write_polydata(pd, str(out_name))
                 hardened = pd
             else:
-                hardened = wma.transform.apply_affine_to_polydata(pd, matrix_cache[str(tf_path)])
-                if out_name.suffix == '.vtp':
-                    space = vtk.vtkStringArray()
-                    space.SetName('SPACE')
-                    space.InsertNextValue('RAS')
-                    hardened.GetFieldData().AddArray(space)
+                mat = matrix_cache[str(tf_path)]
+                if is_lps:
+                    mat = mat @ numpy.diag([-1.0, -1.0, 1.0, 1.0])
+                hardened = wma.transform.apply_affine_to_polydata(pd, mat)
+                if out_name.suffix.lower() == '.vtp' or is_lps:
+                    _set_ras_space_field(hardened)
                 wma.io.write_polydata(hardened, str(out_name))
             if split_output_dir is not None:
                 _split_hardened_polydata(hardened, out_name, split_output_dir)
