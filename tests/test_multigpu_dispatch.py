@@ -237,6 +237,7 @@ class MultiGpuDispatchTests(unittest.TestCase):
         saved_cfg = {name: getattr(wma.gpu.config, name)
                      for name in ('requested', 'float32', 'devices', 'allow_mps')}
         self.addCleanup(lambda: [setattr(wma.gpu.config, k, v) for k, v in saved_cfg.items()])
+        wma.gpu.config.requested = None
 
         for mode in ('Affine', 'Rigid', 'Nonrigid'):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmpdir:
@@ -348,6 +349,7 @@ class MultiGpuDispatchTests(unittest.TestCase):
         saved_cfg = {name: getattr(wma.gpu.config, name)
                      for name in ('requested', 'float32', 'devices', 'allow_mps')}
         self.addCleanup(lambda: [setattr(wma.gpu.config, k, v) for k, v in saved_cfg.items()])
+        wma.gpu.config.requested = None
 
         for mode, n_gpus in (('Affine', 2), ('Nonrigid', 2), ('Affine', 1)):
             with self.subTest(mode=mode, n_gpus=n_gpus), tempfile.TemporaryDirectory() as tmpdir:
@@ -448,6 +450,7 @@ class MultiGpuDispatchTests(unittest.TestCase):
         saved_cfg = {name: getattr(wma.gpu.config, name)
                      for name in ('requested', 'float32', 'devices', 'strict', 'allow_mps')}
         self.addCleanup(lambda: [setattr(wma.gpu.config, k, v) for k, v in saved_cfg.items()])
+        wma.gpu.config.requested = None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             reg = congeal_multisubject.MultiSubjectRegistration()

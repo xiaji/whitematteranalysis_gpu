@@ -90,8 +90,8 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
         # subject data that must be input
         #self.fixed = None
         #self.moving = None
-        #self.initial_step = 5
-        #self.final_step = 2
+        self.initial_step = 5
+        self.final_step = 2
 
         # set up default grid
         #self.nonrigid_grid_resolution = 3

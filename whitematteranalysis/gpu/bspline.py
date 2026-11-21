@@ -55,6 +55,48 @@ if registration_kernel.triton is not None:
     import triton.language as tl
 
     @triton.jit
+    def _accum_x(Coefficients, row_base,
+                 ix0, ix1, ix2, ix3,
+                 wx0, wx1, wx2, wx3,
+                 mask):
+        DTYPE = Coefficients.dtype.element_ty
+        c0 = (row_base + ix0) * 3
+        c1 = (row_base + ix1) * 3
+        c2 = (row_base + ix2) * 3
+        c3 = (row_base + ix3) * 3
+        vx = (tl.load(Coefficients + c0 + 0, mask, other=0.).to(DTYPE) * wx0
+              + tl.load(Coefficients + c1 + 0, mask, other=0.).to(DTYPE) * wx1
+              + tl.load(Coefficients + c2 + 0, mask, other=0.).to(DTYPE) * wx2
+              + tl.load(Coefficients + c3 + 0, mask, other=0.).to(DTYPE) * wx3)
+        vy = (tl.load(Coefficients + c0 + 1, mask, other=0.).to(DTYPE) * wx0
+              + tl.load(Coefficients + c1 + 1, mask, other=0.).to(DTYPE) * wx1
+              + tl.load(Coefficients + c2 + 1, mask, other=0.).to(DTYPE) * wx2
+              + tl.load(Coefficients + c3 + 1, mask, other=0.).to(DTYPE) * wx3)
+        vz = (tl.load(Coefficients + c0 + 2, mask, other=0.).to(DTYPE) * wx0
+              + tl.load(Coefficients + c1 + 2, mask, other=0.).to(DTYPE) * wx1
+              + tl.load(Coefficients + c2 + 2, mask, other=0.).to(DTYPE) * wx2
+              + tl.load(Coefficients + c3 + 2, mask, other=0.).to(DTYPE) * wx3)
+        return vx, vy, vz
+
+    @triton.jit
+    def _accum_xy(Coefficients, iz, wz, RES: tl.constexpr,
+                  iy0, iy1, iy2, iy3, wy0, wy1, wy2, wy3,
+                  ix0, ix1, ix2, ix3, wx0, wx1, wx2, wx3,
+                  mask):
+        vx0, vy0, vz0 = _accum_x(Coefficients, (iz * RES + iy0) * RES,
+                                 ix0, ix1, ix2, ix3, wx0, wx1, wx2, wx3, mask)
+        vx1, vy1, vz1 = _accum_x(Coefficients, (iz * RES + iy1) * RES,
+                                 ix0, ix1, ix2, ix3, wx0, wx1, wx2, wx3, mask)
+        vx2, vy2, vz2 = _accum_x(Coefficients, (iz * RES + iy2) * RES,
+                                 ix0, ix1, ix2, ix3, wx0, wx1, wx2, wx3, mask)
+        vx3, vy3, vz3 = _accum_x(Coefficients, (iz * RES + iy3) * RES,
+                                 ix0, ix1, ix2, ix3, wx0, wx1, wx2, wx3, mask)
+        vzx = vx0 * wy0 + vx1 * wy1 + vx2 * wy2 + vx3 * wy3
+        vzy = vy0 * wy0 + vy1 * wy1 + vy2 * wy2 + vy3 * wy3
+        vzz = vz0 * wy0 + vz1 * wy1 + vz2 * wy2 + vz3 * wy3
+        return vzx * wz, vzy * wz, vzz * wz
+
+    @triton.jit
     def _transform(Points, Indices, Weights, Invalid, Coefficients, Output,
                    N_POINTS, RES: tl.constexpr, BLOCK: tl.constexpr):
         point = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -89,32 +131,21 @@ if registration_kernel.triton is not None:
         wz2 = tl.load(Weights + idx_base + 10, mask, other=0.).to(DTYPE)
         wz3 = tl.load(Weights + idx_base + 11, mask, other=0.).to(DTYPE)
 
-        dx = tl.full((BLOCK,), 0., DTYPE)
-        dy = tl.full((BLOCK,), 0., DTYPE)
-        dz = tl.full((BLOCK,), 0., DTYPE)
-        for iz, wz in ((iz0, wz0), (iz1, wz1), (iz2, wz2), (iz3, wz3)):
-            vzx = tl.full((BLOCK,), 0., DTYPE)
-            vzy = tl.full((BLOCK,), 0., DTYPE)
-            vzz = tl.full((BLOCK,), 0., DTYPE)
-            for iy, wy in ((iy0, wy0), (iy1, wy1), (iy2, wy2), (iy3, wy3)):
-                vyx = tl.full((BLOCK,), 0., DTYPE)
-                vyy = tl.full((BLOCK,), 0., DTYPE)
-                vyz = tl.full((BLOCK,), 0., DTYPE)
-                row_base = (iz * RES + iy) * RES
-                for ix, wx in ((ix0, wx0), (ix1, wx1), (ix2, wx2), (ix3, wx3)):
-                    c_idx = (row_base + ix) * 3
-                    cx = tl.load(Coefficients + c_idx + 0, mask, other=0.).to(DTYPE)
-                    cy = tl.load(Coefficients + c_idx + 1, mask, other=0.).to(DTYPE)
-                    cz = tl.load(Coefficients + c_idx + 2, mask, other=0.).to(DTYPE)
-                    vyx += cx * wx
-                    vyy += cy * wx
-                    vyz += cz * wx
-                vzx += vyx * wy
-                vzy += vyy * wy
-                vzz += vyz * wy
-            dx += vzx * wz
-            dy += vzy * wz
-            dz += vzz * wz
+        dx0, dy0, dz0 = _accum_xy(Coefficients, iz0, wz0, RES,
+                                  iy0, iy1, iy2, iy3, wy0, wy1, wy2, wy3,
+                                  ix0, ix1, ix2, ix3, wx0, wx1, wx2, wx3, mask)
+        dx1, dy1, dz1 = _accum_xy(Coefficients, iz1, wz1, RES,
+                                  iy0, iy1, iy2, iy3, wy0, wy1, wy2, wy3,
+                                  ix0, ix1, ix2, ix3, wx0, wx1, wx2, wx3, mask)
+        dx2, dy2, dz2 = _accum_xy(Coefficients, iz2, wz2, RES,
+                                  iy0, iy1, iy2, iy3, wy0, wy1, wy2, wy3,
+                                  ix0, ix1, ix2, ix3, wx0, wx1, wx2, wx3, mask)
+        dx3, dy3, dz3 = _accum_xy(Coefficients, iz3, wz3, RES,
+                                  iy0, iy1, iy2, iy3, wy0, wy1, wy2, wy3,
+                                  ix0, ix1, ix2, ix3, wx0, wx1, wx2, wx3, mask)
+        dx = dx0 + dx1 + dx2 + dx3
+        dy = dy0 + dy1 + dy2 + dy3
+        dz = dz0 + dz1 + dz2 + dz3
 
         p_base = point * 3
         zero = tl.full((BLOCK,), 0., DTYPE)

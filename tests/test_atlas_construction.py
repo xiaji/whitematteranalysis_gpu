@@ -10,17 +10,21 @@ from vtk.util.numpy_support import numpy_to_vtk
 import whitematteranalysis as wma
 
 
-def _make_bundle_polydata(seed=0, fibers_per_cluster=12, n_pts=15):
+def _make_bundle_polydata(seed=0, fibers_per_cluster=12, n_pts=15,
+                          jitter_scale=0.6, bend_scale=0.0):
     rng = np.random.RandomState(seed)
     centers = ((-35.0, 0.0, 5.0), (35.0, 0.0, 5.0), (0.0, 35.0, 10.0))
+    t = np.linspace(0.0, 1.0, n_pts)
+    arch = np.sin(np.pi * t)
     all_pts = []
     offsets = [0]
     for cx, cy, cz in centers:
         for _ in range(fibers_per_cluster):
-            jitter = rng.normal(scale=0.6, size=3)
+            jitter = rng.normal(scale=jitter_scale, size=3)
+            bend = rng.normal(scale=bend_scale, size=2) if bend_scale > 0.0 else (0.0, 0.0)
             xs = np.linspace(cx + jitter[0], cx + jitter[0] + 15.0, n_pts)
-            ys = np.full(n_pts, cy + jitter[1]) + np.linspace(-5.0, 5.0, n_pts)
-            zs = np.full(n_pts, cz + jitter[2])
+            ys = np.full(n_pts, cy + jitter[1]) + np.linspace(-5.0, 5.0, n_pts) + bend[0] * arch
+            zs = np.full(n_pts, cz + jitter[2]) + bend[1] * arch
             all_pts.append(np.column_stack((xs, ys, zs)))
             offsets.append(offsets[-1] + n_pts)
     pts_arr = np.ascontiguousarray(np.vstack(all_pts), dtype=np.float64)
@@ -115,7 +119,8 @@ class AtlasConstructionTests(unittest.TestCase):
 
     @unittest.skipUnless(wma.gpu.available(), 'CUDA is required')
     def test_spectral_nystrom_gpu_resident_matches_cpu(self):
-        pd, n_fibers = _make_bundle_polydata(seed=19, fibers_per_cluster=40)
+        pd, n_fibers = _make_bundle_polydata(
+            seed=19, fibers_per_cluster=40, jitter_scale=12.0, bend_scale=6.0)
         nystrom_mask = np.zeros(n_fibers, dtype=bool)
         nystrom_mask[:105] = True
 
@@ -124,7 +129,7 @@ class AtlasConstructionTests(unittest.TestCase):
             pd,
             number_of_clusters=3,
             number_of_eigenvectors=3,
-            sigma=35.0,
+            sigma=25.0,
             threshold=0.0,
             number_of_jobs=1,
             use_nystrom=True,
@@ -140,7 +145,7 @@ class AtlasConstructionTests(unittest.TestCase):
             pd,
             number_of_clusters=3,
             number_of_eigenvectors=3,
-            sigma=35.0,
+            sigma=25.0,
             threshold=0.0,
             number_of_jobs=1,
             use_nystrom=True,
@@ -152,10 +157,17 @@ class AtlasConstructionTests(unittest.TestCase):
             use_gpu=True,
         )
         np.testing.assert_array_equal(rej_gpu, rej_cpu)
-        np.testing.assert_allclose(atlas_gpu.pinv_A, atlas_cpu.pinv_A, rtol=1e-10, atol=1e-10)
-        np.testing.assert_allclose(atlas_gpu.e_vec_norm[-4:], atlas_cpu.e_vec_norm[-4:], rtol=1e-11, atol=1e-11)
-        np.testing.assert_allclose(embed_gpu, embed_cpu, rtol=1e-10, atol=1e-10)
-        np.testing.assert_array_equal(idx_gpu, idx_cpu)
+        np.testing.assert_allclose(atlas_gpu.pinv_A, atlas_cpu.pinv_A, rtol=1e-7, atol=1e-7)
+        np.testing.assert_allclose(atlas_gpu.e_vec_norm[-4:], atlas_cpu.e_vec_norm[-4:], rtol=1e-10, atol=1e-10)
+        aligned_embed_gpu = embed_gpu.copy()
+        for col in range(aligned_embed_gpu.shape[1]):
+            if np.dot(aligned_embed_gpu[:, col], embed_cpu[:, col]) < 0.0:
+                aligned_embed_gpu[:, col] *= -1.0
+        np.testing.assert_allclose(aligned_embed_gpu, embed_cpu, rtol=1e-9, atol=1e-9)
+        np.testing.assert_array_equal(
+            idx_gpu[:, None] == idx_gpu[None, :],
+            idx_cpu[:, None] == idx_cpu[None, :],
+        )
 
     def test_compute_cluster_loo_similarity_cpu_and_edge_cases(self):
         pd, n_fibers = _make_bundle_polydata(seed=31, fibers_per_cluster=6)

@@ -379,6 +379,11 @@ def _mock_slicer_hardening(in_dir, out_dir, tfm_path, slicer_path, jobs,
 
 
 class ORGPipelineCLITests(unittest.TestCase):
+    def setUp(self):
+        cfg_fields = ('requested', 'float32', 'strict', 'devices', 'allow_mps')
+        saved_cfg = {name: getattr(wma.gpu.config, name) for name in cfg_fields}
+        self.addCleanup(lambda: [setattr(wma.gpu.config, k, v) for k, v in saved_cfg.items()])
+
     def test_single_process_org_cli_end_to_end_and_short_fiber_exclusion(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

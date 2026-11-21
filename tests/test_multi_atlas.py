@@ -167,6 +167,9 @@ class MultiAtlasTests(unittest.TestCase):
                 wma.atlases.resolve_atlas(root, family='east-west', validate_mrml=False)
 
     def test_apply_org_cli_supports_east_west_and_naba(self):
+        cfg_fields = ('requested', 'float32', 'strict', 'devices', 'allow_mps')
+        saved_cfg = {name: getattr(wma.gpu.config, name) for name in cfg_fields}
+        self.addCleanup(lambda: [setattr(wma.gpu.config, k, v) for k, v in saved_cfg.items()])
         org_cli = _load_module('wm_apply_ORG_atlas_multi', ORG_CLI_PATH)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
