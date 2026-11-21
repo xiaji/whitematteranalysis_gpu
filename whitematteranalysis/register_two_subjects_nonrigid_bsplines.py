@@ -36,6 +36,11 @@ except ImportError:
 
 import whitematteranalysis as wma
 
+
+class _MaxFunReached(RuntimeError):
+    """Internal sentinel raised when maxfun objective evaluations are exhausted."""
+
+
 class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractography):
 
     def constraint(self, x_current):
@@ -119,8 +124,42 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
         # GPU inputs and B-spline sampling geometry live for one compute call.
         self.use_gpu = None
         self.gpu_device = None
+        self.gpu_float32 = None
+        self.analytic_grad = None
         self._gpu_objective = None
+        self._analytic_objective = None
         self._cpu_executor = None
+
+    def _use_analytic_grad(self):
+        enabled = (
+            bool(self.analytic_grad)
+            if self.analytic_grad is not None
+            else os.environ.get('WMA_NONRIGID_ANALYTIC_GRAD', '0').strip().lower() in (
+                '1', 'true', 'yes', 'on')
+        )
+        if not enabled:
+            return False
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def _record_objective(self, scaled_current_x, obj, current_x):
+        if obj < self.minimum_objective:
+            self.minimum_objective = obj
+            self.final_transform[:] = scaled_current_x
+
+        self.objective_function_values.append(obj)
+
+        if self.optimizer == "BFGS":
+            self.constraint(current_x)
+
+        if self.verbose:
+            print("O:", obj, "X:", scaled_current_x)
+
+        if self.objective_computations > self.maxfun:
+            raise _MaxFunReached("The optimizer needs to stop.")
 
     def initialize_nonrigid_grid(self):
         res = self.nonrigid_grid_resolution
@@ -133,17 +172,15 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
         class: threshold, sigma. Compares sampled fibers from moving
         input, to all fibers of fixed input."""
         self.objective_computations += 1
-    
-        #scaled_current_x = current_x * 0.01
         scaled_current_x = current_x / self.scaling
-        
+
         if self._gpu_objective is not None:
             obj = self._gpu_objective(scaled_current_x, self.sigma)
         elif self._using_gpu():
             from .gpu.bspline import NonrigidObjective
             objective = NonrigidObjective(
                 self.fixed, self.moving, self.nonrigid_grid_resolution,
-                device=self.gpu_device)
+                device=self.gpu_device, gpu_float32=self.gpu_float32)
             obj = objective(scaled_current_x, self.sigma)
         else:
             moving = self.transform_fiber_array_numpy(self.moving, scaled_current_x)
@@ -153,29 +190,27 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
             else:
                 obj = wma.register_two_subjects.inner_loop_objective(self.fixed, moving, self.sigma * self.sigma)
 
-        # keep track of minimum objective so far and its matching transform
-        if obj < self.minimum_objective:
-            #print "OBJECTIVE:", obj, "PREV MIN",  self.minimum_objective
-            self.minimum_objective = obj
-            # must copy current_x into allocated memory space to keep the value
-            self.final_transform[:] = scaled_current_x
-
-        # save objective function value for analysis of performance
-        self.objective_function_values.append(obj)
-
-        # temporary for testing
-        if self.optimizer == "BFGS":
-            self.constraint(current_x)
-
-        if self.verbose:
-            print("O:",  obj, "X:", scaled_current_x)
-        #print "X:", self._x_opt
-
-        # Stop the optimizer if needed
-        if self.objective_computations > self.maxfun:
-            raise RuntimeError("The optimizer needs to stop.")
-
+        self._record_objective(scaled_current_x, obj, current_x)
         return obj
+
+    def objective_and_gradient(self, current_x):
+        """Return (objective, dL/d(current_x)) for L-BFGS-B with analytic_grad=True."""
+        self.objective_computations += 1
+        scaled_current_x = current_x / self.scaling
+
+        target = self._gpu_objective if self._gpu_objective is not None else self._analytic_objective
+        if target is None:
+            from .gpu.bspline import NonrigidObjective
+            dev = self.gpu_device if self._using_gpu() else 'cpu'
+            f32 = self.gpu_float32 if self._using_gpu() else False
+            target = NonrigidObjective(
+                self.fixed, self.moving, self.nonrigid_grid_resolution,
+                device=dev, gpu_float32=f32)
+        obj, grad = target.value_and_gradient(scaled_current_x, self.sigma)
+        grad = numpy.asarray(grad, dtype=numpy.float64) / self.scaling
+
+        self._record_objective(scaled_current_x, obj, current_x)
+        return obj, grad
 
     def transform_fiber_array_numpy(self, in_array, transform):
         from .gpu.bspline import transform_fiber_array_numpy
@@ -234,11 +269,17 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
         # initialize time for objective function computations
         self.last_time = time.time()
 
+        analytic = (self.optimizer == "BFGS" and self._use_analytic_grad())
         if self._using_gpu():
             from .gpu.bspline import NonrigidObjective
             self._gpu_objective = NonrigidObjective(
                 self.fixed, self.moving, self.nonrigid_grid_resolution,
-                device=self.gpu_device)
+                device=self.gpu_device, gpu_float32=self.gpu_float32)
+        elif analytic:
+            from .gpu.bspline import NonrigidObjective
+            self._analytic_objective = NonrigidObjective(
+                self.fixed, self.moving, self.nonrigid_grid_resolution,
+                device='cpu', gpu_float32=False)
         elif self._using_cpu_fast() and wma.gpu.cpu_backend.cpu_threads() > 1:
             from concurrent.futures import ThreadPoolExecutor
             self._cpu_executor = ThreadPoolExecutor(
@@ -256,42 +297,28 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
                                                       maxfun=self.maxfun, rhobeg=self.initial_step * self.scaling,
                                                       rhoend=self.final_step * self.scaling, disp=1)
             elif self.optimizer == "BFGS":
-                # Test optimization with BFGS
-                # (Broyden-Fletcher-Goldfarb-Shanno algorithm) refines at each
-                # step an approximation of the Hessian.  L-BFGS:
-                # Limited-memory BFGS Sits between BFGS and conjugate
-                # gradient: in very high dimensions (> 250) the Hessian matrix
-                # is too costly to compute and invert. L-BFGS keeps a low-rank
-                # version. In addition, the scipy version,
-                # scipy.optimize.fmin_l_bfgs_b(), includes box bounds.
-                # Note If you do not specify the gradient to the L-BFGS
-                # solver, you need to add approx_grad=1
-                # list of (min,max) pairs for the values being optimized. Assume we never should move by >30mm
-                #bounds = list()
-                #for lm in self.target_landmarks:
-                #    bounds.append((lm-30,lm+30))
-                ## (self.final_transform, f, dict) = scipy.optimize.fmin_l_bfgs_b(self.objective_function,
-                ##                                                                self.initial_transform,
-                ##                                                                approx_grad = True,
-                ##                                                                maxfun=self.maxfun,
-                ##                                                                maxiter=self.maxfun,
-                ##                                                                factr=1e12,
-                ##                                                                epsilon=self.final_step,
-                ##                                                                iprint=0,
-                ##                                                                bounds=bounds)
-                #maxiter=1,
                 try:
-                    (not_used, f, dict) = scipy.optimize.fmin_l_bfgs_b(self.objective_function,
-                                                                               self.initial_transform * self.scaling,
-                                                                               approx_grad = True,
-                                                                               maxfun=self.maxfun,
-                                                                               maxiter=2,
-                                                                               factr=1e12,
-                                                                               epsilon=self.final_step * self.scaling,
-                                                                               iprint=1)
-                except:
+                    if analytic:
+                        (not_used, f, dict) = scipy.optimize.fmin_l_bfgs_b(
+                            self.objective_and_gradient,
+                            self.initial_transform * self.scaling,
+                            approx_grad=False,
+                            maxfun=self.maxfun,
+                            maxiter=2,
+                            factr=1e12,
+                            iprint=1)
+                    else:
+                        (not_used, f, dict) = scipy.optimize.fmin_l_bfgs_b(
+                            self.objective_function,
+                            self.initial_transform * self.scaling,
+                            approx_grad=True,
+                            maxfun=self.maxfun,
+                            maxiter=2,
+                            factr=1e12,
+                            epsilon=self.final_step * self.scaling,
+                            iprint=1)
+                except _MaxFunReached:
                     print("EXCEPTION WAS CAUGHT, total objectives:", self.objective_computations)
-                #print f, dict
 
             elif self.optimizer == "Powell":
                 # Test optimization with Powell's method
@@ -311,6 +338,7 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
                 print("Unknown optimizer.")
         finally:
             self._gpu_objective = None
+            self._analytic_objective = None
             if self._cpu_executor is not None:
                 self._cpu_executor.shutdown(wait=True)
                 self._cpu_executor = None

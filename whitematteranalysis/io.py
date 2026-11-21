@@ -622,82 +622,55 @@ def write_transforms_to_itk_format(transform_list, outdir, subject_ids=None):
 
             origin = -grid_spacing * (numpy.array(extent_1) - numpy.array(extent_0))/2.0
 
-            grid_points_LPS = list()
-            grid_points_RAS = list()
+            coords_s = numpy.arange(extent_0[0], extent_1[0] + 1, dtype=numpy.float64) * grid_spacing
+            coords_p = numpy.arange(extent_0[1], extent_1[1] + 1, dtype=numpy.float64) * grid_spacing
+            coords_l = numpy.arange(extent_0[2], extent_1[2] + 1, dtype=numpy.float64) * grid_spacing
+            ss, pp, ll = numpy.meshgrid(coords_s, coords_p, coords_l, indexing='ij')
+            grid_lps = numpy.ascontiguousarray(
+                numpy.stack((ll, pp, ss), axis=-1).reshape(-1, 3), dtype=numpy.float64)
 
-            # ordering of grid points must match itk-style array order for images
-            for s in range(extent_0[0], extent_1[0]+1):
-                for p in range(extent_0[1], extent_1[1]+1):
-                    for l in range(extent_0[2], extent_1[2]+1):
-                        grid_points_RAS.append([-l*grid_spacing, -p*grid_spacing, s*grid_spacing])
-                        grid_points_LPS.append([l*grid_spacing, p*grid_spacing, s*grid_spacing])
+            print("LPS grid for storing transform:", grid_lps[0].tolist(), grid_lps[-1].tolist(), grid_spacing)
 
-            displacements_LPS = list()
-
-            print("LPS grid for storing transform:", grid_points_LPS[0], grid_points_LPS[-1], grid_spacing)
-
+            from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
             lps_points = vtk.vtkPoints()
+            lps_points.SetData(numpy_to_vtk(grid_lps, deep=True))
             lps_points2 = vtk.vtkPoints()
-            for gp_lps in grid_points_LPS:
-                lps_points.InsertNextPoint(gp_lps[0], gp_lps[1], gp_lps[2])
+            lps_points2.SetDataTypeToDouble()
 
             spline_inverse_lps.TransformPoints(lps_points, lps_points2)
-            pidx = 0
-            for gp_lps in grid_points_LPS:
-                pt = lps_points2.GetPoint(pidx)
-                diff_lps = [pt[0] - gp_lps[0], pt[1] - gp_lps[1], pt[2] - gp_lps[2]]
-                pidx += 1
-
-                ## # this tested grid definition and origin were okay.
-                ## diff_lps = [20,30,40]
-
-                ## # this tested that the ordering of L,P,S is correct:
-                ## diff_lps = [0, gp_lps[1], 0]
-                ## diff_lps = [gp_lps[0], 0, 0]
-                ## diff_lps = [0, 0, gp_lps[2]]
-
-                ## # this tested that the ordering of grid points is correct
-                ## # only the R>0, A>0, S<0 region shows a transform.
-                ## if gp_lps[0] < 0 and gp_lps[1] < 0 and gp_lps[2] < 0:
-                ##     diff_lps = [gp_lps[0]/2.0, 0, 0]
-                ## else:
-                ##     diff_lps = [0, 0, 0]
-
-                displacements_LPS.append(diff_lps)
+            diff_lps = vtk_to_numpy(lps_points2.GetData()).astype(numpy.float64, copy=False) - grid_lps
 
             # save the points and displacement vectors in ITK format.
             #print 'Saving in ITK transform format.'
-            f = open(fname, 'w')
-            f.write('#Insight Transform File V1.0\n')
-            f.write('# Transform 0\n')
-            # ITK version 3 that included an additive (!) affine transform
-            #f.write('Transform: BSplineDeformableTransform_double_3_3\n')
-            # ITK version 4 that does not include a second transform in the file
-            f.write('Transform: BSplineTransform_double_3_3\n')
-            f.write('Parameters: ')
-            # "Here the data are: The bulk of the BSpline part are 3D
-            # displacement vectors for each of the BSpline grid-nodes
-            # in physical space, i.e. for each grid-node, there will
-            # be three blocks of displacements defining dx,dy,dz for
-            # all grid nodes."
-            for block in [0, 1, 2]:
-                for diff in displacements_LPS:
-                    f.write(f'{diff[block]} ')
+            with open(fname, 'w') as f:
+                f.write('#Insight Transform File V1.0\n')
+                f.write('# Transform 0\n')
+                # ITK version 4 that does not include a second transform in the file
+                f.write('Transform: BSplineTransform_double_3_3\n')
+                f.write('Parameters: ')
+                # "Here the data are: The bulk of the BSpline part are 3D
+                # displacement vectors for each of the BSpline grid-nodes
+                # in physical space, i.e. for each grid-node, there will
+                # be three blocks of displacements defining dx,dy,dz for
+                # all grid nodes."
+                chunk = 65536
+                for block in (0, 1, 2):
+                    col = diff_lps[:, block]
+                    for start in range(0, len(col), chunk):
+                        f.write(' '.join(map(str, col[start:start + chunk].tolist())))
+                        f.write(' ')
 
-            #FixedParameters: size size size origin origin origin origin spacing spacing spacing (then direction cosines: 1 0 0 0 1 0 0 0 1)
-            f.write('\nFixedParameters:')
-            #f.write(' {0} {0} {0}'.format(2*sz+1))
-            f.write(f' {grid_size[0]}')
-            f.write(f' {grid_size[1]}')
-            f.write(f' {grid_size[2]}')
+                #FixedParameters: size size size origin origin origin origin spacing spacing spacing (then direction cosines: 1 0 0 0 1 0 0 0 1)
+                f.write('\nFixedParameters:')
+                f.write(f' {grid_size[0]}')
+                f.write(f' {grid_size[1]}')
+                f.write(f' {grid_size[2]}')
 
-            f.write(f' {origin[0]}')
-            f.write(f' {origin[1]}')
-            f.write(f' {origin[2]}')
-            f.write(' {0} {0} {0}'.format(grid_spacing))
-            f.write(' 1 0 0 0 1 0 0 0 1\n')
-
-            f.close()
+                f.write(f' {origin[0]}')
+                f.write(f' {origin[1]}')
+                f.write(f' {origin[2]}')
+                f.write(' {0} {0} {0}'.format(grid_spacing))
+                f.write(' 1 0 0 0 1 0 0 0 1\n')
         else:
             tx_inverse = vtk.vtkTransform()
             tx_inverse.DeepCopy(tx)
