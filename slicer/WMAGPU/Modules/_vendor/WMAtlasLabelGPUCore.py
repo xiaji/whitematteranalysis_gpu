@@ -382,35 +382,10 @@ def build_atlas(subject_directory, output_directory,
             subjects_per_cluster = len(set(subject_ID_per_fiber))
 
             pd_c = wma.filter.mask(input_data, mask, verbose=False)
-            if use_gpu:
-                cluster_distances = wma.cluster._pairwise_distance_matrix(
-                    pd_c, 0.0, number_of_jobs=1, bilateral=bilateral,
-                    distance_method=distance_method, use_gpu=True)
-            elif cpu_fast:
-                cluster_distances = wma.gpu.cpu_backend.pairwise_distance_matrix(
-                    pd_c, 0.0, distance_method=distance_method,
-                    bilateral=bilateral)
-            else:
-                cluster_distances = wma.cluster._pairwise_distance_matrix(
-                    pd_c, 0.0, number_of_jobs=1, bilateral=bilateral,
-                    distance_method=distance_method)
-            if distance_method == 'StrictSimilarity':
-                cluster_similarity = cluster_distances
-            else:
-                cluster_similarity = wma.similarity.distance_to_similarity(
-                    cluster_distances, cluster_local_sigmasq)
-
-            # leave-one-out total similarity: only fibers from other
-            # subjects count (bin:541-552)
-            total_similarity = numpy.zeros(number_fibers_in_cluster)
-            for j, sidx in enumerate(subject_ID_per_fiber):
-                loo_mask = subject_ID_per_fiber != sidx
-                n_loo = int(numpy.sum(loo_mask))
-                if n_loo == 0:
-                    total_similarity[j] = numpy.nan
-                else:
-                    total_similarity[j] = numpy.sum(
-                        cluster_similarity[j, loo_mask]) / n_loo
+            total_similarity = wma.cluster.compute_cluster_loo_similarity(
+                pd_c, subject_ID_per_fiber, outlier_sigma,
+                distance_method=distance_method, bilateral=bilateral,
+                use_gpu=bool(use_gpu), return_distances=False)
 
             mean_sim = numpy.nanmean(total_similarity)
             cluster_std = numpy.nanstd(total_similarity)
@@ -427,11 +402,12 @@ def build_atlas(subject_directory, output_directory,
         # to the whole brain (bin:597-612)
         brain_mean_sim = numpy.mean(fiber_mean_sim)
         brain_std_sim = numpy.std(fiber_mean_sim)
-        for fidx in range(len(cluster_numbers_s)):
-            if fiber_mean_sim[fidx] < brain_mean_sim - cluster_outlier_std * brain_std_sim:
-                if cluster_numbers_s[fidx] >= 0:
-                    cluster_numbers_s[fidx] = -cluster_numbers_s[fidx] - 1
-                    reject_idx.append(fidx)
+        global_cutoff = brain_mean_sim - cluster_outlier_std * brain_std_sim
+        global_reject_idx = numpy.nonzero(
+            (cluster_numbers_s >= 0) & (fiber_mean_sim < global_cutoff))[0]
+        if global_reject_idx.size > 0:
+            cluster_numbers_s[global_reject_idx] = -cluster_numbers_s[global_reject_idx] - 1
+            reject_idx.extend(global_reject_idx.tolist())
 
         # keep only the retained fibers for the next iteration / output
         keep = cluster_numbers_s >= 0

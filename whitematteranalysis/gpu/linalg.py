@@ -107,6 +107,61 @@ def nystrom_embed_B(B, e_vec, e_val):
     return V2.cpu().numpy()
 
 
+def nystrom_normalize_and_embed_top(B, dhat_a, dhat_b, e_vec_top, e_val_top,
+                                    gpu_float32=None, device=None):
+    """Normalize B on GPU in column tiles and project only the top eigenvector columns.
+
+    Computes ``V2_top = ((dhat_a[:, None] * B * dhat_b[None, :]).T @ e_vec_top) / e_val_top``
+    without materializing a second full-sized normalized B matrix on the host or retaining B on GPU.
+    Returns ``(V2_top, norm_sq_top)`` as float64 NumPy arrays.
+    """
+    if torch is None:
+        raise RuntimeError("torch is not available, cannot use the GPU linalg backend.")
+
+    _memory.disable_tf32()
+    dev = _resolve_device(device)
+    target_dtype = _resolve_dtype(gpu_float32=gpu_float32)
+
+    m_rows, n_cols = B.shape
+    count = e_vec_top.shape[1]
+    e_sq_a = numpy.sum(numpy.multiply(e_vec_top, e_vec_top), axis=0, dtype=numpy.float64)
+    if n_cols == 0:
+        return numpy.zeros((0, count), dtype=numpy.float64), e_sq_a
+
+    dhat_a_g = _as_gpu(dhat_a, dev, target_dtype)
+    e_vec_g = _as_gpu(e_vec_top, dev, target_dtype)
+    recip_g = _as_gpu(numpy.divide(1.0, e_val_top), dev, target_dtype)
+
+    itemsize = 8 if target_dtype == torch.float64 else 4
+    bytes_per_col = max(1, (m_rows + count) * itemsize * 3)
+    free_bytes = _memory.effective_free_vram(dev)
+    tile_cols = max(1, min(n_cols, int(free_bytes * 0.4) // bytes_per_col, 16384))
+
+    V2_out = numpy.empty((n_cols, count), dtype=numpy.float64)
+    v2_sq_sum = numpy.zeros(count, dtype=numpy.float64)
+    s = 0
+    while s < n_cols:
+        e = min(s + tile_cols, n_cols)
+        try:
+            B_blk = _as_gpu(B[:, s:e], dev, target_dtype)
+            db_blk = _as_gpu(dhat_b[s:e], dev, target_dtype)
+            B_blk.mul_(dhat_a_g[:, None]).mul_(db_blk[None, :])
+            V2_blk = torch.matmul(B_blk.t(), e_vec_g) * recip_g[None, :]
+            V2_np = V2_blk.cpu().numpy().astype(numpy.float64, copy=False)
+            del B_blk, db_blk, V2_blk
+        except Exception as exc:
+            if not _memory.is_gpu_oom(exc) or (e - s) == 1:
+                raise
+            _memory.empty_cache(dev)
+            tile_cols = max(1, (e - s) // 2)
+            continue
+        V2_out[s:e] = V2_np
+        v2_sq_sum += numpy.sum(numpy.multiply(V2_np, V2_np), axis=0, dtype=numpy.float64)
+        s = e
+
+    return V2_out, e_sq_a + v2_sq_sum
+
+
 def atlas_label_embedding(B, atlas, gpu_float32=None, device=None):
     """GPU equivalent of cluster.spectral_atlas_label steps 2-5.
 

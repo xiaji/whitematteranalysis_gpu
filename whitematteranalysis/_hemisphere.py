@@ -8,15 +8,16 @@ from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 import whitematteranalysis as wma
 
 
-def load_location_policy(filename):
-    """Load the assessment table and apply the historical CPC overrides."""
+def load_location_policy(filename, apply_org_cpc_overrides=True):
+    """Load the assessment table and optionally apply ORG CPC overrides."""
     policy = numpy.atleast_1d(numpy.loadtxt(
         filename,
         dtype={'names': ('Cluster Index', 'Location Label'), 'formats': ('S17', 'S2')},
         delimiter="\t", skiprows=1))
-    for index in (145, 159, 557, 677, 770):
-        if index < len(policy):
-            policy[index][1] = b'h'
+    if apply_org_cpc_overrides:
+        for index in (145, 159, 557, 677, 770):
+            if index < len(policy):
+                policy[index][1] = b'h'
     return policy
 
 

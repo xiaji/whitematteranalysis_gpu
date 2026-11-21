@@ -96,7 +96,9 @@ def _build_arg_parser():
     parser.add_argument('-o', '--output', required=True,
                         help='Output root directory; subject outputs are published under <output>/<caseID>.')
     parser.add_argument('-a', '--atlas', required=True,
-                        help='ORG atlas root directory containing ORG-RegAtlas-100HCP and ORG-800FC-100HCP.')
+                        help='Atlas root directory (ORG, East-West, NABA, or parent atlas folder).')
+    parser.add_argument('--atlas-family', choices=('auto', 'org', 'east-west', 'naba'), default='auto',
+                        help='Atlas family layout: auto (default), org, east-west, or naba.')
     parser.add_argument('-s', '--slicer', default=None,
                         help='Path to 3D Slicer executable (optional for tensor-free rigid mode).')
     parser.add_argument('-r', '--reg-mode', choices=('rig', 'nonrig'), default='rig',
@@ -191,14 +193,17 @@ def _parse_mrml_clusters(mrml_path, valid_cluster_names):
     return members
 
 
-def _collect_tract_tasks(fc_atlas_dir, atlas_cluster_names, location_data):
+def _collect_tract_tasks(fc_atlas_dir, atlas_cluster_names, location_data,
+                         hemispheric_tracts=None, commissural_tracts=None):
     valid_names = set(atlas_cluster_names)
-    standard_hemi = [(t, fc_atlas_dir / f"{t}.mrml") for t in HEMISPHERIC_TRACTS]
-    standard_comm = [(t, fc_atlas_dir / f"{t}.mrml") for t in COMMISSURAL_TRACTS]
+    hemi_defs = hemispheric_tracts if hemispheric_tracts is not None else HEMISPHERIC_TRACTS
+    comm_defs = commissural_tracts if commissural_tracts is not None else COMMISSURAL_TRACTS
+    standard_hemi = [(t, fc_atlas_dir / f"{t}.mrml") for t in hemi_defs]
+    standard_comm = [(t, fc_atlas_dir / f"{t}.mrml") for t in comm_defs]
     all_standard_present = all(p.is_file() for _, p in standard_hemi + standard_comm)
     if len(atlas_cluster_names) >= 800 and not all_standard_present:
         missing = [str(p) for _, p in standard_hemi + standard_comm if not p.is_file()]
-        raise FileNotFoundError(f"Missing ORG atlas MRML files: {missing[:5]}")
+        raise FileNotFoundError(f"Missing atlas MRML files: {missing[:5]}")
 
     tasks = []
     seen_mrml = set()
@@ -527,33 +532,21 @@ def run_pipeline(args):
     if not input_path.is_file():
         raise FileNotFoundError(f"Input tractography file does not exist: {input_path}")
 
-    atlas_base = Path(args.atlas).resolve()
-    reg_atlas_dir = atlas_base / 'ORG-RegAtlas-100HCP'
-    fc_atlas_dir = atlas_base / 'ORG-800FC-100HCP'
-    if not reg_atlas_dir.is_dir() or not fc_atlas_dir.is_dir():
-        raise FileNotFoundError(
-            f"ORG atlas must contain ORG-RegAtlas-100HCP and ORG-800FC-100HCP under {atlas_base}")
-
-    reg_atlas_path = reg_atlas_dir / 'registration_atlas.vtk'
-    if not reg_atlas_path.is_file():
-        reg_atlas_path = reg_atlas_dir / 'registration_atlas.vtp'
-    if not reg_atlas_path.is_file():
-        raise FileNotFoundError(f"Registration atlas file not found in {reg_atlas_dir}")
-
-    atlas_cluster_paths = sorted(glob.glob(str(fc_atlas_dir / 'cluster_*.vtp')))
-    if not atlas_cluster_paths:
-        raise FileNotFoundError(f"No cluster_*.vtp files found in {fc_atlas_dir}")
-    atlas_cluster_names = [Path(p).name for p in atlas_cluster_paths]
-
-    location_file = fc_atlas_dir / 'cluster_hemisphere_location.txt'
-    if not location_file.is_file():
-        raise FileNotFoundError(f"Missing hemisphere location file: {location_file}")
-    location_data = load_location_policy(str(location_file))
-    if len(location_data) != len(atlas_cluster_names):
-        raise RuntimeError(
-            f"Cluster count ({len(atlas_cluster_names)}) does not match {location_file} ({len(location_data)})")
-
-    tract_tasks = _collect_tract_tasks(fc_atlas_dir, atlas_cluster_names, location_data)
+    resolved_atlas = wma.atlases.resolve_atlas(
+        args.atlas, family=getattr(args, 'atlas_family', 'auto'), validate_mrml=True)
+    atlas_base = resolved_atlas.base_dir
+    reg_atlas_path = resolved_atlas.reg_atlas_path
+    fc_atlas_dir = resolved_atlas.fc_dir
+    atlas_cluster_paths = list(resolved_atlas.cluster_paths)
+    atlas_cluster_names = list(resolved_atlas.cluster_names)
+    location_data = resolved_atlas.location_data
+    tract_tasks = _collect_tract_tasks(
+        fc_atlas_dir,
+        atlas_cluster_names,
+        location_data,
+        hemispheric_tracts=resolved_atlas.hemispheric_tracts,
+        commissural_tracts=resolved_atlas.commissural_tracts,
+    )
 
     wma.gpu.apply_gpu_arguments(args)
     workers = _effective_workers(args.jobs)
@@ -917,6 +910,7 @@ def run_pipeline(args):
                 'case_id': case_id,
                 'input_file': str(input_path),
                 'atlas_dir': str(atlas_base),
+                'atlas_family': resolved_atlas.family,
                 'reg_mode': args.reg_mode,
                 'fiber_length_mm': float(args.fiber_length),
                 'fiber_length_max_mm': float(args.fiber_length_max),

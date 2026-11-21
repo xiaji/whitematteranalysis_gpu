@@ -462,7 +462,7 @@ def main():
             print(f"<{os.path.basename(__file__)}> Output directory", outdir1, "does not exist, creating it.")
             os.makedirs(outdir1)    
         print(f'<{os.path.basename(__file__)}> Saving output files in directory:', outdir1)
-        wma.cluster.output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_fiber_list, input_polydatas, number_of_subjects, outdir1, cluster_numbers_s, color, embed, number_of_fibers_to_display, testing=testing, verbose=False, render_images=render)
+        wma.cluster.output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_fiber_list, input_polydatas, number_of_subjects, outdir1, cluster_numbers_s, color, embed, number_of_fibers_to_display, testing=testing, verbose=False, render_images=render, number_of_jobs=number_of_jobs)
     
         # Remove outliers from this iteration and save atlas again                                                 
         print("Starting local cluster outlier removal")
@@ -526,33 +526,14 @@ def main():
             cluster_right_hem.append(farray.number_right_hem)
             cluster_commissure.append(farray.number_commissure)
     
-            # Compute distances and fiber probabilities
-            if distance_method == 'StrictSimilarity':
-                cluster_distances = wma.cluster._pairwise_distance_matrix(pd_c, 0.0, number_of_jobs=1, bilateral=bilateral, distance_method=distance_method, sigmasq = cluster_local_sigma * cluster_local_sigma)
-                cluster_similarity = cluster_distances
-            else:
-                cluster_distances = wma.cluster._pairwise_distance_matrix(pd_c, 0.0, number_of_jobs=1, bilateral=bilateral, distance_method=distance_method)
-                cluster_similarity = wma.similarity.distance_to_similarity(cluster_distances, cluster_local_sigma * cluster_local_sigma)
-    
-            #p(f1) = sum over all f2 of p(f1|f2) * p(f2)
-            # by using sample we estimate expected value of the above
-            # get total similarity for each fiber (-1 to neglect self comparison)
-            total_similarity_OLD = (numpy.sum(cluster_similarity, axis=1) - 1.0) / number_fibers_in_cluster
-            # get leave-one-out total similarity (probability) where only fibers from other subjects are considered
-            total_similarity = list()
-            for (fidx, sidx) in zip(list(range(len(subject_ID_per_fiber))), subject_ID_per_fiber):
-                mask = subject_ID_per_fiber != sidx
-                #print sidx, "!=", set(subject_ID_per_fiber[mask])
-                number_fibers_in_LOO_cluster = numpy.sum(mask)
-                total_similarity.append(numpy.sum(cluster_similarity[fidx,mask]) / number_fibers_in_LOO_cluster)
-                mask2 = subject_ID_per_fiber == sidx
-                if verbose:
-                    tmp = numpy.sum(cluster_similarity[fidx, mask2]) / numpy.sum(mask2)
-                    print("LOO:", total_similarity[-1], "all:", total_similarity_OLD[fidx], "subj:", tmp, "f:", number_fibers_in_cluster, "LOO f:", number_fibers_in_LOO_cluster, "subj f:", numpy.sum(mask2))
-            total_similarity = numpy.array(total_similarity)
+            # Compute distances and leave-one-subject-out fiber probabilities
+            total_similarity, cluster_distances, cluster_similarity = wma.cluster.compute_cluster_loo_similarity(
+                pd_c, subject_ID_per_fiber, cluster_local_sigma,
+                distance_method=distance_method, bilateral=bilateral,
+                use_gpu=None, return_distances=True)
             
             if verbose:
-                print("cluster", c, "tsim:", numpy.min(total_similarity), numpy.mean(total_similarity), numpy.max(total_similarity), "num fibers:", numpy.sum(mask), "num subjects:", subjects_per_cluster)
+                print("cluster", c, "tsim:", numpy.min(total_similarity), numpy.mean(total_similarity), numpy.max(total_similarity), "num fibers:", number_fibers_in_cluster, "num subjects:", subjects_per_cluster)
     
             # remove outliers with low similarity to their cluster
             mean_sim = numpy.mean(total_similarity)
@@ -599,14 +580,13 @@ def main():
         # This can prune fibers from variable clusters that might be missed above
         brain_mean_sim = numpy.mean(fiber_mean_sim)
         brain_std_sim = numpy.std(fiber_mean_sim)
-    
-        for fidx in range(len(cluster_numbers_s)):
-            if fiber_mean_sim[fidx] < brain_mean_sim - cluster_outlier_std_threshold*brain_std_sim:
-                #print fidx, cluster_numbers_s[fidx], fiber_mean_sim[count]
-                if cluster_numbers_s[fidx] >= 0:
-                    cluster_numbers_s[fidx] = -cluster_numbers_s[fidx] - 1
-                    reject_idx.append(fidx)
-    
+        global_cutoff = brain_mean_sim - cluster_outlier_std_threshold * brain_std_sim
+        global_reject_idx = numpy.nonzero(
+            (cluster_numbers_s >= 0) & (fiber_mean_sim < global_cutoff))[0]
+        if global_reject_idx.size > 0:
+            cluster_numbers_s[global_reject_idx] = -cluster_numbers_s[global_reject_idx] - 1
+            reject_idx.extend(global_reject_idx.tolist())
+
         reject_idx = numpy.array(reject_idx)
     
         print("Rejecting whole-brain cluster outlier fibers:", len(reject_idx))
@@ -673,7 +653,7 @@ def main():
         # NOTE: compute and save mean fibers per cluster (add these into the atlas as another polydata)
     
         # Save the current atlas
-        wma.cluster.output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_fiber_list, input_polydatas, number_of_subjects, outdir2, cluster_numbers_s, color, embed, number_of_fibers_to_display, testing=testing, verbose=False, render_images=render)
+        wma.cluster.output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_fiber_list, input_polydatas, number_of_subjects, outdir2, cluster_numbers_s, color, embed, number_of_fibers_to_display, testing=testing, verbose=False, render_images=render, number_of_jobs=number_of_jobs)
     
         # now make the outlier clusters have positive numbers with -cluster_numbers_s so they can be saved also
         outdir3 = os.path.join(outdir2, 'outlier_tracts')
@@ -683,7 +663,7 @@ def main():
         print(f'<{os.path.basename(__file__)}> Saving outlier fiber files in directory:', outdir3)
         mask = cluster_numbers_s < 0
         cluster_numbers_outliers = -numpy.multiply(cluster_numbers_s, mask) - 1
-        wma.cluster.output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_fiber_list, input_polydatas, number_of_subjects, outdir3, cluster_numbers_outliers, color, embed, number_of_fibers_to_display, testing=testing, verbose=False, render_images=False)
+        wma.cluster.output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_fiber_list, input_polydatas, number_of_subjects, outdir3, cluster_numbers_outliers, color, embed, number_of_fibers_to_display, testing=testing, verbose=False, render_images=False, number_of_jobs=number_of_jobs)
     
         test = subject_fiber_list[numpy.nonzero(mask)]
     

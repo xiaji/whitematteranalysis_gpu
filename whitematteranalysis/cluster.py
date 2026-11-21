@@ -170,16 +170,17 @@ def hierarchical(input_polydata, number_of_clusters=300,
     return output_polydata, cluster_idx
 
 
-def nearPSD(A,epsilon=0):
-   n = A.shape[0]
-   eigval, eigvec = numpy.linalg.eig(A)
-   val = numpy.matrix(numpy.maximum(eigval,epsilon))
-   vec = numpy.matrix(eigvec)
-   T = 1/(numpy.multiply(vec,vec) * val.T)
-   T = numpy.matrix(numpy.sqrt(numpy.diag(numpy.array(T).reshape(n) )))
-   B = T * vec * numpy.diag(numpy.array(numpy.sqrt(val)).reshape(n))
-   out = B*B.T
-   return(numpy.asarray(out))
+def nearPSD(A, epsilon=0, eig=None):
+    """Project a symmetric matrix to the nearest correlation-style PSD matrix via eigh."""
+    if eig is not None:
+        eigval, eigvec = eig
+    else:
+        eigval, eigvec = gpu.linalg.eigh(A)
+    val = numpy.maximum(eigval, epsilon)
+    denom = (eigvec * eigvec) @ val
+    inv_diag_sqrt = numpy.sqrt(1.0 / denom)
+    factors = (inv_diag_sqrt[:, None] * eigvec) * numpy.sqrt(val)[None, :]
+    return factors @ factors.T
    
 def spectral(input_polydata, number_of_clusters=200,
              number_of_eigenvectors=20, sigma=60, threshold=0.0,
@@ -315,12 +316,14 @@ def spectral(input_polydata, number_of_clusters=200,
     #print A.shape, B.shape, reorder_embedding.shape
                     
     # Ensure that A is positive definite.
+    e_val_a = None
+    e_vec_a = None
     if pos_def_approx:
         e_val, e_vec = gpu.linalg.eigh(A)
         print(f"<{os.path.basename(__file__)}> Eigenvalue range of A:", e_val[0], e_val[-1])
-        A2 = nearPSD(A)
-        e_val, e_vec = gpu.linalg.eigh(A2)
-        print(f"<{os.path.basename(__file__)}> Eigenvalue range of nearest PSD matrix to A:", e_val[0], e_val[-1])
+        A2 = nearPSD(A, eig=(e_val, e_vec))
+        e_val_a, e_vec_a = gpu.linalg.eigh(A2)
+        print(f"<{os.path.basename(__file__)}> Eigenvalue range of nearest PSD matrix to A:", e_val_a[0], e_val_a[-1])
         testval = numpy.max(A-A2) 
         if not testval == 0.0:
             print(f"<{os.path.basename(__file__)}> A matrix differs by PSD matrix by maximum of:", testval)
@@ -340,34 +343,17 @@ def spectral(input_polydata, number_of_clusters=200,
             # C is not computed.
             # Calculate the sum of the partial rows we've computed:
             atlas.row_sum_1 = numpy.sum(A, axis=0) + numpy.sum(B.T, axis=0)  
-            #print "<cluster.py> A size:", A.shape
-            #print "<cluster.py> B size:", B.shape
-            #print "<cluster.py> A-B matrix row sums range (should be > 0):", numpy.min(atlas.row_sum_1), numpy.max(atlas.row_sum_1)
-            
-            # Approximate the sum of the rest of the data (including C)
-            # These are weighted sums of the columns we did compute
-            # where the weight depends on how similar that fiber 
-            # was to each path in A.  This uses the dual basis
-            # of the columns in A.
-            # Approximate the inverse of A for dual basis
-            #print "<cluster.py> Using numpy linalg pinv A"
-            atlas.pinv_A = numpy.linalg.pinv(A)
+            if e_val_a is not None:
+                max_abs_ev = numpy.max(numpy.abs(e_val_a)) if e_val_a.size else 0.0
+                cutoff = 1e-15 * max_abs_ev
+                nonzero = numpy.abs(e_val_a) > cutoff
+                inv_e_val = numpy.where(nonzero, numpy.divide(1.0, e_val_a, where=nonzero), 0.0)
+                atlas.pinv_A = (e_vec_a * inv_e_val[None, :]) @ e_vec_a.T
+            else:
+                atlas.pinv_A = numpy.linalg.pinv(A)
 
-            #e_val, e_vec = numpy.linalg.eigh(atlas.pinv_A)
-            #print "<cluster.py> test of non-normalized A pseudoinverse Eigenvalue range:", e_val[0], e_val[-1]  
-
-            # row sum formula:
-            # dhat = [a_r + b_r; b_c + B^T*A-1*b_r]
-            # this matrix is A^-1 * b_r, where b_r are the row sums of B
-            # matlab was: atlas.approxRowSumMatrix = sum(B',1)*atlas.pseudoInverseA;
             atlas.row_sum_matrix = numpy.dot(numpy.sum(B.T, axis=0), atlas.pinv_A)
-            #test = numpy.sum(B.T, axis=0)
-            #print "<cluster.py> B column sums range (should be > 0):", numpy.min(test), numpy.max(test)
             print(f"<{os.path.basename(__file__)}> Range of row sum weights:", numpy.min(atlas.row_sum_matrix), numpy.max(atlas.row_sum_matrix))
-            #print "<cluster.py> First 10 entries in weight matrix:", atlas.row_sum_matrix[0:10]
-            #test = numpy.dot(atlas.row_sum_matrix, B)
-            #print "<cluster.py> Test partial sum estimation for B:", numpy.min(test), numpy.max(test)
-            #del test
             
             # row sum estimate for current B part of the matrix
             if gpu.use_gpu(use_gpu):
@@ -403,33 +389,28 @@ def spectral(input_polydata, number_of_clusters=200,
             sz = polydata_m.GetNumberOfLines()
             number_fibers = output_polydata.GetNumberOfLines()
             print(f'<{os.path.basename(__file__)}> Using Nystrom approximation. Subset size (A):',  sz, '/', number_fibers, "B:", polydata_n.GetNumberOfLines())
-            # Determine ordering to get embedding to correspond to original input data.
-            # reject outliers from masks
             reject_idx = numpy.concatenate((midxA[reject_A],midxB[reject_B]))
             nystrom_mask_2 = numpy.delete(nystrom_mask_2,reject_idx)
             not_nystrom_mask = numpy.delete(not_nystrom_mask,reject_idx)
-            #print "hi after mask:", reorder_embedding.shape, numpy.sum(nystrom_mask_2), numpy.sum(not_nystrom_mask)
             reorder_embedding = numpy.concatenate((numpy.where(nystrom_mask_2)[0], numpy.where(not_nystrom_mask)[0]))
-            #print "hi after embed reorder calc:", reorder_embedding.shape, numpy.max(reorder_embedding), numpy.min(reorder_embedding)
            
             # in case of negative row sum estimation
             if any(row_sum_2<=0):
                 print(f"<{os.path.basename(__file__)}> Warning: Consider increasing sigma or using the Mean distance. negative row sum approximations.")
                 print("Number of negative row sums:", numpy.count_nonzero(row_sum_2<=0))
-                #row_sum_2[row_sum_2<0] = 0.1
 
-            # save for testing
-            column_sum = numpy.concatenate((numpy.sum(A, axis=1) , numpy.sum(B.T, axis=1)))
+            # save for testing (before normalization)
+            column_sum = numpy.concatenate((numpy.sum(A, axis=1), numpy.sum(B.T, axis=1)))
 
             # normalized cuts normalization
             row_sum = numpy.concatenate((atlas.row_sum_1, row_sum_2))
             dhat = numpy.sqrt(numpy.divide(1, row_sum))
-            #dhat = numpy.sqrt(numpy.divide(1, numpy.concatenate((atlas.row_sum_1, row_sum_2))))
+            dhat_a = dhat[0:sz]
+            dhat_b = dhat[sz:]
 
-            A = \
-                numpy.multiply(A, numpy.outer(dhat[0:sz], dhat[0:sz].T))
-            B = \
-                numpy.multiply(B, numpy.outer(dhat[0:sz], dhat[sz:].T))
+            A = numpy.multiply(A, numpy.outer(dhat_a, dhat_a.T))
+            if not gpu.use_gpu(use_gpu):
+                B = numpy.multiply(B, numpy.outer(dhat_a, dhat_b.T))
 
         else:
             # normalized cuts normalization using row (same as column) sums
@@ -452,47 +433,27 @@ def spectral(input_polydata, number_of_clusters=200,
     # 4) Compute embedding using eigenvectors
     print(f'<{os.path.basename(__file__)}> Compute embedding using eigenvectors.')
     if use_nystrom:
-        # Create embedding vectors using nystrom approximation to find
-        # the approximate top eigenvectors of the matrix
-        # L = D^(-1/2) (D - W) D^(-1/2) 
-        # See the paper:
-        # "Spectral Grouping Using the Nystrom Method"
-        # Basically all this does is adds in the extra measurements
-        # by projecting them onto the original eigenvector basis.
-        # A=UVU' => U = AUV^-1 => take new rows of extended A (B') and do
-        # the same.  U' = [AUV^-1 ; B'UV^-1] = [U ; B'UV^-1]
-        # Note they divide embedding by 1st eigenvector rather
-        # than sqrt of row sum, as in this code (below).
-
-        # matlab was: % project onto eigenvectors of A:
-        # % v' = [v ; B'*v*d^-1
-        # V = [atlas.eigenvectA; B'*atlas.eigenvectA*(diag(1./diag(atlas.eigenvalA)))];
+        count = min(number_of_eigenvectors + 1, atlas.e_vec.shape[1])
+        e_vec_top = atlas.e_vec[:, -count:]
+        e_val_top = atlas.e_val[-count:]
         if gpu.use_gpu(use_gpu):
-            V2 = gpu.linalg.nystrom_embed_B(B, atlas.e_vec, atlas.e_val)
-            V = numpy.concatenate((atlas.e_vec, V2))
+            V2_top, norm_top = gpu.linalg.nystrom_normalize_and_embed_top(
+                B, dhat_a, dhat_b, e_vec_top, e_val_top, gpu_float32=gpu_float32)
+            V_top = numpy.concatenate((e_vec_top, V2_top))
         else:
-            V = numpy.concatenate((atlas.e_vec, \
-                                      numpy.dot(numpy.dot(B.T, atlas.e_vec), \
-                                                    numpy.diag(numpy.divide(1.0, atlas.e_val)))))
+            V2_top = numpy.dot(
+                numpy.dot(B.T, e_vec_top),
+                numpy.diag(numpy.divide(1.0, e_val_top)))
+            V_top = numpy.concatenate((e_vec_top, V2_top))
+            norm_top = numpy.sum(numpy.multiply(V_top, V_top), 0)
 
-        # normalize estimated eigenvectors to have length of one
-        # matlab was:
-        # atlas.eigenvectorLengthToNormalize=sqrt(sum(V.*V));
-        # V=V./repmat(atlas.eigenvectorLengthToNormalize,length(V),1);
-        atlas.e_vec_norm = numpy.sum(numpy.multiply(V, V),0)
-        V = numpy.divide(V, atlas.e_vec_norm)
+        atlas.e_vec_norm = numpy.ones(atlas.e_vec.shape[1], dtype=numpy.float64)
+        atlas.e_vec_norm[-count:] = norm_top
+        V_top = numpy.divide(V_top, norm_top)
 
-        # Normalize each embedding vector by first eigenvector. Matlab code was:
-        # for i = 2:embedLength+1
-        #    embedding(:,i-1) = V(:,i)./V(:,1);
-        # end
-        # This eigenvector corresponds to an eigenvalue of 1, since row sums are 1.
-        # The other option from the literature was to use this:
-        # embedding_i,j = V_i+i,j./sqrt(D_j,j)
         embed = numpy.zeros((number_fibers, number_of_eigenvectors))
-        #print "Hi 3:", embed.shape, number_fibers, reorder_embedding.shape, V.shape, A.shape, B.shape
         for i in range(0, number_of_eigenvectors):
-            embed[reorder_embedding,i] = numpy.divide(V[:,-(i+2)], V[:,-1])
+            embed[reorder_embedding, i] = numpy.divide(V_top[:, -(i + 2)], V_top[:, -1])
     else:
         embed = atlas.e_vec[:, -number_of_eigenvectors - 2: -2]
         embed = numpy.divide(embed.T, atlas.e_vec[:, -1]).T
@@ -689,10 +650,12 @@ def spectral_atlas_label(input_polydata, atlas, number_of_jobs=2,
         # 3) Compute eigenvectors for use in spectral embedding
         # <done already in atlas creation>
 
-        # 4) Compute embedding using eigenvectors
-        V = numpy.dot(numpy.dot(B.T, atlas.e_vec), \
-                          numpy.diag(numpy.divide(1.0, atlas.e_val)))
-        V = numpy.divide(V, atlas.e_vec_norm)
+        # 4) Compute embedding using eigenvectors (slice top columns only)
+        count = min(atlas.number_of_eigenvectors + 1, atlas.e_vec.shape[1])
+        V = numpy.dot(
+            numpy.dot(B.T, atlas.e_vec[:, -count:]),
+            numpy.diag(numpy.divide(1.0, atlas.e_val[-count:])))
+        V = numpy.divide(V, atlas.e_vec_norm[-count:])
         embed = numpy.zeros((number_fibers, atlas.number_of_eigenvectors))
         for i in range(0, atlas.number_of_eigenvectors):
             embed[:,i] = numpy.divide(V[:,-(i+2)], V[:,-1])
@@ -1068,7 +1031,72 @@ def _embed_to_rgb(embed):
     return color
 
 
-def output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_fiber_list, input_polydatas, number_of_subjects, outdir, cluster_numbers_s, color, embed, number_of_fibers_to_display, testing=False, verbose=False, render_images=True):
+def compute_cluster_loo_similarity(pd_c, subject_ids, sigma, distance_method='Mean',
+                                   bilateral=False, use_gpu=None, gpu_float32=None,
+                                   return_distances=False):
+    """Compute leave-one-subject-out mean similarity for every fiber in one cluster."""
+    subject_arr = numpy.asarray(subject_ids)
+    n_fibers = int(subject_arr.shape[0])
+    sigmasq = float(sigma) * float(sigma)
+    if n_fibers == 0:
+        empty = numpy.zeros(0, dtype=numpy.float64)
+        if return_distances:
+            empty_m = numpy.zeros((0, 0), dtype=numpy.float64)
+            return empty, empty_m, empty_m
+        return empty
+
+    if (not return_distances and distance_method == 'Mean'
+            and gpu.use_gpu(use_gpu)
+            and gpu.distance.distance_supported(distance_method)):
+        X = gpu.fiber_tensors.polydata_to_numpy(pd_c, 15)
+        total_sums = gpu.distance.similarity_row_sums_from_arrays(
+            X, X, 0.0, distance_method=distance_method, bilateral=bilateral,
+            sigmasq=sigmasq, gpu_float32=gpu_float32)
+        total_similarity = numpy.empty(n_fibers, dtype=numpy.float64)
+        uniq_subjects, inverse = numpy.unique(subject_arr, return_inverse=True)
+        for u_idx in range(len(uniq_subjects)):
+            s_idx = numpy.flatnonzero(inverse == u_idx)
+            n_s = int(s_idx.size)
+            n_loo = n_fibers - n_s
+            if n_loo == 0:
+                total_similarity[s_idx] = numpy.nan
+            elif n_s == 1:
+                total_similarity[s_idx] = (total_sums[s_idx] - 1.0) / float(n_loo)
+            else:
+                X_s = X[s_idx]
+                same_sums = gpu.distance.similarity_row_sums_from_arrays(
+                    X_s, X_s, 0.0, distance_method=distance_method, bilateral=bilateral,
+                    sigmasq=sigmasq, gpu_float32=gpu_float32)
+                total_similarity[s_idx] = (total_sums[s_idx] - same_sums) / float(n_loo)
+        return total_similarity
+
+    cluster_distances = _pairwise_distance_matrix(
+        pd_c, 0.0, number_of_jobs=1, bilateral=bilateral,
+        distance_method=distance_method, sigmasq=sigmasq,
+        use_gpu=use_gpu, gpu_float32=gpu_float32)
+    if distance_method == 'StrictSimilarity':
+        cluster_similarity = cluster_distances
+    else:
+        cluster_similarity = similarity.distance_to_similarity(cluster_distances, sigmasq)
+
+    row_sums = numpy.sum(cluster_similarity, axis=1)
+    total_similarity = numpy.empty(n_fibers, dtype=numpy.float64)
+    uniq_subjects, inverse = numpy.unique(subject_arr, return_inverse=True)
+    for u_idx in range(len(uniq_subjects)):
+        s_idx = numpy.flatnonzero(inverse == u_idx)
+        n_loo = n_fibers - int(s_idx.size)
+        if n_loo == 0:
+            total_similarity[s_idx] = numpy.nan
+        else:
+            same_sums = numpy.sum(cluster_similarity[numpy.ix_(s_idx, s_idx)], axis=1)
+            total_similarity[s_idx] = (row_sums[s_idx] - same_sums) / float(n_loo)
+
+    if return_distances:
+        return total_similarity, cluster_distances, cluster_similarity
+    return total_similarity
+
+
+def output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_fiber_list, input_polydatas, number_of_subjects, outdir, cluster_numbers_s, color, embed, number_of_fibers_to_display, testing=False, verbose=False, render_images=True, number_of_jobs=1):
 
     """Save the output in our atlas format for automatic labeling of clusters.
 
@@ -1113,12 +1141,10 @@ def output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_f
 
     # output summary file to save information about all clusters
     clusters_qc_fname = os.path.join(outdir, 'cluster_quality_control.txt')
-    clusters_qc_file = open(clusters_qc_fname, 'w')
 
     # Figure out how many subjects in each cluster (ideally, most subjects in most clusters)
     subjects_per_cluster = list()
     percent_subjects_per_cluster = list()
-    fibers_per_cluster = list()
     mean_fiber_len_per_cluster = list()
     std_fiber_len_per_cluster = list()
     mean_fibers_per_subject_per_cluster = list()
@@ -1129,29 +1155,27 @@ def output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_f
 
     # loop over each cluster and compute quality control metrics
     cluster_indices = list(range(atlas.centroids.shape[0]))
+    subj_arr = numpy.asarray(subject_fiber_list, dtype=numpy.int64)
     for cidx in cluster_indices:
-        cluster_mask = (cluster_numbers_s==cidx) 
-        subjects_per_cluster.append(len(set(subject_fiber_list[cluster_mask])))
-        fibers_per_subject = list()
-        for sidx in range(number_of_subjects):
-            fibers_per_subject.append(list(subject_fiber_list[cluster_mask]).count(sidx))
-        mean_fibers_per_subject_per_cluster.append(numpy.mean(numpy.array(fibers_per_subject)))
-        std_fibers_per_subject_per_cluster.append(numpy.std(numpy.array(fibers_per_subject)))
+        cluster_mask = (cluster_numbers_s == cidx)
+        subj_c = subj_arr[cluster_mask]
+        subjects_per_cluster.append(len(set(subj_c)))
+        fibers_per_subject = numpy.bincount(subj_c, minlength=number_of_subjects)
+        mean_fibers_per_subject_per_cluster.append(numpy.mean(fibers_per_subject))
+        std_fibers_per_subject_per_cluster.append(numpy.std(fibers_per_subject))
         mean_fiber_len_per_cluster.append(numpy.mean(fiber_length[cluster_mask]))
         std_fiber_len_per_cluster.append(numpy.std(fiber_length[cluster_mask]))
 
-    percent_subjects_per_cluster = numpy.divide(numpy.array(subjects_per_cluster),float(number_of_subjects))
+    percent_subjects_per_cluster = numpy.divide(numpy.array(subjects_per_cluster), float(number_of_subjects))
 
     # Save output quality control information
     print(f"<{os.path.basename(__file__)}> Saving cluster quality control information file.")
-    clusters_qc_file = open(clusters_qc_fname, 'w')
-    print('cluster_idx','\t', 'number_subjects','\t', 'percent_subjects','\t', 'mean_length','\t', 'std_length','\t', 'mean_fibers_per_subject','\t', 'std_fibers_per_subject', file=clusters_qc_file)
-    for cidx in cluster_indices:
-        print(cidx + 1,'\t', subjects_per_cluster[cidx],'\t', percent_subjects_per_cluster[cidx] * 100.0,'\t', \
-            mean_fiber_len_per_cluster[cidx],'\t', std_fiber_len_per_cluster[cidx],'\t', \
-            mean_fibers_per_subject_per_cluster[cidx],'\t', std_fibers_per_subject_per_cluster[cidx], file=clusters_qc_file)
-
-    clusters_qc_file.close()
+    with open(clusters_qc_fname, 'w') as clusters_qc_file:
+        print('cluster_idx', '\t', 'number_subjects', '\t', 'percent_subjects', '\t', 'mean_length', '\t', 'std_length', '\t', 'mean_fibers_per_subject', '\t', 'std_fibers_per_subject', file=clusters_qc_file)
+        for cidx in cluster_indices:
+            print(cidx + 1, '\t', subjects_per_cluster[cidx], '\t', percent_subjects_per_cluster[cidx] * 100.0, '\t',
+                  mean_fiber_len_per_cluster[cidx], '\t', std_fiber_len_per_cluster[cidx], '\t',
+                  mean_fibers_per_subject_per_cluster[cidx], '\t', std_fibers_per_subject_per_cluster[cidx], file=clusters_qc_file)
 
     if HAVE_PLT:
         print(f"<{os.path.basename(__file__)}> Saving subjects per cluster histogram.")
@@ -1179,35 +1203,27 @@ def output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_f
     cluster_sizes = list()
     cluster_fnames = list()
     for c in cluster_indices:
-        print(c, end=' ')
         mask = cluster_numbers_s == c
         cluster_size = numpy.sum(mask)
         cluster_sizes.append(cluster_size)
-        #pd_c = filter.mask(output_polydata_s, mask,verbose=verbose)
         pd_c = pd_c_list[c]
-        # color by subject so we can see which one it came from
         filter.add_point_data_array(pd_c, subject_fiber_list[mask], "Subject_ID")
-        # Save hemisphere information into the polydata
         farray = fibers.FiberArray()
         farray.hemispheres = True
         farray.hemisphere_percent_threshold = 0.90
         farray.convert_from_polydata(pd_c, points_per_fiber=50)
         filter.add_point_data_array(pd_c, farray.fiber_hemisphere, "Hemisphere")
-        # The clusters are stored starting with 1, not 0, for user friendliness.
         fname_c = f'cluster_{c+1:05d}.vtp'
-        # save the filename for writing into the MRML file
         fnames.append(fname_c)
-        # prepend the output directory
-        fname_c = os.path.join(outdir, fname_c)
-        #print fname_c
-        io.write_polydata(pd_c, fname_c)
-        cluster_fnames.append(fname_c)
+        cluster_fnames.append(os.path.join(outdir, fname_c))
         if cluster_size > 0:
-            color_c = color[mask,:]
-            cluster_colors.append(numpy.mean(color_c,0))
+            color_c = color[mask, :]
+            cluster_colors.append(numpy.mean(color_c, 0))
         else:
-            cluster_colors.append([0,0,0])
-        del pd_c
+            cluster_colors.append([0, 0, 0])
+    io.write_polydatas_parallel(
+        pd_c_list, cluster_fnames, jobs=number_of_jobs, use_threads=bool(gpu.use_gpu()))
+    del pd_c_list
     print("\n<cluster.py> Finishes saving individual clusters as polydata files.")
 
     # Notify user if some clusters empty
