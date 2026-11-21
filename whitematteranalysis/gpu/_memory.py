@@ -67,7 +67,7 @@ def empty_cache(device=None) -> None:
 def effective_free_vram(device) -> int:
     """Return free VRAM bytes for *device*, capped by ``config.max_vram_gib``."""
     free_bytes = 4 << 30
-    if _device_type(device) != 'mps':
+    if _device_type(device) == 'cuda':
         try:
             import torch
             free_bytes, _total = torch.cuda.mem_get_info(device)

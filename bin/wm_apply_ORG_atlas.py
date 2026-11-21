@@ -258,6 +258,20 @@ def _assemble_single_tract(member_pds, output_path):
     return int(pd_appended.GetNumberOfLines()), int(pd_appended.GetNumberOfPoints())
 
 
+@contextlib.contextmanager
+def _default_lz4_compression():
+    prev_comp = os.environ.get('WMA_VTP_COMPRESSION')
+    if not prev_comp:
+        os.environ['WMA_VTP_COMPRESSION'] = 'lz4'
+    try:
+        yield
+    finally:
+        if prev_comp is None:
+            os.environ.pop('WMA_VTP_COMPRESSION', None)
+        else:
+            os.environ['WMA_VTP_COMPRESSION'] = prev_comp
+
+
 def _invoke_slicer_hardening(in_dir, out_dir, tfm_path, slicer_path, jobs,
                              inverse=True, split_output_dir=None, no_xvfb=False):
     harden_cli = str(Path(__file__).resolve().with_name('wm_harden_transform.py'))
@@ -274,7 +288,8 @@ def _invoke_slicer_hardening(in_dir, out_dir, tfm_path, slicer_path, jobs,
         cmd.append('-no_xvfb')
     cmd.extend(['--profile', str(in_dir), str(out_dir), str(slicer_path)])
     env = os.environ.copy()
-    env.setdefault('WMA_VTP_COMPRESSION', 'lz4')
+    if not env.get('WMA_VTP_COMPRESSION'):
+        env['WMA_VTP_COMPRESSION'] = 'lz4'
     if (_repo_root / 'whitematteranalysis').is_dir():
         existing_pp = env.get('PYTHONPATH', '')
         env['PYTHONPATH'] = f"{_repo_root}{os.pathsep}{existing_pp}" if existing_pp else str(_repo_root)
@@ -611,7 +626,8 @@ def run_pipeline(args):
                     pre_in = scratch_dir / 'pre_in'
                     pre_out = scratch_dir / 'pre_out'
                     pre_in.mkdir()
-                    wma.io.write_polydata(input_pd, str(pre_in / input_path.name))
+                    with _default_lz4_compression():
+                        wma.io.write_polydata(input_pd, str(pre_in / input_path.name))
                     del input_pd
                     _invoke_slicer_hardening(
                         pre_in, pre_out, pre_tfm_path, slicer_path, workers,
@@ -720,8 +736,9 @@ def run_pipeline(args):
                     init_dir = work_dir / 'FiberClustering' / 'InitialClusters' / case_id
                     init_dir.mkdir(parents=True, exist_ok=True)
                     init_fnames = [str(init_dir / name) for name in atlas_cluster_names]
-                    wma.io.write_polydatas_parallel(
-                        cluster_pds, init_fnames, jobs=workers, use_threads=True)
+                    with _default_lz4_compression():
+                        wma.io.write_polydatas_parallel(
+                            cluster_pds, init_fnames, jobs=workers, use_threads=True)
                 del labeled_pd, cluster_numbers, color, embed
             else:
                 empty_pd = _empty_like_schema(filtered_reg_pd)
@@ -743,9 +760,10 @@ def run_pipeline(args):
             if keep >= 2:
                 outrem_dir = work_dir / 'FiberClustering' / 'OutlierRemovedClusters' / f'{case_id}_outlier_removed'
                 outrem_dir.mkdir(parents=True, exist_ok=True)
-                wma.io.write_polydatas_parallel(
-                    cleaned_pds, [str(outrem_dir / name) for name in atlas_cluster_names],
-                    jobs=workers, use_threads=True)
+                with _default_lz4_compression():
+                    wma.io.write_polydatas_parallel(
+                        cleaned_pds, [str(outrem_dir / name) for name in atlas_cluster_names],
+                        jobs=workers, use_threads=True)
                 with (outrem_dir / 'cluster_log.txt').open('w') as lf:
                     lf.write('cluster\t input_fibers\t output_fibers\t number_removed\t percentage_removed\t '
                              'mean_distance_before\t mean_distance_after\t mean_probability_before\t mean_probability_after\n')
@@ -798,21 +816,23 @@ def run_pipeline(args):
                 if keep >= 2 and hardened_for_save is not None:
                     tfm_dir = work_dir / 'FiberClustering' / 'TransformedClusters' / case_id
                     tfm_dir.mkdir(parents=True, exist_ok=True)
-                    wma.io.write_polydatas_parallel(
-                        hardened_for_save, [str(tfm_dir / name) for name in atlas_cluster_names],
-                        jobs=workers, use_threads=True)
+                    with _default_lz4_compression():
+                        wma.io.write_polydatas_parallel(
+                            hardened_for_save, [str(tfm_dir / name) for name in atlas_cluster_names],
+                            jobs=workers, use_threads=True)
                     (tfm_dir / 'transform_complete.log').write_text(
                         f'Transforms completed for {number_of_clusters} files.\n')
                     del hardened_for_save
 
                 if keep >= 1:
                     sep_dir = work_dir / 'FiberClustering' / 'SeparatedClusters'
-                    for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
-                        (sep_dir / folder).mkdir(parents=True, exist_ok=True)
-                        wma.io.write_polydatas_parallel(
-                            [separated_map[folder][name] for name in atlas_cluster_names],
-                            [str(sep_dir / folder / name) for name in atlas_cluster_names],
-                            jobs=workers, use_threads=True)
+                    with _default_lz4_compression():
+                        for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
+                            (sep_dir / folder).mkdir(parents=True, exist_ok=True)
+                            wma.io.write_polydatas_parallel(
+                                [separated_map[folder][name] for name in atlas_cluster_names],
+                                [str(sep_dir / folder / name) for name in atlas_cluster_names],
+                                jobs=workers, use_threads=True)
                     (sep_dir / 'hemisphere_separation_complete.log').write_text(
                         f'Hemisphere separation completed for {number_of_clusters} clusters.\n')
             else:
@@ -820,15 +840,10 @@ def run_pipeline(args):
                     if keep >= 2 else (scratch_dir / 'OutlierRemovedWork')
                 if keep < 2:
                     outrem_work.mkdir(parents=True, exist_ok=True)
-                    prev_comp = os.environ.get('WMA_VTP_COMPRESSION')
-                    os.environ['WMA_VTP_COMPRESSION'] = prev_comp or 'lz4'
-                    try:
+                    with _default_lz4_compression():
                         wma.io.write_polydatas_parallel(
                             cleaned_pds, [str(outrem_work / name) for name in atlas_cluster_names],
                             jobs=workers, use_threads=True)
-                    finally:
-                        if prev_comp is None:
-                            os.environ.pop('WMA_VTP_COMPRESSION', None)
                 del cleaned_pds
                 gc.collect()
 
@@ -836,34 +851,30 @@ def run_pipeline(args):
                     if keep >= 2 else (scratch_dir / 'TransformedClusters')
                 sep_final_dir = (work_dir / 'FiberClustering' / 'SeparatedClusters') \
                     if keep >= 1 else (scratch_dir / 'SeparatedClusters')
-                sep_split_dir = (scratch_dir / 'SeparatedClustersPre') \
-                    if args.transform else sep_final_dir
+                rig_target_dir = (scratch_dir / 'TransformedClustersPre') if args.transform else tfm_dir
+                rig_split_dir = None if args.transform else sep_final_dir
                 tfm_dir.mkdir(parents=True, exist_ok=True)
-                sep_split_dir.mkdir(parents=True, exist_ok=True)
+                rig_target_dir.mkdir(parents=True, exist_ok=True)
                 sep_final_dir.mkdir(parents=True, exist_ok=True)
 
                 if args.reg_mode == 'nonrig':
-                    tmp_nonrig = tfm_dir / 'tmp'
+                    tmp_nonrig = scratch_dir / 'tmp_nonrig'
                     tmp_nonrig.mkdir(parents=True, exist_ok=True)
                     _invoke_slicer_hardening(
                         outrem_work, tmp_nonrig, nonrig_tfm_path, slicer_path, workers,
                         inverse=True, no_xvfb=args.no_xvfb)
                     hardening_backend = _invoke_slicer_hardening(
-                        tmp_nonrig, tfm_dir, rig_tfm_path, slicer_path, workers,
-                        inverse=True, split_output_dir=sep_split_dir, no_xvfb=args.no_xvfb)
+                        tmp_nonrig, rig_target_dir, rig_tfm_path, slicer_path, workers,
+                        inverse=True, split_output_dir=rig_split_dir, no_xvfb=args.no_xvfb)
                 else:
                     hardening_backend = _invoke_slicer_hardening(
-                        outrem_work, tfm_dir, rig_tfm_path, slicer_path, workers,
-                        inverse=True, split_output_dir=sep_split_dir, no_xvfb=args.no_xvfb)
+                        outrem_work, rig_target_dir, rig_tfm_path, slicer_path, workers,
+                        inverse=True, split_output_dir=rig_split_dir, no_xvfb=args.no_xvfb)
 
                 if args.transform:
-                    for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
-                        dst_folder = sep_final_dir / folder
-                        dst_folder.mkdir(parents=True, exist_ok=True)
-                        _invoke_slicer_hardening(
-                            sep_split_dir / folder, dst_folder, pre_tfm_path, slicer_path, workers,
-                            inverse=True, no_xvfb=args.no_xvfb)
-                        (dst_folder / 'transform_complete.log').unlink(missing_ok=True)
+                    hardening_backend = _invoke_slicer_hardening(
+                        rig_target_dir, tfm_dir, pre_tfm_path, slicer_path, workers,
+                        inverse=True, split_output_dir=sep_final_dir, no_xvfb=args.no_xvfb)
 
                 if keep >= 1:
                     (sep_final_dir / 'hemisphere_separation_complete.log').write_text(

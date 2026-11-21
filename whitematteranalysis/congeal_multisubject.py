@@ -11,6 +11,7 @@ class MultiSubjectRegistration
 
 import os
 import time
+import weakref
 import numpy
 import vtk
 from joblib import Parallel, delayed
@@ -68,6 +69,40 @@ class MultiSubjectRegistration:
         #self.nonrigid_grid_resolution = 3
         #self.nonrigid_grid_resolution = 5
         self.nonrigid_grid_resolution = 6
+        self.gpu_process_pool = None
+        self._gpu_process_executor = None
+        self._gpu_process_workers = None
+        self._gpu_process_finalizer = None
+
+    def _use_gpu_process_pool(self):
+        if self.gpu_process_pool is not None:
+            return bool(self.gpu_process_pool)
+        return os.environ.get('WMA_GPU_PROCESS_POOL', '0').strip().lower() in (
+            '1', 'true', 'yes', 'on')
+
+    def _get_gpu_process_executor(self, workers):
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing
+
+        if (self._gpu_process_executor is not None
+                and self._gpu_process_workers == workers):
+            return self._gpu_process_executor
+        self.close()
+        ctx = multiprocessing.get_context('spawn')
+        executor = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+        self._gpu_process_executor = executor
+        self._gpu_process_workers = workers
+        self._gpu_process_finalizer = weakref.finalize(self, executor.shutdown, wait=True)
+        return executor
+
+    def close(self):
+        """Release any persistent multi-GPU process pool."""
+        finalizer = self._gpu_process_finalizer
+        self._gpu_process_finalizer = None
+        self._gpu_process_executor = None
+        self._gpu_process_workers = None
+        if finalizer is not None and finalizer.alive:
+            finalizer()
 
     def update_nonrigid_grid(self):
         """This updates the nonrigid grids. Subjects must be added first using
@@ -298,6 +333,19 @@ class MultiSubjectRegistration:
                 print("Using GPU acceleration for registration (single device, subjects sequential).")
                 ret = [congeal_multisubject_inner_loop(*args, use_gpu=True, device=base_dev)
                        for args in arglist]
+            elif n_gpus > 1 and self.mode != "Nonrigid" and self._use_gpu_process_pool():
+                worker_arglist = _prerender_fixed_brains(arglist)
+                workers = min(n_gpus, len(worker_arglist))
+                print(f"Using GPU acceleration for registration ({n_gpus} devices, {workers} spawn processes).")
+                executor = self._get_gpu_process_executor(workers)
+                devices_cfg = wma.gpu.config.devices
+                f32_flag = wma.gpu.float32_enabled()
+                strict_flag = wma.gpu.strict_enabled()
+                tasks = [
+                    (subj_args, subj_i % n_gpus, devices_cfg, f32_flag, strict_flag)
+                    for subj_i, subj_args in enumerate(worker_arglist)
+                ]
+                ret = list(executor.map(_congeal_multisubject_gpu_process_worker, tasks))
             elif n_gpus > 1:
                 worker_arglist = _prerender_fixed_brains(arglist)
                 print(f"Using GPU acceleration for registration ({n_gpus} devices, round-robin workers).")
@@ -538,6 +586,26 @@ def _prerender_fixed_brains(arglist):
             args = args[:10] + (False,) + args[11:]
         worker_arglist.append(args)
     return worker_arglist
+
+
+def _congeal_multisubject_gpu_process_worker(task):
+    """Top-level spawn worker so multi-GPU COBYLA avoids SciPy's process-wide lock."""
+    import contextlib
+    import torch
+
+    args_tuple, gpu_idx, devices_cfg, float32_flag, strict_flag = task
+    wma.gpu.set_gpu(True)
+    wma.gpu.set_float32(float32_flag)
+    wma.gpu.set_strict(strict_flag)
+    if devices_cfg is not None:
+        wma.gpu.set_devices(devices_cfg)
+    worker_dev = wma.gpu.get_device(gpu_idx)
+    dev_ctx = (torch.cuda.device(worker_dev)
+               if worker_dev.type == 'cuda' and torch.cuda.is_available()
+               else contextlib.nullcontext())
+    with dev_ctx:
+        return congeal_multisubject_inner_loop(
+            *args_tuple, use_gpu=True, device=worker_dev)
 
 
 def congeal_multisubject_inner_loop(mean, subject, initial_transform, mode, sigma, subject_idx, iteration_count, output_directory, step_size, maxfun, render, grid_resolution, use_gpu=None, device=None):

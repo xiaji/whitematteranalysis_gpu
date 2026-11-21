@@ -360,7 +360,8 @@ def main():
         Parallel(n_jobs=workers, prefer='threads')(delayed(run)() for run in runs)
         if args.profile and prepare_already_ran:
             (logs / 'preparation.json').write_text(json.dumps({
-                'prepare_s': prepare_seconds, 'combined_s': time.perf_counter() - started,
+                'prepare_s': prepare_seconds,
+                'combined_s': prepare_seconds + (time.perf_counter() - started),
                 'command': args.prepare_command}, indent=2) + '\n')
     actual = {Path(path).name for path in wma.io.list_vtk_files(str(outdir))}
     if not expected.issubset(actual):

@@ -99,7 +99,10 @@ def read_itk_affine_matrix_ras(tfm_path, inverse=False):
     ras_inv = C @ L @ C
     if inverse:
         return ras_inv
-    return numpy.linalg.inv(ras_inv)
+    try:
+        return numpy.linalg.inv(ras_inv)
+    except numpy.linalg.LinAlgError as exc:
+        raise ValueError(f"Singular linear transform matrix in {tfm_path}") from exc
 
 
 def _extract_linear_matrix(transform_or_matrix):

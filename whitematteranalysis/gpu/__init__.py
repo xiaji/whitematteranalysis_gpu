@@ -40,7 +40,7 @@ from .config import (config, set_gpu, set_float32, set_strict, set_devices, set_
                      use_gpu, float32_enabled, strict_enabled, get_device, visible_device_count,
                      add_gpu_arguments, apply_gpu_arguments)
 
-_BACKENDS = ('fiber_tensors', 'distance', 'registration', 'linalg', 'cpu_backend')
+_BACKENDS = ('fiber_tensors', 'distance', 'registration', 'linalg', 'bspline', 'cpu_backend')
 __all__ = ('config', 'set_gpu', 'set_float32', 'set_strict', 'set_devices', 'set_tile_rows',
            'use_gpu', 'float32_enabled', 'strict_enabled', 'get_device', 'visible_device_count',
            'add_gpu_arguments', 'apply_gpu_arguments', 'available', *_BACKENDS)

@@ -181,6 +181,10 @@ class GPUConfigTests(unittest.TestCase):
         self.assertIs(gpu_config.config.requested, False)
         self.assertFalse(gpu_config.config.float32)
 
+        # Lazy wma.gpu.bspline attribute resolution
+        import whitematteranalysis as wma
+        self.assertIs(wma.gpu.bspline, importlib.import_module('whitematteranalysis.gpu.bspline'))
+
 
 if __name__ == '__main__':
     unittest.main()

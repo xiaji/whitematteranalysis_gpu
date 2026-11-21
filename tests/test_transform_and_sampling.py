@@ -272,6 +272,18 @@ class TransformModuleTests(unittest.TestCase):
             h5_file.write_bytes(b'\x89HDF\r\n\x1a\n\x00\x00\xff')
             self.assertIsNone(wma.transform.read_itk_affine_matrix_ras(str(h5_file)))
 
+            # Singular linear matrix raises explicit ValueError context message
+            singular_tfm = root / 'singular.tfm'
+            singular_tfm.write_text(
+                '#Insight Transform File V1.0\n'
+                '# Transform 0\n'
+                'Transform: AffineTransform_double_3_3\n'
+                'Parameters: 0 0 0 0 0 0 0 0 0 0 0 0\n'
+                'FixedParameters: 0 0 0\n'
+            )
+            with self.assertRaisesRegex(ValueError, 'Singular linear transform matrix'):
+                wma.transform.read_itk_affine_matrix_ras(str(singular_tfm), inverse=False)
+
 
 class DirectSamplingTests(unittest.TestCase):
     def _non_integer_float64_polydata(self):

@@ -730,6 +730,32 @@ class ORGPipelineCLITests(unittest.TestCase):
             self.assertEqual(qc1['hardening_backend'], 'mock_slicer_model_node')
             self.assertTrue(qc1['has_tensor_arrays'])
 
+            # Verify empty-string WMA_VTP_COMPRESSION='' restoration and unset preservation in _default_lz4_compression
+            with patch.dict(os.environ, {'WMA_VTP_COMPRESSION': ''}):
+                with org_cli._default_lz4_compression():
+                    self.assertEqual(os.environ.get('WMA_VTP_COMPRESSION'), 'lz4')
+                self.assertEqual(os.environ.get('WMA_VTP_COMPRESSION'), '')
+            with patch.dict(os.environ, {'WMA_VTP_COMPRESSION': 'zlib'}):
+                with org_cli._default_lz4_compression():
+                    self.assertEqual(os.environ.get('WMA_VTP_COMPRESSION'), 'zlib')
+                self.assertEqual(os.environ.get('WMA_VTP_COMPRESSION'), 'zlib')
+
+            # Verify non-Tier-1 -t --keep-intermediates 2 runs pre_tfm once and stores native coords in TransformedClusters/
+            out_keep2 = root / 'out_keep2_t'
+            with patch.object(org_cli, '_invoke_slicer_hardening', side_effect=_mock_slicer_hardening) as mock_inv, \
+                    patch.object(sys, 'argv', [
+                        str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_keep2),
+                        '-a', str(atlas_root), '-s', str(fake_slicer), '-t', str(pre_tfm),
+                        '-r', 'rig', '-j', '1', '-gpu', 'off', '--keep-intermediates', '2']):
+                org_cli.main()
+            # 3 hardening invocations total: forward pre_tfm, rig inverse -> scratch, pre_tfm inverse -> TransformedClusters + SeparatedClusters
+            self.assertEqual(mock_inv.call_count, 3)
+            tfm_vtp_count = sum(
+                _assert_native_roundtrip_points(self, p, fibers1)
+                for p in sorted((out_keep2 / 'sub-nontier1' / 'FiberClustering' / 'TransformedClusters' / 'sub-nontier1').glob('cluster_*.vtp'))
+            )
+            self.assertEqual(tfm_vtp_count, len(fibers1))
+
             checked_tracts = sum(
                 _assert_native_roundtrip_points(self, keep1_case / 'AnatomicalTracts' / tract, fibers1)
                 for tract in ('T_AF_left.vtp', 'T_AF_right.vtp', 'T_CC1.vtp')

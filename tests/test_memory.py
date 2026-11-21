@@ -107,14 +107,17 @@ class GPUMemoryTests(unittest.TestCase):
             self.assertAlmostEqual(gpu_config.config.max_vram_gib, 3.5)
             with patch.object(torch.cuda, 'mem_get_info',
                               return_value=(20 << 30, 24 << 30)):
-                free = gpu_memory.effective_free_vram(torch.device('cpu'))
+                free = gpu_memory.effective_free_vram(torch.device('cuda', 0))
             self.assertLessEqual(free, int(3.5 * (1 << 30)))
             self.assertEqual(free, int(3.5 * (1 << 30)))
 
         gpu_config.config.max_vram_gib = None
         with patch.object(torch.cuda, 'mem_get_info',
                           return_value=(2 << 30, 24 << 30)):
-            self.assertEqual(gpu_memory.effective_free_vram(torch.device('cpu')), 2 << 30)
+            self.assertEqual(gpu_memory.effective_free_vram(torch.device('cuda', 0)), 2 << 30)
+        with patch.object(torch.cuda, 'mem_get_info',
+                          side_effect=AssertionError('must not query CUDA on CPU')):
+            self.assertEqual(gpu_memory.effective_free_vram(torch.device('cpu')), 4 << 30)
 
         prev_matmul = torch.backends.cuda.matmul.allow_tf32
         prev_cudnn = torch.backends.cudnn.allow_tf32

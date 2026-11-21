@@ -440,6 +440,76 @@ class MultiGpuDispatchTests(unittest.TestCase):
         np.testing.assert_array_equal(labels_2, labels_1)
         np.testing.assert_allclose(embed_2, embed_1, rtol=1e-12, atol=1e-12)
 
+    def test_congeal_multisubject_gpu_process_pool_worker_and_dispatch(self):
+        torch = self._require_torch()
+        import concurrent.futures
+        import pickle
+
+        saved_cfg = {name: getattr(wma.gpu.config, name)
+                     for name in ('requested', 'float32', 'devices', 'strict', 'allow_mps')}
+        self.addCleanup(lambda: [setattr(wma.gpu.config, k, v) for k, v in saved_cfg.items()])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            reg = congeal_multisubject.MultiSubjectRegistration()
+            reg.output_directory = tmpdir
+            reg.random_seed = 42
+            reg.render = False
+            reg.mode = 'Affine'
+            reg.maxfun = 4
+            reg.mean_brain_size = 8
+            reg.subject_brain_size = 4
+            reg.points_per_fiber = 5
+            reg.parallel_jobs = 2
+            reg.gpu_process_pool = True
+            for i in range(3):
+                reg.add_polydata(_make_polydata(6, n_points=5, seed=40 + i), f'sub{i}')
+
+            cpu_dev = torch.device('cpu')
+            dispatched = []
+
+            class SpyProcessExecutor:
+                def __init__(self, *args, **kwargs):
+                    self.shutdown_calls = 0
+
+                def map(self, fn, tasks):
+                    out = []
+                    for task in tasks:
+                        # Ensure task & worker are cleanly picklable under spawn
+                        roundtrip = pickle.loads(pickle.dumps(task))
+                        dispatched.append((roundtrip[1], roundtrip[2], roundtrip[3], roundtrip[4]))
+                        out.append(fn(roundtrip))
+                    return out
+
+                def shutdown(self, wait=True):
+                    self.shutdown_calls += 1
+
+            spy_exec = SpyProcessExecutor()
+            wma.gpu.config.devices = [3, 5]
+            wma.gpu.config.float32 = False
+            wma.gpu.config.strict = True
+
+            class DummyObj:
+                def __init__(self, fixed, moving, *rest, device=None, **kwargs):
+                    pass
+
+                def __call__(self, param, *args, **kwargs):
+                    return float(np.sum(np.asarray(param) ** 2))
+
+            with patch.object(congeal_multisubject, 'HAVE_PLT', 0), \
+                    patch.object(wma.gpu.config, 'cuda_available', return_value=True), \
+                    patch.object(torch.cuda, 'is_available', return_value=False), \
+                    patch.object(wma.gpu, 'visible_device_count', return_value=2), \
+                    patch.object(wma.gpu, 'get_device', return_value=cpu_dev), \
+                    patch.object(concurrent.futures, 'ProcessPoolExecutor', return_value=spy_exec), \
+                    patch.object(registration, 'AffineObjective', DummyObj):
+                reg.iterate()
+
+            self.assertEqual(dispatched, [(0, [3, 5], False, True),
+                                          (1, [3, 5], False, True),
+                                          (0, [3, 5], False, True)])
+            reg.close()
+            self.assertEqual(spy_exec.shutdown_calls, 1)
+
 
 if __name__ == '__main__':
     unittest.main()

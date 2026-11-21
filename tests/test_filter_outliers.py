@@ -172,6 +172,23 @@ class RemoveOutliersTests(unittest.TestCase):
         np.testing.assert_array_equal(actual, expected)
         self.assertEqual(float(actual[0]), 7.0 / 3.0)
 
+    @unittest.skipUnless(wma.gpu.available(), 'CUDA is required')
+    def test_nearest_neighbor_distances_uses_exact_numpy_division_cuda(self):
+        import torch
+
+        data = fibers_at((0., 1., 2., 3.))
+        fa = wma.fibers.FiberArray()
+        fa.points_per_fiber = 10
+        fa.convert_from_polydata(data)
+        dev = wma.gpu.get_device()
+        fake_row = torch.tensor([[0.0, 1.0, 2.0, 4.0]] * 4, dtype=torch.float64, device=dev)
+        with patch.object(wma.gpu.distance, '_fiber_block_distances', return_value=fake_row):
+            actual = wma.gpu.distance.nearest_neighbor_distances_from_fiber_array(
+                fa, k=3, distance_method='Mean')
+        expected = wma.filter._mean_nearest_neighbor_distance(fake_row.cpu().numpy())
+        np.testing.assert_array_equal(actual, expected)
+        self.assertEqual(float(actual[0]), 7.0 / 3.0)
+
 
 if __name__ == '__main__':
     unittest.main()
