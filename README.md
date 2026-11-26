@@ -54,8 +54,22 @@ dual NVIDIA RTX 3090, warm `float64` atlas cache, `-r rig -j 4 -gpu on`),
 and `3.2x` faster warm registration in `float32`), split-C low-VRAM `nearest_centroids`
 (`88x–111x` faster than `torch.cdist` in `float32`, `22x–25x` in `float64`),
 and multi-GPU scheduling (`1.63x` on 340k `float64` labeling and `1.78x` on 800-cluster
-outlier removal across 2 GPUs). See [doc/acceleration.md](doc/acceleration.md#phase-2-benchmarks-fan93-rtx-3090)
-for complete Benchmarks A–D tables.
+outlier removal across 2 GPUs).
+
+Phase 3 extends nonrigid B-spline acceleration, atlas construction, and multi-atlas
+support: `NonrigidObjective` adds cached 1D separable GPU prefiltering and an unrolled
+1-thread-per-point Triton kernel (`2.08x–2.82x` faster per evaluation in `float64`,
+`2.23x–4.21x` in `float32`), opt-in `WMA_NONRIGID_ANALYTIC_GRAD=1` L-BFGS-B
+analytic gradients (`10.89x` faster at `R=4`), and vectorized `105^3` BSpline ITK
+`.tfm` export (`2.209 s`). Atlas construction adds `pinv_A` reuse and column-tiled
+GPU Nyström projection in `cluster.spectral`, plus `O(N)` GPU LOO scoring in
+`compute_cluster_loo_similarity` (`4.82x` faster, `max_diff = 4.163e-17`), while
+`whitematteranalysis.atlases` and `--atlas-family {auto,org,east-west,naba}` support
+validated ORG (`76` `T_*.vtp`), East-West (`76`), and NABA (`78`) pipelines, and
+opt-in `WMA_GPU_PROCESS_POOL=1` enables multi-process linear groupwise GPU workers.
+See [doc/acceleration.md](doc/acceleration.md#phase-2-benchmarks-fan93-rtx-3090)
+and [Phase 3 benchmarks](doc/acceleration.md#phase-3-benchmarks-fan93-rtx-3090)
+for complete Benchmarks A–F tables.
 
 # GPU and 3D Slicer quick start
 
@@ -125,6 +139,8 @@ Outlier removal shares cached atlas reference statistics across subjects.
 | `WMA_IO_PREFETCH=1` | Opt into whole-file POSIX readahead; default off, benefit depends on storage |
 | `WMA_GPU_MIN_PAIR_WORK=4096` | Route tiny outlier clusters (`n_queries * n_fixed < threshold`) to the CPU backend |
 | `WMA_GPU_MAX_VRAM_GIB=3.5` | Cap the GPU free-VRAM budget used for tile sizing (useful on shared or low-VRAM GPUs) |
+| `WMA_NONRIGID_ANALYTIC_GRAD=1` | Opt into PyTorch analytic gradient for nonrigid `BFGS` (`RegisterTractographyNonrigid`) instead of finite differences |
+| `WMA_GPU_PROCESS_POOL=1` | Opt into a spawn `ProcessPoolExecutor` for multi-GPU linear `MultiSubjectRegistration` to bypass SciPy COBYLA's thread lock |
 
 ## 3D Slicer extension
 
@@ -170,12 +186,13 @@ $ wm_apply_ORG_atlas.py \
   -i input_tractography.vtp \
   -o output_dir \
   -a path_to_atlas/ORG-Atlases-v1.x \
+  --atlas-family auto \
   -r rig \
   -j 4 \
   -gpu on
 ```
 
-For standalone linear `.tfm` hardening without 3D Slicer (on tensor-free files), `wm_harden_transform.py` also accepts `--pure-python` or `Slicer=none`/`auto`.
+`--atlas-family` accepts `{auto,org,east-west,naba}` (default `auto`, reading `ATLAS.json` or atlas subdirectory layout and validating cluster/MRML consistency before running). For standalone linear `.tfm` hardening without 3D Slicer (on tensor-free files), `wm_harden_transform.py` also accepts `--pure-python` or `Slicer=none`/`auto`.
 
 * The legacy master shell script `wm_apply_ORG_atlas_to_subject.sh` (see code [here](bin/wm_apply_ORG_atlas_to_subject.sh)) remains available for SlicerDMRI-based multi-stage workflows and `FiberTractMeasurements`:
 

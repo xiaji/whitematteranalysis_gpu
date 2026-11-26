@@ -24,15 +24,23 @@ repeated objective evaluation is faster because:
   with fewer intermediate tensors and kernel launches. PyTorch provides the
   fallback when Triton is unavailable or `P > 64`. Groupwise multi-subject
   registration (`congeal_multisubject.py`) pre-renders fixed brains on the main
-  thread and schedules subjects round-robin across visible GPUs.
+  thread and schedules subjects round-robin across visible GPUs; setting
+  `WMA_GPU_PROCESS_POOL=1` opts into a spawn `ProcessPoolExecutor` across multiple
+  GPUs for linear (`Affine`/`Rigid`) registration so each GPU runs an independent
+  Python process outside SciPy COBYLA's `@synchronized` lock.
 - Length eligibility and geometry views are reused between registration samples.
   Selected indices are sorted to preserve input fiber order and the original RNG
   sequence without building a full-tractogram selection mask each iteration.
 - Slicer registration reads file-based atlas references as geometry only, omitting
   unused attributes. Subject attributes remain available for the saved output.
-- **Nonrigid workflows:** B-spline evaluation has batch CPU and CUDA paths,
-  avoiding a Python call to VTK for every point. These paths support nonrigid
-  registration; the README's `rig` benchmark measures rigid plus affine only.
+- **Nonrigid workflows:** B-spline evaluation (`whitematteranalysis/gpu/bspline.py`)
+  uses an unrolled 1-thread-per-point Triton kernel (`tl.int64`, `float64`/`float32`),
+  cached 1D separable GPU coefficient prefiltering (bypassed under `WMA_GPU_STRICT=1`
+  to match VTK's `float32`-output `vtkImageBSplineCoefficients` path), opt-in
+  `WMA_NONRIGID_ANALYTIC_GRAD=1` analytic `value_and_gradient` for L-BFGS-B, and
+  vectorized `105^3` ITK `.tfm` export (`whitematteranalysis/io.py`), avoiding per-point
+  Python/VTK loops. These paths support nonrigid registration; the README's `rig`
+  benchmark measures rigid plus affine only.
 
 Source: [CPU backend](../whitematteranalysis/gpu/cpu_backend.py),
 [GPU registration](../whitematteranalysis/gpu/registration.py),
@@ -280,6 +288,22 @@ unit coordinate differences even around `1e8`; float32 can erase those differenc
 and remains opt-in. Explicit `-gpu on` now requires usable CUDA rather than
 silently falling back to CPU.
 
+## Atlas construction & multi-atlas support
+
+- **Spectral atlas construction (`cluster.spectral` / `wm_cluster_atlas.py`):**
+  `nearPSD` uses symmetric `gpu.linalg.eigh`; Nyström clustering reuses `(e_val_a,
+  e_vec_a)` for `pinv_A` and projects only the top `k + 1` columns in column tiles via
+  `gpu.linalg.nystrom_normalize_and_embed_top`, avoiding full `N x m` host copies.
+  Leave-one-out cluster outlier scoring (`compute_cluster_loo_similarity`) uses an
+  `O(N)` GPU path via `similarity_row_sums_from_arrays` when `distance_method == 'Mean'`
+  and `return_distances == False`, and `output_and_quality_control_cluster_atlas`
+  writes cluster VTPs in parallel via `write_polydatas_parallel`.
+- **Declarative multi-atlas registry (`whitematteranalysis/atlases.py`):** Supports
+  `org` (`33` hemispheric + `8` commissural tracts), `east-west` (`34` + `8`), and
+  `naba` (`35` + `8`), gating ORG CPC hemisphere overrides by family and validating
+  `ATLAS.json`, cluster VTPs, location policy, and tract MRML scenes pre-flight via
+  `resolve_atlas` and `wm_apply_ORG_atlas.py --atlas-family {auto,org,east-west,naba}`.
+
 ## Phase 2 benchmarks (`fan93`, RTX 3090)
 
 Measured on `fan93` (NVIDIA GeForce RTX 3090 GPUs 5 & 6, PyTorch `2.8.0+cu128`,
@@ -352,3 +376,41 @@ Notes:
 - In the `-gpu_float32` run, `WMA_ATLAS_CACHE` only held pre-warmed `float64`
   entries, so `outlier_and_hemisphere` (`15.938 s` vs `5.581 s`) included building
   the 800 `float32` cache files on first run.
+
+## Phase 3 benchmarks (`fan93`, RTX 3090)
+
+### Benchmark E: Nonrigid B-spline evaluation, analytic L-BFGS-B gradient & ITK export (GPU `5`, `sub-13086` `1000 x 500 x 3` points)
+
+| Workload / Mode | Strict VTK `float64` (`WMA_GPU_STRICT=1`) | GPU Separable `float64` | GPU Separable `float32` | Parity / Notes |
+| --- | ---: | ---: | ---: | --- |
+| `NonrigidObjective` (`R=4`, warm per-eval) | `1.454 ms` | `0.699 ms` (**2.08x**) | `0.651 ms` (**2.23x**) | `diff_f64 = 2.419e-06` (rel `~1.15e-9`*); `diff_f32 = 7.171e-05` |
+| `NonrigidObjective` (`R=6`, warm per-eval) | `2.151 ms` | `0.763 ms` (**2.82x**) | `0.511 ms` (**4.21x**) | `diff_f64 = 1.168e-06`; `diff_f32 = 1.966e-05` |
+
+\* VTK's `vtkImageBSplineCoefficients` defaults to `float32` output under `strict=True`, whereas `gpu_sep_f64` preserves `float64`.
+
+| Optimizer / Export Benchmark | Baseline / Reference | Accelerated Phase 3 | Speedup / Output |
+| --- | ---: | ---: | --- |
+| `RegisterTractographyNonrigid` `BFGS` (`R=4`, 192 params) | `approx_grad=True` (`maxfun=250`): `0.196 s`, `251` evals, `final_obj = 2100.181554` | `analytic_grad=True` (`maxfun=40`): `0.018 s`, `3` evals, `final_obj = 1983.259520` | **10.89x** faster (`116.92` lower objective) |
+| Vectorized `105^3` BSpline ITK `.tfm` export (`write_transforms_to_itk_format`) | — | `2.209 s` | `51.89 MiB` (`itk_txform_00001.tfm`) |
+
+### Benchmark F: Atlas construction, LOO similarity & multi-atlas pipelines (`fan93`, RTX 3090)
+
+1. **Real multi-atlas pre-flight validation & end-to-end `-r rig -j 4 -gpu on` (`5,000`-fiber `sub-13086`, GPUs `5, 6`):**
+
+| Atlas Family | `resolve_atlas(..., validate_mrml=True)` Layout | End-to-End Wall Time | QC Family / Hardening | `T_*.vtp` Written |
+| --- | --- | ---: | --- | ---: |
+| `org` | `ORG-RegAtlas-100HCP` / `ORG-800FC-100HCP` (`800` clusters, `33` hemi + `8` comm, CPC overrides on) | (see Benchmark D for 340k full run) | `org` / `pure_python_affine` | `76` (incl. `T_FalsePositive`) |
+| `east-west` | `East-West_WM_Atlas_Reg` / `East-West_WM_Atlas_800FC` (`800` clusters, `34` hemi + `8` comm, CPC overrides off) | `135.388 s` (`stage_timings_s['total'] = 134.031 s`) | `east-west` / `pure_python_affine` | `76` |
+| `naba` | `NABA-RegAtlas` / `NABA-800FC` (`800` clusters, `35` hemi + `8` comm, CPC overrides off) | `52.702 s` (`stage_timings_s['total'] = 51.314 s`) | `naba` / `pure_python_affine` | `78` |
+
+Both `east-west/ATLAS.json` and `naba/ATLAS.json` also passed `--atlas-family auto` detection.
+
+2. **Spectral atlas construction & `O(N)` GPU LOO similarity (`sub-13086` subsets, `bilateral=True`):**
+
+| Operation / Shape | CPU (`use_gpu=False`) | GPU | Speedup | Numerical Parity (GPU vs CPU) |
+| --- | ---: | ---: | ---: | --- |
+| `compute_cluster_loo_similarity` (`Nc=2000`, `20` subj, `Mean`, warm GPU `5`) | `0.143 s` | `0.030 s` | **4.82x** | `max_diff = 4.163e-17` |
+| `cluster.spectral` (`N=4000, m=1000, k=10`, shared host load, warm GPU `3`) | `23.328 s` | `19.995 s` | **1.17x** | Sign-aligned `emb_max_diff = 4.194e-11`; `pinv_max_diff = 6.931e-07` |
+| `cluster.spectral` (`N=10000, m=1500, k=200`, shared host load, warm GPU `3`) | `38.818 s` | `33.448 s` | **1.16x** | Sign-aligned `emb_max_diff = 1.395e-10`; `pinv_max_diff = 4.210e-06` |
+
+Under low host CPU load on first-call GPU `5` (`N=4000, m=1000, k=10`, including CUDA/cuSOLVER init), `cluster.spectral` measured `1.268 s` CPU vs `2.216 s` cold-JIT GPU (`emb_max_diff = 4.194e-11`). For multi-GPU linear groupwise registration, `WMA_GPU_PROCESS_POOL=1` spawn dispatch and pickling parity passed unit verification (`test_congeal_multisubject_gpu_process_pool_worker_and_dispatch`), while live 2-GPU wall-time measurement on `fan93` was skipped after host GPU `2` entered a PCIe/NVML hardware fault (`0000:56:00.0: Unknown Error`).
