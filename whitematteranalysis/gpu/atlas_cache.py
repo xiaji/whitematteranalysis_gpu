@@ -24,7 +24,8 @@ def _implementation(backend, float32, device_index, device_type='cuda'):
     digest = hashlib.sha256()
     for name in files:
         digest.update((root / name).read_bytes())
-    features = sorted(name for name, enabled in np.core._multiarray_umath.__cpu_features__.items() if enabled)
+    np_core = getattr(np, '_core', np.core)
+    features = sorted(name for name, enabled in np_core._multiarray_umath.__cpu_features__.items() if enabled)
     versions = [sys.platform, platform.machine(), platform.libc_ver(), features,
                 np.__version__, backend, float32, digest.hexdigest()]
     if backend == 'gpu':

@@ -60,20 +60,31 @@ See [doc/acceleration.md](doc/acceleration.md#phase-2-benchmarks-fan93-rtx-3090)
 
 This package uses a modern PEP 621 [pyproject.toml](pyproject.toml) (pure Python — no C/C++ compilation required).
 
-### Recommended installation (GPU or CPU)
+### Recommended installation (Conda GPU environment or `uv` / `venv`)
+
+In an existing Conda GPU environment with CUDA PyTorch already installed:
 
 ```shell
-# 1. (GPU only) Create an isolated venv and install the CUDA-enabled PyTorch build matching your driver first
-#    Example for CUDA 12.8 with uv (or use python -m venv + pip):
+conda activate <your-gpu-env>
+
+# Install directly from GitHub (preserves existing CUDA PyTorch and Conda packages)
+pip install --no-build-isolation "git+https://github.com/xiaji/whitematteranalysis_gpu.git@main"
+# Optional extras: [h5] for ITK .h5 transforms, [dev] for pytest, [doc] for Sphinx
+# pip install --no-build-isolation "whitematteranalysis[h5] @ git+https://github.com/xiaji/whitematteranalysis_gpu.git@main"
+
+# Verify Python, VTK, PyTorch/CUDA, Triton, and atlas cache status
+wma doctor
+```
+
+Or in a fresh `uv` / `venv` environment:
+
+```shell
+# 1. (GPU only) Install the CUDA-enabled PyTorch build matching your driver first
 uv venv .venv && source .venv/bin/activate
 uv pip install torch --index-url https://download.pytorch.org/whl/cu128
 
-# 2. Install directly from GitHub (or locally with `pip install -e .` for development)
+# 2. Install from GitHub (or locally with `pip install --no-build-isolation -e ".[h5]"`)
 uv pip install "git+https://github.com/xiaji/whitematteranalysis_gpu.git@main"
-# Optional extras: [h5] for ITK .h5 transforms, [dev] for pytest, [doc] for Sphinx
-# uv pip install -e ".[h5]"
-
-# 3. Verify Python, VTK, PyTorch/CUDA, Triton, and atlas cache status
 wma doctor
 ```
 
