@@ -32,11 +32,11 @@ CPU outputs were byte-identical to joblib. GPU membership, connectivity and
 attributes matched; maximum coordinate difference: **1.91e-6 mm**.
 See the [acceleration overview](doc/acceleration.md) for details.
 
-### Single-process ORG CLI & Phase 2–4 GPU updates (`fan93`, 2x RTX 3090)
+### Single-process ORG CLI & Phase 2–5 GPU updates (`fan93`, 2x RTX 3090)
 
-For tensor-free rigid ORG parcellation (single-subject or persistent multi-subject batch),
+For tensor-free rigid or nonrigid ORG parcellation (single-subject or persistent multi-subject batch),
 [bin/wm_apply_ORG_atlas.py](bin/wm_apply_ORG_atlas.py) runs registration, spectral clustering,
-outlier removal, pure-Python affine hardening, hemisphere separation and anatomical tract
+outlier removal, pure-Python/VTK affine or BSpline hardening, hemisphere separation and anatomical tract
 assembly in a single Python process with no 3D Slicer or SlicerDMRI subprocesses required
 (recording `qc_summary.json` / `batch_qc_summary.json` and publishing atomically by default):
 
@@ -50,7 +50,9 @@ wm_apply_ORG_atlas.py --input-dir subjects/ -o batch_out -a /path/to/ORG-Atlases
 
 Phase 4 adds three P0 end-to-end optimizations—**zero-intermediate indexed ORG parcellation** (`--keep-intermediates 0` skipping 800-cluster VTK materialization and per-cluster affine/hemisphere copies), a **`1.2 MiB` binary `.npz` spectral atlas inference cache** (`WMA_ATLAS_CACHE/spectral-atlas/`) with **GPU-resident atlas prep**, and **persistent multi-subject batch mode** (`-i <dir>` / `--input-dir` / `--input-list`). On `sub-13086` (**340,795 streamlines**, `ORG-RegAtlas-100HCP` + `ORG-800FC-100HCP`, dual NVIDIA RTX 3090, `-r rig -j 4 -gpu on`), end-to-end wall time drops from Phase 2's **2:05.21 (125.21 s)** (`90.237 s` `clustering`) to **39.76 s** (cold cache, `float64`), **29.78 s** (warm cache, `float64`, **`4.20x` speedup** with **`28.5x` faster clustering** at `3.171 s`), and **25.12 s** (warm cache, `-gpu_float32`, **`0.996 s` clustering**) with identical `76` `AnatomicalTracts/T_*.vtp` bundles (`max_coord_diff = 0.000e+00` vs `--keep-intermediates 2` on real 5k parity test). In persistent 2-subject batch mode (`sub-13001` 326k + `sub-13086` 341k fibers, warm `float64`), both whole-brain subjects complete in **55.30 s** total (`21.19 s` for `sub-13086`).
 
-In earlier Phase 2–3 updates on RTX 3090, WMA also added FP32 + arbitrary `1 <= P <= 64` Triton kernels, split-C low-VRAM `nearest_centroids` (`88x–111x` vs `torch.cdist` in `float32`), multi-GPU labeling/outlier dispatch, cached 1D separable GPU B-spline prefiltering + 1-thread-per-point Triton kernel + `WMA_NONRIGID_ANALYTIC_GRAD=1` L-BFGS-B gradients (`10.89x` faster at `R=4`) and vectorized `105^3` `.tfm` export, GPU `pinv_A` reuse + `O(N)` LOO similarity (`4.82x` faster), and validated multi-atlas support (`--atlas-family {auto,org,east-west,naba}` yielding `76` / `76` / `78` `T_*.vtp` bundles). See [doc/acceleration.md](doc/acceleration.md#phase-2-benchmarks-fan93-rtx-3090), [Phase 3 benchmarks](doc/acceleration.md#phase-3-benchmarks-fan93-rtx-3090), and [Phase 4 (P0) benchmarks](doc/acceleration.md#phase-4-p0-benchmarks-fan93-rtx-3090) for complete Benchmarks A–G tables.
+In earlier Phase 2–3 updates on RTX 3090, WMA also added FP32 + arbitrary `1 <= P <= 64` Triton kernels, split-C low-VRAM `nearest_centroids` (`88x–111x` vs `torch.cdist` in `float32`), multi-GPU labeling/outlier dispatch, cached 1D separable GPU B-spline prefiltering + 1-thread-per-point Triton kernel + `WMA_NONRIGID_ANALYTIC_GRAD=1` L-BFGS-B gradients (`10.89x` faster at `R=4`) and vectorized `105^3` `.tfm` export, GPU `pinv_A` reuse + `O(N)` LOO similarity (`4.82x` faster), and validated multi-atlas support (`--atlas-family {auto,org,east-west,naba}` yielding `76` / `76` / `78` `T_*.vtp` bundles). Phase 5 extends Slicer-free execution and high-resolution nonrigid / atlas-construction scaling (**P1**): **Slicer-free `-r nonrig` hardening** (`read_itk_transform_ras` for ITK `BSplineTransform`/`CompositeTransform` `.tfm`/`.h5` plus `apply_transform_to_polydata`, completing `5,000`-fiber `-r nonrig` without `-s` in **54.26 s** with `0.000e+00` coordinate delta vs `--keep-intermediates 2`, and standalone `800`-cluster `105^3` BSpline hardening in **3.337 s**), a **fused `O(N + R^3)` Triton backward kernel** for `NonrigidObjective.value_and_gradient` (`4000 x 4000` / `8000 x 8000` at **2.27x–2.30x** speedup with **74x–113x** lower VRAM in `float64`, and **5.42x–8.12x** speedup with **64x–139x** lower VRAM in `float32`), and **PSD-skip + GPU batched `kmeans2`** in `cluster.spectral` (**8.22x** faster at `N=50,000, k=800` with `0` label diffs).
+
+See [doc/acceleration.md](doc/acceleration.md#phase-2-benchmarks-fan93-rtx-3090), [Phase 3 benchmarks](doc/acceleration.md#phase-3-benchmarks-fan93-rtx-3090), [Phase 4 (P0) benchmarks](doc/acceleration.md#phase-4-p0-benchmarks-fan93-rtx-3090), and [Phase 5 (P1) benchmarks](doc/acceleration.md#phase-5-p1-benchmarks-fan93-rtx-3090) for complete Benchmarks A–H tables.
 
 # GPU and 3D Slicer quick start
 
@@ -160,7 +162,7 @@ The upstream `whitematteranalysis` documentation can be found at
 https://whitematteranalysis.readthedocs.io/en/latest/.
 Use the guides above for acceleration and Slicer behavior specific to this fork.
 
-* For automated subject-specific ORG parcellation without SlicerDMRI in tensor-free rigid mode (falling back to 3D Slicer automatically wrapped with `xvfb-run -a` on headless Linux only for nonrigid mode, non-linear `.tfm` pre-transforms, or tensor-bearing inputs), use the single-process CLI [bin/wm_apply_ORG_atlas.py](bin/wm_apply_ORG_atlas.py):
+* For automated subject-specific ORG parcellation without SlicerDMRI in tensor-free rigid or nonrigid mode (falling back to 3D Slicer automatically wrapped with `xvfb-run -a` on headless Linux only for tensor-bearing inputs or unsupported non-linear pre-transforms), use the single-process CLI [bin/wm_apply_ORG_atlas.py](bin/wm_apply_ORG_atlas.py):
 
 ```shell
 $ wm_apply_ORG_atlas.py \
@@ -173,7 +175,7 @@ $ wm_apply_ORG_atlas.py \
   -gpu on
 ```
 
-`--atlas-family` accepts `{auto,org,east-west,naba}` (default `auto`, reading `ATLAS.json` or atlas subdirectory layout and validating cluster/MRML consistency before running). For standalone linear `.tfm` hardening without 3D Slicer (on tensor-free files), `wm_harden_transform.py` also accepts `--pure-python` or `Slicer=none`/`auto`.
+`--atlas-family` accepts `{auto,org,east-west,naba}` (default `auto`, reading `ATLAS.json` or atlas subdirectory layout and validating cluster/MRML consistency before running). For standalone linear, BSpline, or composite `.tfm` hardening without 3D Slicer (on tensor-free files), `wm_harden_transform.py` also accepts `--pure-python` or `Slicer=none`/`auto`.
 
 * The legacy master shell script `wm_apply_ORG_atlas_to_subject.sh` (see code [here](bin/wm_apply_ORG_atlas_to_subject.sh)) remains available for SlicerDMRI-based multi-stage workflows and `FiberTractMeasurements`:
 

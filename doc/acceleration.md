@@ -37,7 +37,11 @@ repeated objective evaluation is faster because:
   uses an unrolled 1-thread-per-point Triton kernel (`tl.int64`, `float64`/`float32`),
   cached 1D separable GPU coefficient prefiltering (bypassed under `WMA_GPU_STRICT=1`
   to match VTK's `float32`-output `vtkImageBSplineCoefficients` path), opt-in
-  `WMA_NONRIGID_ANALYTIC_GRAD=1` analytic `value_and_gradient` for L-BFGS-B, and
+  `WMA_NONRIGID_ANALYTIC_GRAD=1` analytic `value_and_gradient` for L-BFGS-B
+  (backed by a fused `O(N + R^3)` Triton backward kernel
+  `pairwise_probability_sums_and_weighted_fixed` in `registration_kernel.py`
+  and chunked vectorized B-spline coefficient scatter in `bspline.py`, avoiding
+  `O(N_m x N_f)` intermediate probability matrices), and
   vectorized `105^3` ITK `.tfm` export (`whitematteranalysis/io.py`), avoiding per-point
   Python/VTK loops. These paths support nonrigid registration; the README's `rig`
   benchmark measures rigid plus affine only.
@@ -170,14 +174,17 @@ Source: [outlier command](../bin/wm_cluster_remove_outliers.py),
 Hemisphere assessment, transform hardening, hemisphere separation and anatomical
 tract assembly run on the CPU:
 
-- **Tier 1 (SlicerDMRI-free pure-Python affine):** [whitematteranalysis/transform.py](../whitematteranalysis/transform.py)
-  provides `has_tensor_arrays`, LPS-to-RAS linear ITK `.tfm` parsing
-  (`read_itk_affine_matrix_ras`), and bounded-chunk `float64`
-  `apply_affine_to_polydata` (used by `congeal_to_atlas.py`,
+- **Tier 1 (SlicerDMRI-free pure-Python / VTK linear & nonrigid):**
+  [whitematteranalysis/transform.py](../whitematteranalysis/transform.py)
+  provides `has_tensor_arrays`, LPS-to-RAS ITK transform parsing
+  (`read_itk_affine_matrix_ras` and `read_itk_transform_ras` for linear,
+  3D cubic `BSplineTransform`, and `CompositeTransform` `.tfm`/`.h5` files),
+  `compose_ras_transforms`, `apply_affine_to_polydata` (bounded-chunk `float64`),
+  and `apply_transform_to_polydata` (used by `congeal_to_atlas.py`,
   `wm_harden_transform.py --pure-python` / `Slicer=none`/`auto`, and
-  `bin/wm_apply_ORG_atlas.py` in tensor-free `-r rig` mode). Any tensor, vector,
-  normal, or 9-component array triggers automatic fallback to
-  `vtkTransformPolyDataFilter` / 3D Slicer.
+  `bin/wm_apply_ORG_atlas.py` in both `-r rig` and `-r nonrig` tensor-free modes).
+  Tensor-bearing inputs or unsupported pre-transforms trigger automatic fallback
+  to `vtkTransformPolyDataFilter` / 3D Slicer.
 - **Tier 2 (`vtkMRMLModelNode` fallback without SlicerDMRI):**
   [bin/harden_transform_with_slicer.py](../bin/harden_transform_with_slicer.py)
   falls back to `vtkMRMLModelNode` when `vtkMRMLFiberBundleNode` is unavailable,
@@ -318,11 +325,16 @@ silently falling back to CPU.
 ## Atlas construction & multi-atlas support
 
 - **Spectral atlas construction (`cluster.spectral` / `wm_cluster_atlas.py`):**
-  `nearPSD` uses symmetric `gpu.linalg.eigh`; Nyström clustering reuses `(e_val_a,
-  e_vec_a)` for `pinv_A` and projects only the top `k + 1` columns in column tiles via
+  `nearPSD` uses symmetric `gpu.linalg.eigh` and skips redundant `nearPSD` +
+  second `eigh` when `A` is already numerically PSD (`min_eig >= -1e-12 * max_eig`)
+  with unit diagonal; Nyström clustering reuses `(e_val_a, e_vec_a)` for `pinv_A`
+  and projects only the top `k + 1` columns in column tiles via
   `gpu.linalg.nystrom_normalize_and_embed_top`, avoiding full `N x m` host copies.
-  Leave-one-out cluster outlier scoring (`compute_cluster_loo_similarity`) uses an
-  `O(N)` GPU path via `similarity_row_sums_from_arrays` when `distance_method == 'Mean'`
+  In GPU mode, K-means clustering dispatches to `gpu.linalg.kmeans2` (reusing the
+  Split-C Triton `nearest_centroids` kernel when `1 <= D <= 32` with `torch.bincount`
+  / `index_add_` centroid updates). Leave-one-out cluster outlier scoring
+  (`compute_cluster_loo_similarity`) uses an `O(N)` GPU path via
+  `similarity_row_sums_from_arrays` when `distance_method == 'Mean'`
   and `return_distances == False`, and `output_and_quality_control_cluster_atlas`
   writes cluster VTPs in parallel via `write_polydatas_parallel`.
 - **Declarative multi-atlas registry (`whitematteranalysis/atlases.py`):** Supports
@@ -503,3 +515,36 @@ Spawn process-pool dispatch matches single-GPU transforms bitwise
 (`0.000e+00`), while fixed spawn/IPC startup overhead (`~3.2 s`) exceeds the
 compute runtime for small `4 x 2,000` COBYLA workloads and is intended for longer
 large-cohort linear registration jobs.
+
+## Phase 5 (P1) benchmarks (`fan93`, RTX 3090)
+
+Measured on `fan93` (dual `NVIDIA GeForce RTX 3090` GPUs `0, 4`, PyTorch `2.8.0+cu128`,
+Triton `3.4.0`, SciPy `1.13.1`, NumPy `2.0.2`, VTK `9.6.2`) using geometry-only
+`sub-13086` and `ORG-RegAtlas-100HCP` + `ORG-800FC-100HCP`.
+
+### Benchmark H1: Slicer-free `-r nonrig` ORG pipeline & standalone BSpline hardening (`5,000`-fiber `sub-13086`, GPUs `0, 4`, `-j 4 -gpu on`, `WMA_NONRIGID_ANALYTIC_GRAD=1`)
+
+| Run / Mode | Wall Time | `hardening_backend` | Peak RSS | Parity / Notes |
+| --- | ---: | --- | ---: | --- |
+| `wm_apply_ORG_atlas.py -r nonrig --keep-intermediates 0` (no `-s`) | **0:54.26** (`51.552 s` stage total) | `pure_python_vtk_nonrigid` | `3,402.33 MiB` | `76 / 76` `T_*.vtp` (`859` fibers); `registration = 25.050 s`, `hardening_and_separation = 22.641 s` |
+| `wm_apply_ORG_atlas.py -r nonrig --keep-intermediates 2` (no `-s`) | `3:06.73` (`183.707 s` stage total) | `pure_python_vtk_nonrigid` | `3,403.20 MiB` | `max_coord_diff = 0.000e+00` vs `--keep-intermediates 0` across all 76 bundles |
+| Standalone `wm_harden_transform.py --pure-python -i -j 4` (800 clusters, `105^3` BSpline `.tfm`) | **3.337 s** | `pure-Python/VTK nonrigid` | — | `max_diff_vs_vtk_filter = 0.000e+00` vs `vtkTransformPolyDataFilter` |
+
+### Benchmark H2: Fused `O(N + R^3)` Triton backward vs eager strict PyTorch (`NonrigidObjective.value_and_gradient`, GPU `0`, `R=6, P=10`)
+
+| Dtype | `(N_m, N_f)` | Strict Eager (`WMA_GPU_STRICT=1`) | Fused Triton (`WMA_GPU_STRICT=0`) | Speedup | VRAM Reduction | `loss_diff` / `grad_max_diff` |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `float64` | `(1000, 500)` | `3.641 ms` (`80.57 MiB`) | `3.599 ms` (`21.74 MiB`) | `1.01x` | **3.71x** | `0.00e+00` / `3.91e-14` |
+| `float64` | `(4000, 4000)` | `79.969 ms` (`2,565.31 MiB`) | **34.762 ms** (`34.59 MiB`) | **2.30x** | **74.16x** | `0.00e+00` / `6.04e-14` |
+| `float64` | `(8000, 8000)` | `303.877 ms` (`4,109.84 MiB`) | **134.046 ms** (`36.42 MiB`) | **2.27x** | **112.84x** | `0.00e+00` / `6.39e-14` |
+| `float32` | `(1000, 500)` | `3.165 ms` (`40.29 MiB`) | `2.154 ms` (`13.50 MiB`) | **1.47x** | **2.98x** | `0.00e+00` / `1.72e-05` |
+| `float32` | `(4000, 4000)` | `36.440 ms` (`1,282.66 MiB`) | **6.719 ms** (`19.88 MiB`) | **5.42x** | **64.50x** | `0.00e+00` / `4.58e-05` |
+| `float32` | `(8000, 8000)` | `131.580 ms` (`2,861.63 MiB`) | **16.210 ms** (`20.59 MiB`) | **8.12x** | **139.00x** | `0.00e+00` / `3.81e-05` |
+
+### Benchmark H3: GPU batched `kmeans2` & `cluster.spectral` (GPU `0`, `D=10`, `n_iter=10`)
+
+| Workload / Shape | CPU (`scipy` / vectorized CPU) | GPU (`linalg.kmeans2` / CUDA) | Speedup | Numerical Parity |
+| --- | ---: | ---: | ---: | --- |
+| `kmeans2` (`10,000` pts, `k=200`, `D=10`) | `0.075 s` | `0.032 s` | **2.34x** | `0` label diffs; `centroid_max_diff = 1.33e-15` |
+| `kmeans2` (`50,000` pts, `k=800`, `D=10`) | `1.411 s` | `0.172 s` | **8.22x** | `0` label diffs; `centroid_max_diff = 1.33e-15` |
+| `cluster.spectral` (`10,000` `sub-13086` fibers, `m=1500, k=200, bilateral=True`) | `1.820 s` | `1.484 s` | **1.23x** | — |
