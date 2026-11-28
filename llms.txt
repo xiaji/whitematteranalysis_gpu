@@ -6,7 +6,7 @@
 
 - [README.md](README.md): Overview, RTX 3090 benchmarks, and quick start across CLI, Python SDK, and Docker/Apptainer.
 - [AGENTS.md](AGENTS.md): Machine-readable integration contract, JSON CLI probes, I/O schemas, exit codes, and resource controls for AI agents.
-- [pyproject.toml](pyproject.toml): PEP 621 package metadata, dependencies, optional extras (`gpu`, `h5`, `dev`, `doc`), and `wma` console script.
+- [pyproject.toml](pyproject.toml): PEP 621 package metadata, dependencies, optional extras (`gpu`, `h5`, `dev`), and `wma` console script.
 - [Dockerfile](Dockerfile): Multi-target container build (`gpu` default CUDA 12.4 / optional CUDA 12.8, plus lightweight `cpu` target).
 
 ## Code Map
@@ -20,6 +20,6 @@
 ## Technical Docs
 
 - [doc/acceleration.md](doc/acceleration.md): GPU/CPU acceleration architecture and Benchmarks A–H.
-- [doc/command-line-reference.md](doc/command-line-reference.md): Complete argument reference for all 28 `bin/` CLI scripts.
+- [doc/command-line-reference.md](doc/command-line-reference.md): Complete argument reference for `bin/` CLI scripts.
 - [doc/bundles.md](doc/bundles.md): Anatomical white matter tract definitions.
-- [doc/subject-specific-tractography-parcellation.md](doc/subject-specific-tractography-parcellation.md): Step-by-step parcellation pipeline guide.
+- [NOTICE](NOTICE): Upstream provenance and contributor attribution (`SlicerDMRI/whitematteranalysis`, `NeuroDMRI/whitematteranalysis_gpu`, `xiaji`).

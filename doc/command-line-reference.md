@@ -1,7 +1,7 @@
 # Command-line reference
 
 This reference covers all **28 top-level scripts in `bin/`**, including the
-internal Slicer transform helper. `bin/tests/` contains tests, not user commands.
+internal Slicer transform helper.
 Each entry describes the current implementation, its arguments, output and an
 example. Defaults below are effective runtime defaults, including defaults set
 after argument parsing. Flag spelling and capitalization matter.
@@ -9,7 +9,7 @@ after argument parsing. Flag spelling and capitalization matter.
 ## Before running commands
 
 Install this checkout with `python -m pip install .`; see the
-[README](../README.md#python--command-line) for CPU/GPU dependencies. Examples
+[README](../README.md#1-command-line-interface-conda--pip--uv) for CPU/GPU dependencies. Examples
 below run from the repository root and use placeholder paths. Replace these with
 your files. Installed Python scripts can also be invoked directly, for example
 `wm_cluster_from_atlas.py --help`. The shell pipeline calls these installed

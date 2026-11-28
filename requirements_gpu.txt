@@ -1,4 +1,0 @@
-# Install the CUDA-enabled PyTorch build appropriate for your driver first.
-# Existing compatible PyTorch installations are reused, regardless of CUDA version.
--r requirements_cpu.txt
-torch>=2.4.1

@@ -11,6 +11,9 @@
 
 [Overview](#overview) · [Benchmarks](#benchmarks) · [CLI](#1-command-line-interface-conda--pip--uv) · [Python SDK](#2-python-sdk-whitematteranalysispipelines) · [Docker & HPC](#3-docker--apptainer-hpc) · [Configuration](#configuration) · [Docs](#documentation) · [FAQ](#faq) · [Citation](#citation--attribution)
 
+> [!NOTE]
+> **Upstream Provenance & Attribution**: This repository is built upon the original **[SlicerDMRI/whitematteranalysis](https://github.com/SlicerDMRI/whitematteranalysis)** codebase by Lauren J. O'Donnell, Fan Zhang, Isaiah Norton, and contributors (Brigham and Women's Hospital, [3D Slicer License v1.0](License.txt)) and the initial GPU/CPU acceleration foundation from **[NeuroDMRI/whitematteranalysis_gpu](https://github.com/NeuroDMRI/whitematteranalysis_gpu)** by Yijie Li. It extends them with custom Triton kernels, Slicer-free nonrigid parcellation, a Python SDK, container images, and agent-first CLI tooling. See [NOTICE](NOTICE) for full provenance details.
+
 ---
 
 ## Overview
@@ -253,9 +256,9 @@ CLI flags (`-gpu`, `-gpu_float32`, `-gpu_devices`) take precedence when passed e
 
 - [Agent Integration Guide (`AGENTS.md`)](AGENTS.md) & [`llms.txt`](llms.txt)
 - [Acceleration Architecture & Benchmarks A–H](doc/acceleration.md)
-- [Command-Line Reference (28 `bin/` Scripts)](doc/command-line-reference.md)
-- [Subject-Specific Tractography Parcellation Guide](doc/subject-specific-tractography-parcellation.md)
+- [Command-Line Reference (`bin/` Scripts)](doc/command-line-reference.md)
 - [Anatomical White Matter Bundles](doc/bundles.md)
+- [Provenance & Attribution Notice (`NOTICE`)](NOTICE)
 
 ---
 

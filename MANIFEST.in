@@ -1,9 +1,11 @@
 include License.txt
+include NOTICE
+include CITATION.cff
 include README.md
+include AGENTS.md
+include llms.txt
 include pyproject.toml
-include requirements_cpu.txt
-include requirements_gpu.txt
 include bin/*.py
 include utilities/*.py
-recursive-include doc *
+recursive-include doc *.md
 global-exclude __pycache__ *.py[cod]

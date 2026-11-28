@@ -45,13 +45,7 @@ h5 = [
 ]
 dev = [
     "pytest>=7.0",
-    "pytest-console-scripts",
     "setuptools>=64",
-]
-doc = [
-    "sphinx",
-    "sphinx-argparse",
-    "sphinx_rtd_theme",
 ]
 all = [
     "h5py>=3.7.0",
