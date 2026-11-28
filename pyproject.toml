@@ -118,3 +118,6 @@ version = { attr = "whitematteranalysis.__version__" }
 [tool.setuptools.packages.find]
 include = ["whitematteranalysis*"]
 exclude = ["tests*", "bin*", "slicer*", "utilities*"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "tests"]

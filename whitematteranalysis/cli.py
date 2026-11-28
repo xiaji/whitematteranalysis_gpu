@@ -8,6 +8,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import sysconfig
 
 from . import __version__
 
@@ -269,18 +270,30 @@ def format_doctor_report(info):
 def resolve_script(script_name):
     """Locate an installed or source-tree WMA script by filename."""
     candidates = []
+    scripts_dir = sysconfig.get_path('scripts')
+    if scripts_dir:
+        candidates.append(Path(scripts_dir) / script_name)
+    if sys.executable:
+        exe_path = Path(sys.executable)
+        candidates.append(exe_path.parent / script_name)
     if sys.argv and sys.argv[0]:
-        argv_dir = Path(sys.argv[0]).resolve().parent
-        candidates.append(argv_dir / script_name)
-    exe_dir = Path(sys.executable).resolve().parent
-    candidates.append(exe_dir / script_name)
+        argv_path = Path(sys.argv[0])
+        candidates.append(argv_path.parent / script_name)
+        candidates.append(argv_path.resolve().parent / script_name)
+    if sys.executable:
+        candidates.append(Path(sys.executable).resolve().parent / script_name)
     repo_root = Path(__file__).resolve().parents[1]
     candidates.append(repo_root / 'bin' / script_name)
     candidates.append(repo_root / 'utilities' / script_name)
 
+    seen = set()
     for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
         if path.is_file():
-            return str(path)
+            return key
     found = shutil.which(script_name)
     if found:
         return found

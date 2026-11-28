@@ -18,11 +18,18 @@ from whitematteranalysis.pipelines import (
     parcellate_batch,
     parcellate_subject,
 )
-from tests.test_org_pipeline_cli import (
-    _build_synthetic_org_atlas,
-    _bundle_coords,
-    _make_tract_polydata,
-)
+try:
+    from test_org_pipeline_cli import (
+        _build_synthetic_org_atlas,
+        _bundle_coords,
+        _make_tract_polydata,
+    )
+except ImportError:
+    from tests.test_org_pipeline_cli import (
+        _build_synthetic_org_atlas,
+        _bundle_coords,
+        _make_tract_polydata,
+    )
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -172,6 +179,89 @@ class PipelinesSDKTests(unittest.TestCase):
                     continue_on_error=False,
                 )
             self.assertTrue((out_failfast / 'batch_qc_summary.json').is_file())
+
+    def test_gpu_config_is_scoped_per_pipeline_run_and_restored(self):
+        with tempfile.TemporaryDirectory(prefix='wma_sdk_gpu_scope_') as tmp:
+            root = Path(tmp)
+            atlas_dir = root / 'atlas'
+            _build_synthetic_org_atlas(atlas_dir)
+            subj_path = root / 'sub-scope.vtp'
+            _write_synthetic_subject(subj_path, seed_offset=4)
+
+            gpu_cfg = wma.gpu.config
+            orig_state = (
+                gpu_cfg.requested,
+                gpu_cfg.float32,
+                gpu_cfg.strict,
+                list(gpu_cfg.devices) if gpu_cfg.devices is not None else None,
+                gpu_cfg.device_index,
+            )
+            try:
+                gpu_cfg.requested = None
+                gpu_cfg.float32 = False
+                gpu_cfg.strict = False
+                gpu_cfg.devices = None
+
+                cpu_pipe = ORGParcellationPipeline(
+                    atlas_dir, gpu=False, gpu_float32=False, gpu_strict=False, jobs=1
+                )
+                gpu_pipe = ORGParcellationPipeline(
+                    atlas_dir, gpu=True, gpu_float32=True, gpu_strict=True, gpu_devices=[1, 0], jobs=1
+                )
+                # Constructing gpu_pipe must not mutate process-global GPU config.
+                self.assertIsNone(gpu_cfg.requested)
+                self.assertFalse(gpu_cfg.float32)
+                self.assertFalse(gpu_cfg.strict)
+                self.assertIsNone(gpu_cfg.devices)
+
+                observed = {}
+
+                def _fake_run_subject(case_id, input_path, args, session, workers, slicer_path):
+                    observed['requested'] = wma.gpu.config.requested
+                    observed['float32'] = wma.gpu.config.float32
+                    observed['strict'] = wma.gpu.config.strict
+                    observed['devices'] = list(wma.gpu.config.devices) if wma.gpu.config.devices is not None else None
+                    out_d = Path(args.output) / case_id
+                    (out_d / 'AnatomicalTracts').mkdir(parents=True, exist_ok=True)
+                    return out_d, {'tracts': {}, 'retained_clustered_fibers': 0, 'stage_timings_s': {}}
+
+                with patch('whitematteranalysis.pipelines.org._run_subject', side_effect=_fake_run_subject):
+                    gpu_pipe.run(subj_path, root / 'out_gpu')
+                    self.assertEqual(observed, {
+                        'requested': True,
+                        'float32': True,
+                        'strict': True,
+                        'devices': [1, 0],
+                    })
+                    # Global state restored immediately after gpu_pipe.run().
+                    self.assertIsNone(gpu_cfg.requested)
+                    self.assertFalse(gpu_cfg.float32)
+                    self.assertFalse(gpu_cfg.strict)
+                    self.assertIsNone(gpu_cfg.devices)
+
+                    gpu_pipe.close()
+                    cpu_pipe.run(subj_path, root / 'out_cpu')
+                    self.assertEqual(observed, {
+                        'requested': False,
+                        'float32': False,
+                        'strict': False,
+                        'devices': None,
+                    })
+                    cpu_pipe.close()
+
+                # Global state remains untouched after both runs.
+                self.assertIsNone(gpu_cfg.requested)
+                self.assertFalse(gpu_cfg.float32)
+                self.assertFalse(gpu_cfg.strict)
+                self.assertIsNone(gpu_cfg.devices)
+            finally:
+                (
+                    gpu_cfg.requested,
+                    gpu_cfg.float32,
+                    gpu_cfg.strict,
+                    gpu_cfg.devices,
+                    gpu_cfg.device_index,
+                ) = orig_state
 
 
 if __name__ == '__main__':

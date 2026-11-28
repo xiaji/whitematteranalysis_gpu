@@ -108,6 +108,36 @@ class WMACLITests(unittest.TestCase):
         self.assertTrue(called_cmd[1].endswith('wm_apply_ORG_atlas.py'))
         self.assertEqual(called_cmd[2:], ['--help'])
 
+    def test_resolve_script_preserves_unactivated_venv_symlink_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='wma_venv_resolve_') as tmp:
+            root = Path(tmp)
+            real_bin = root / 'real_python' / 'bin'
+            venv_bin = root / 'venv' / 'bin'
+            real_bin.mkdir(parents=True)
+            venv_bin.mkdir(parents=True)
+            real_py = real_bin / 'python3'
+            real_py.write_text('#!/bin/sh\n', encoding='utf-8')
+            venv_py = venv_bin / 'python3'
+            venv_py.symlink_to(real_py)
+            fake_script = venv_bin / 'wm_unique_venv_test_script.py'
+            fake_script.write_text('#!/usr/bin/env python\n', encoding='utf-8')
+
+            with patch.object(cli.sysconfig, 'get_path', return_value=str(real_bin)), \
+                    patch.object(cli.sys, 'executable', str(venv_py)), \
+                    patch.object(cli.sys, 'argv', ['-m']), \
+                    patch.object(cli.shutil, 'which', return_value=None):
+                resolved = cli.resolve_script('wm_unique_venv_test_script.py')
+            self.assertEqual(resolved, str(fake_script))
+
+            # Also verify sysconfig scripts dir takes priority when present.
+            with patch.object(cli.sysconfig, 'get_path', return_value=str(venv_bin)), \
+                    patch.object(cli.sys, 'executable', str(real_py)), \
+                    patch.object(cli.sys, 'argv', ['-m']), \
+                    patch.object(cli.shutil, 'which', return_value=None):
+                resolved = cli.resolve_script('wm_unique_venv_test_script.py')
+            self.assertEqual(resolved, str(fake_script))
+
     def test_unknown_command_returns_exit_2(self):
         buf = io.StringIO()
         with patch('sys.stderr', buf):

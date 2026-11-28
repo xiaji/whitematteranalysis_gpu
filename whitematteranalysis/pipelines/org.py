@@ -1415,19 +1415,35 @@ def _write_batch_summary(output_root, batch_summary):
     return summary_path
 
 
-def _apply_sdk_gpu_config(cfg):
-    if cfg.gpu is not None:
-        wma.gpu.set_gpu(cfg.gpu)
-    if cfg.gpu_float32 is not None:
-        wma.gpu.set_float32(bool(cfg.gpu_float32))
-    if cfg.gpu_strict is not None:
-        wma.gpu.set_strict(bool(cfg.gpu_strict))
-    if cfg.gpu_devices is not None:
-        if isinstance(cfg.gpu_devices, (list, tuple)):
-            devices_arg = ','.join(str(int(d)) for d in cfg.gpu_devices)
-        else:
-            devices_arg = str(cfg.gpu_devices)
-        wma.gpu.set_devices(devices_arg)
+@contextlib.contextmanager
+def _scoped_sdk_gpu_config(cfg):
+    """Temporarily apply ``ORGConfig`` GPU overrides and restore global state."""
+    gpu_cfg = wma.gpu.config
+    prev_requested = gpu_cfg.requested
+    prev_float32 = gpu_cfg.float32
+    prev_strict = gpu_cfg.strict
+    prev_devices = list(gpu_cfg.devices) if gpu_cfg.devices is not None else None
+    prev_device_index = gpu_cfg.device_index
+    try:
+        if cfg.gpu is not None:
+            wma.gpu.set_gpu(cfg.gpu)
+        if cfg.gpu_float32 is not None:
+            wma.gpu.set_float32(bool(cfg.gpu_float32))
+        if cfg.gpu_strict is not None:
+            wma.gpu.set_strict(bool(cfg.gpu_strict))
+        if cfg.gpu_devices is not None:
+            if isinstance(cfg.gpu_devices, (list, tuple)):
+                devices_arg = ','.join(str(int(d)) for d in cfg.gpu_devices)
+            else:
+                devices_arg = str(cfg.gpu_devices)
+            wma.gpu.set_devices(devices_arg)
+        yield
+    finally:
+        gpu_cfg.requested = prev_requested
+        gpu_cfg.float32 = prev_float32
+        gpu_cfg.strict = prev_strict
+        gpu_cfg.devices = prev_devices
+        gpu_cfg.device_index = prev_device_index
 
 
 @dataclass
@@ -1635,7 +1651,6 @@ class ORGParcellationPipeline:
                 gpu_strict=gpu_strict,
                 verbose=verbose,
             )
-        _apply_sdk_gpu_config(self.config)
         self._workers = _effective_workers(self.config.jobs)
         self._slicer_path = _resolve_slicer_executable(
             str(self.config.slicer) if self.config.slicer is not None else None
@@ -1665,9 +1680,10 @@ class ORGParcellationPipeline:
             raise FileNotFoundError(f'Input tractography file does not exist: {input_path}')
         resolved_case_id = str(case_id) if case_id is not None else os.path.splitext(input_path.name)[0]
         ns = self.config._to_namespace(output_dir=output_dir, transform=transform)
-        final_dir, qc = _run_subject(
-            resolved_case_id, input_path, ns, self._session, self._workers, self._slicer_path
-        )
+        with _scoped_sdk_gpu_config(self.config):
+            final_dir, qc = _run_subject(
+                resolved_case_id, input_path, ns, self._session, self._workers, self._slicer_path
+            )
         tracts_dir = final_dir / 'AnatomicalTracts'
         tract_paths = {name: tracts_dir / name for name in qc.get('tracts', {})}
         return SubjectResult(
