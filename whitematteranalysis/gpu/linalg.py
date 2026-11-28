@@ -16,6 +16,7 @@ is far below the level that affects cluster labels.
 """
 
 import os
+import warnings
 
 import numpy
 
@@ -304,3 +305,78 @@ def atlas_label_embedding_blocks(blocks, atlas, number_fibers, gpu_float32=None,
     embed, rows, columns, labels, distances = _unpack_atlas_results(
         embed_g, rows_g, columns_g, labels_g, distances_g)
     return embed, labels, distances, numpy.concatenate((atlas.row_sum_1, rows)), columns
+
+
+@SmallPages()
+def kmeans2(data, k, n_iter=10, gpu_float32=None, device=None, init_centroids=None, seed=None):
+    """GPU-accelerated K-means matching ``scipy.cluster.vq.kmeans2(..., minit='points')`` semantics."""
+    if torch is None:
+        raise RuntimeError("torch is not available, cannot use the GPU linalg backend.")
+    if int(n_iter) < 1:
+        raise ValueError(f"Invalid n_iter ({n_iter}), must be a positive integer.")
+
+    data_np = numpy.asarray(data)
+    if data_np.ndim != 2:
+        raise ValueError(f"Expected 2D input array for kmeans2, got shape {data_np.shape}")
+    n_samples, n_dims = data_np.shape
+    k_int = int(k)
+    if k_int < 1 or n_samples < 1:
+        raise ValueError("kmeans2 requires at least 1 sample and 1 cluster.")
+    if init_centroids is None and k_int > n_samples:
+        raise ValueError(f"Cannot sample {k_int} initial centroids from {n_samples} samples.")
+    if not numpy.isfinite(data_np).all():
+        raise ValueError("Input data to kmeans2 must not contain NaNs or Infs.")
+
+    _memory.disable_tf32()
+    dev = _resolve_device(device)
+    target_dtype = _resolve_dtype(gpu_float32=gpu_float32)
+
+    if init_centroids is not None:
+        init_np = numpy.asarray(init_centroids)
+        if init_np.shape != (k_int, n_dims):
+            raise ValueError(f"Expected init_centroids shape {(k_int, n_dims)}, got {init_np.shape}")
+    else:
+        rng = numpy.random.default_rng(seed)
+        indices = rng.choice(n_samples, size=k_int, replace=False)
+        init_np = data_np[indices]
+
+    data_g = _as_gpu(data_np, dev, target_dtype)
+    centroids_g = _as_gpu(init_np, dev, target_dtype)
+    labels_g = torch.empty(n_samples, dtype=torch.int64, device=dev)
+
+    tile_rows = n_samples
+    for _ in range(int(n_iter)):
+        s = 0
+        while s < n_samples:
+            e = min(s + tile_rows, n_samples)
+            try:
+                _, idx_blk = _nearest_centroids(data_g[s:e].contiguous(), centroids_g)
+                labels_g[s:e] = idx_blk
+                del idx_blk
+            except Exception as exc:
+                if not _memory.is_gpu_oom(exc) or (e - s) == 1:
+                    raise
+                _memory.empty_cache(dev)
+                tile_rows = max(1, (e - s) // 2)
+                continue
+            s = e
+
+        counts = torch.bincount(labels_g, minlength=k_int)
+        has_members = counts > 0
+        sums = torch.zeros((k_int, n_dims), dtype=target_dtype, device=dev)
+        sums.index_add_(0, labels_g, data_g)
+        new_centroids = centroids_g.clone()
+        new_centroids[has_members] = (
+            sums[has_members] / counts[has_members, None].to(target_dtype)
+        )
+        if not bool(has_members.all()):
+            warnings.warn(
+                "One of the clusters is empty. Re-run kmeans with a different initialization.",
+                UserWarning, stacklevel=2,
+            )
+        centroids_g = new_centroids
+
+    return (
+        centroids_g.cpu().numpy().astype(numpy.float64, copy=False),
+        labels_g.cpu().numpy().astype(numpy.int32, copy=False),
+    )

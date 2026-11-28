@@ -254,6 +254,135 @@ class AtlasConstructionTests(unittest.TestCase):
                 self.assertIsNotNone(c_pd.GetPointData().GetArray('Subject_ID'))
                 self.assertIsNotNone(c_pd.GetPointData().GetArray('Hemisphere'))
 
+    def test_spectral_skips_near_psd_when_already_psd_and_runs_near_psd_when_indefinite(self):
+        from unittest.mock import patch
+
+        pd, n_fibers = _make_bundle_polydata(seed=61, fibers_per_cluster=40)
+        nystrom_mask = np.zeros(n_fibers, dtype=bool)
+        nystrom_mask[:105] = True
+
+        # Well-separated bundles yield PSD affinity A -> 2 eigh calls (A and normalized A) and 0 nearPSD calls
+        with patch.object(wma.cluster, 'nearPSD', wraps=wma.cluster.nearPSD) as psd_spy, \
+                patch.object(wma.gpu.linalg, 'eigh', wraps=wma.gpu.linalg.eigh) as eigh_spy:
+            wma.cluster.spectral(
+                pd, number_of_clusters=3, number_of_eigenvectors=3, sigma=30.0,
+                threshold=0.0, number_of_jobs=1, use_nystrom=True,
+                nystrom_mask=nystrom_mask.copy(), distance_method='MeanSquared',
+                outlier_std_threshold=np.inf, pos_def_approx=True, bilateral=False, use_gpu=False,
+            )
+        self.assertEqual(psd_spy.call_count, 0)
+        self.assertEqual(eigh_spy.call_count, 2)
+
+        # Force negative eigenvalue in A while keeping diag(A)==1 -> must call nearPSD + 3rd eigh
+        orig_pw = wma.cluster._pairwise_similarity_matrix
+
+        def indefinite_pw(*args, **kwargs):
+            A = orig_pw(*args, **kwargs).copy()
+            A[0, 1] = A[1, 0] = 0.99
+            A[0, 2] = A[2, 0] = 0.01
+            A[1, 2] = A[2, 1] = 0.99
+            return A
+
+        with patch.object(wma.cluster, '_pairwise_similarity_matrix', side_effect=indefinite_pw), \
+                patch.object(wma.cluster, 'nearPSD', wraps=wma.cluster.nearPSD) as psd_spy, \
+                patch.object(wma.gpu.linalg, 'eigh', wraps=wma.gpu.linalg.eigh) as eigh_spy:
+            wma.cluster.spectral(
+                pd, number_of_clusters=3, number_of_eigenvectors=3, sigma=30.0,
+                threshold=0.0, number_of_jobs=1, use_nystrom=True,
+                nystrom_mask=nystrom_mask.copy(), distance_method='MeanSquared',
+                outlier_std_threshold=np.inf, pos_def_approx=True, bilateral=False, use_gpu=False,
+            )
+        self.assertEqual(psd_spy.call_count, 1)
+        self.assertEqual(eigh_spy.call_count, 3)
+
+    def test_gpu_kmeans2_matches_scipy_on_cpu_fallback_and_cuda_triton(self):
+        from unittest.mock import patch
+        import warnings
+        import scipy.cluster.vq
+        try:
+            import torch
+        except ImportError:
+            self.skipTest('torch is required')
+
+        rng = np.random.RandomState(2026)
+        data10 = rng.normal(size=(250, 10)).astype(np.float64)
+        init10 = data10[:12].copy()
+        # Append an unreachable centroid to verify empty-cluster preservation + UserWarning
+        init_with_empty = np.vstack([data10[:11], np.full((1, 10), 1e6, dtype=np.float64)])
+        exp_c, exp_l = scipy.cluster.vq.kmeans2(data10, init10, iter=10, minit='matrix')
+
+        act_c, act_l = wma.gpu.linalg.kmeans2(
+            data10, 12, n_iter=10, gpu_float32=False, device='cpu', init_centroids=init10)
+        np.testing.assert_array_equal(act_l, exp_l)
+        np.testing.assert_allclose(act_c, exp_c, rtol=1e-12, atol=1e-12)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            exp_ec, exp_el = scipy.cluster.vq.kmeans2(data10, init_with_empty, iter=5, minit='matrix')
+            act_ec, act_el = wma.gpu.linalg.kmeans2(
+                data10, 12, n_iter=5, gpu_float32=False, device='cpu', init_centroids=init_with_empty)
+        self.assertTrue(any('empty' in str(w.message).lower() for w in caught))
+        np.testing.assert_array_equal(act_el, exp_el)
+        np.testing.assert_allclose(act_ec, exp_ec, rtol=1e-12, atol=1e-12)
+
+        # High-dimensional D=40 cdist fallback
+        data40 = rng.normal(size=(120, 40)).astype(np.float64)
+        init40 = data40[:8].copy()
+        exp40_c, exp40_l = scipy.cluster.vq.kmeans2(data40, init40, iter=5, minit='matrix')
+        act40_c, act40_l = wma.gpu.linalg.kmeans2(
+            data40, 8, n_iter=5, gpu_float32=False, device='cpu', init_centroids=init40)
+        np.testing.assert_array_equal(act40_l, exp40_l)
+        np.testing.assert_allclose(act40_c, exp40_c, rtol=1e-12, atol=1e-12)
+
+        # Verify cluster.spectral dispatches kmeans2 when use_gpu=True
+        pd, n_fibers = _make_bundle_polydata(seed=73, fibers_per_cluster=40)
+        nystrom_mask = np.zeros(n_fibers, dtype=bool)
+        nystrom_mask[:105] = True
+
+        orig_pw = wma.cluster._pairwise_similarity_matrix
+        orig_rect = wma.cluster._rectangular_similarity_matrix
+        orig_kmeans2 = wma.gpu.linalg.kmeans2
+        calls = []
+
+        def tracked_kmeans2(data, k, **kwargs):
+            calls.append((data.shape, k))
+            return orig_kmeans2(data, k, n_iter=10, gpu_float32=False, device='cpu', seed=99)
+
+        with patch.object(wma.gpu, 'use_gpu', side_effect=lambda req=None: bool(req)), \
+                patch.object(wma.cluster, '_pairwise_similarity_matrix',
+                             side_effect=lambda *a, **kw: orig_pw(*a, **{**kw, 'use_gpu': False})), \
+                patch.object(wma.cluster, '_rectangular_similarity_matrix',
+                             side_effect=lambda *a, **kw: orig_rect(*a, **{**kw, 'use_gpu': False})), \
+                patch.object(wma.gpu.linalg, 'nystrom_row_sum_2',
+                             side_effect=lambda B, rm: B.sum(0) + np.dot(rm, B)), \
+                patch.object(wma.gpu.linalg, 'nystrom_normalize_and_embed_top',
+                             side_effect=lambda B, da, db, ev, el, **kw: (
+                                 ((da[:, None] * B * db[None, :]).T @ ev) / el,
+                                 np.sum(np.vstack((ev, ((da[:, None] * B * db[None, :]).T @ ev) / el)) ** 2, 0),
+                             )), \
+                patch.object(wma.gpu.linalg, 'kmeans2', side_effect=tracked_kmeans2):
+            wma.cluster.spectral(
+                pd, number_of_clusters=3, number_of_eigenvectors=3, sigma=30.0,
+                threshold=0.0, number_of_jobs=1, use_nystrom=True,
+                nystrom_mask=nystrom_mask.copy(), distance_method='MeanSquared',
+                outlier_std_threshold=np.inf, pos_def_approx=True, bilateral=False, use_gpu=True,
+            )
+        self.assertEqual(calls, [((n_fibers, 3), 3)])
+
+        if wma.gpu.available():
+            data_k800 = rng.normal(size=(4000, 10)).astype(np.float64)
+            init_k800 = data_k800[:800].copy()
+            exp800_c, exp800_l = scipy.cluster.vq.kmeans2(data_k800, init_k800, iter=10, minit='matrix')
+            act800_c, act800_l = wma.gpu.linalg.kmeans2(
+                data_k800, 800, n_iter=10, gpu_float32=False, init_centroids=init_k800)
+            np.testing.assert_array_equal(act800_l, exp800_l)
+            np.testing.assert_allclose(act800_c, exp800_c, rtol=1e-11, atol=1e-11)
+
+            act40_gpu_c, act40_gpu_l = wma.gpu.linalg.kmeans2(
+                data40, 8, n_iter=5, gpu_float32=False, init_centroids=init40)
+            np.testing.assert_array_equal(act40_gpu_l, exp40_l)
+            np.testing.assert_allclose(act40_gpu_c, exp40_c, rtol=1e-12, atol=1e-12)
+
 
 if __name__ == '__main__':
     unittest.main()

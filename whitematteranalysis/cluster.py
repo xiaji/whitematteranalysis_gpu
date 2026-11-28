@@ -365,16 +365,21 @@ def spectral(input_polydata, number_of_clusters=200,
     if pos_def_approx:
         e_val, e_vec = gpu.linalg.eigh(A)
         print(f"<{os.path.basename(__file__)}> Eigenvalue range of A:", e_val[0], e_val[-1])
-        A2 = nearPSD(A, eig=(e_val, e_vec))
-        e_val_a, e_vec_a = gpu.linalg.eigh(A2)
-        print(f"<{os.path.basename(__file__)}> Eigenvalue range of nearest PSD matrix to A:", e_val_a[0], e_val_a[-1])
-        testval = numpy.max(A-A2) 
-        if not testval == 0.0:
-            print(f"<{os.path.basename(__file__)}> A matrix differs by PSD matrix by maximum of:", testval)
-            if testval > 0.25:
-                print(f"<{os.path.basename(__file__)}> ERROR: A matrix changed by more than 0.25.")
-                raise AssertionError
-        A = A2
+        psd_tol = 1e-12 * max(1.0, abs(float(e_val[-1]))) if e_val.size else 0.0
+        if e_val.size > 0 and e_val[0] >= -psd_tol and numpy.allclose(numpy.diag(A), 1.0, atol=1e-12, rtol=0.0):
+            e_val_a, e_vec_a = numpy.maximum(e_val, 0.0), e_vec
+            print(f"<{os.path.basename(__file__)}> A is already PSD with unit diagonal; skipping nearPSD.")
+        else:
+            A2 = nearPSD(A, eig=(e_val, e_vec))
+            e_val_a, e_vec_a = gpu.linalg.eigh(A2)
+            print(f"<{os.path.basename(__file__)}> Eigenvalue range of nearest PSD matrix to A:", e_val_a[0], e_val_a[-1])
+            testval = numpy.max(A-A2) 
+            if not testval == 0.0:
+                print(f"<{os.path.basename(__file__)}> A matrix differs by PSD matrix by maximum of:", testval)
+                if testval > 0.25:
+                    print(f"<{os.path.basename(__file__)}> ERROR: A matrix changed by more than 0.25.")
+                    raise AssertionError
+            A = A2
         
     # 2) Do Normalized Cuts transform of similarity matrix.
     # See the paper: "Spectral Grouping Using the Nystrom Method"
@@ -514,7 +519,11 @@ def spectral(input_polydata, number_of_clusters=200,
     cluster_metric = None
     if centroid_finder == 'K-means':
         print(f'<{os.path.basename(__file__)}> K-means clustering in embedding space.')
-        centroids, cluster_metric = scipy.cluster.vq.kmeans2(embed, number_of_clusters, minit='points')
+        if gpu.use_gpu(use_gpu) and number_of_clusters <= embed.shape[0]:
+            centroids, cluster_metric = gpu.linalg.kmeans2(
+                embed, number_of_clusters, n_iter=10, gpu_float32=gpu_float32)
+        else:
+            centroids, cluster_metric = scipy.cluster.vq.kmeans2(embed, number_of_clusters, minit='points')
         # sort centroids by first eigenvector order
         # centroid_order = numpy.argsort(centroids[:,0])
         # sort centroids according to colormap and save them in this order in atlas
