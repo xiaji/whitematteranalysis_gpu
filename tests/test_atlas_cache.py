@@ -144,5 +144,124 @@ class AtlasCacheTests(unittest.TestCase):
             np.testing.assert_array_equal(cached_probs, probabilities)
 
 
+class SpectralAtlasCacheTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.atlas_dir = self.root / 'atlas'
+        self.atlas_dir.mkdir()
+        self.cache = self.root / 'cache'
+        environment = patch.dict(os.environ, WMA_ATLAS_CACHE=str(self.cache))
+        environment.start()
+        self.addCleanup(environment.stop)
+
+        # Build a synthetic ClusterAtlas fixture (12 Nystrom fibers, 3 eigenvectors, 3 clusters)
+        atlas_pd = tractography(12)
+        rng = np.random.RandomState(31)
+        atlas = wma.cluster.ClusterAtlas()
+        atlas.nystrom_polydata = atlas_pd
+        atlas.pinv_A = np.eye(12, dtype=np.float64)
+        atlas.row_sum_1 = rng.uniform(5.0, 15.0, size=12)
+        atlas.row_sum_matrix = rng.uniform(0.1, 1.0, size=12)
+        atlas.e_vec = rng.normal(size=(12, 12))
+        atlas.e_val = np.linspace(0.1, 1.0, 12)
+        atlas.e_vec_norm = np.sqrt(np.sum(atlas.e_vec ** 2, axis=0) + 1.0)
+        atlas.centroids = rng.normal(size=(3, 3))
+        atlas.number_of_eigenvectors = 3
+        atlas.sigma = 45.0
+        atlas.threshold = 0.0
+        atlas.bilateral = True
+        atlas.distance_method = 'Mean'
+        atlas.save(str(self.atlas_dir), 'atlas')
+        self.atlas_p = self.atlas_dir / 'atlas.p'
+        self.atlas_vtp = self.atlas_dir / 'atlas.vtp'
+        self.subject = tractography(24)
+
+    def test_spectral_atlas_cache_roundtrip_and_labeling_parity(self):
+        uncached = wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=False)
+        first = wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=True)
+
+        cache_files = list((self.cache / 'spectral-atlas').glob('*.npz'))
+        self.assertEqual(len(cache_files), 1)
+        self.assertIsNone(first.nystrom_polydata)
+        self.assertEqual(first.e_vec.shape, (12, 4))
+
+        with patch.object(wma.io, 'read_polydata', side_effect=AssertionError('cache miss')), \
+                patch.object(wma.cluster.ClusterAtlas, 'load', side_effect=AssertionError('pickle miss')):
+            second = wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=True)
+
+        np.testing.assert_array_equal(second.nystrom_coords, first.nystrom_coords)
+        np.testing.assert_array_equal(second.e_vec, first.e_vec)
+        np.testing.assert_array_equal(second.e_val, first.e_val)
+        np.testing.assert_array_equal(second.e_vec_norm, first.e_vec_norm)
+        np.testing.assert_array_equal(second.centroids, first.centroids)
+
+        # Verify spectral_atlas_label produces identical results across uncached, cached, and shared queries_15
+        _, lbl_ref, _, emb_ref = wma.cluster.spectral_atlas_label(
+            self.subject, uncached, number_of_jobs=1, use_gpu=False)
+        q15 = wma.gpu.fiber_tensors.polydata_to_numpy(self.subject, 15)
+        _, lbl_fast, _, emb_fast = wma.cluster.spectral_atlas_label(
+            self.subject, second, number_of_jobs=1, use_gpu=False, queries_15=q15)
+        np.testing.assert_array_equal(lbl_fast, lbl_ref)
+        np.testing.assert_allclose(emb_fast, emb_ref, rtol=1e-13, atol=1e-13)
+
+        # Legacy fallback path still works via lazy _ensure_nystrom_polydata
+        with patch.object(wma.gpu.config, 'cpu_fast', False):
+            _, lbl_leg, _, emb_leg = wma.cluster.spectral_atlas_label(
+                self.subject, second, number_of_jobs=1, use_gpu=False)
+        np.testing.assert_array_equal(lbl_leg, lbl_ref)
+        np.testing.assert_allclose(emb_leg, emb_ref, rtol=1e-13, atol=1e-13)
+
+    def test_spectral_atlas_cache_invalidation_recovery_and_disable(self):
+        first = wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=True)
+        path, = (self.cache / 'spectral-atlas').glob('*.npz')
+
+        # Corrupt cache triggers clean recompute
+        path.write_bytes(b'corrupt npz data')
+        recovered = wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=True)
+        np.testing.assert_array_equal(recovered.nystrom_coords, first.nystrom_coords)
+
+        # mtime change invalidates cache key and rebuilds on read
+        stat = self.atlas_vtp.stat()
+        os.utime(str(self.atlas_vtp), ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+        with patch.object(wma.io, 'read_polydata', wraps=wma.io.read_polydata) as reader:
+            wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=True)
+            self.assertGreaterEqual(reader.call_count, 1)
+        self.assertEqual(len(list((self.cache / 'spectral-atlas').glob('*.npz'))), 2)
+
+        # WMA_ATLAS_CACHE=off bypasses cache completely
+        with patch.dict(os.environ, WMA_ATLAS_CACHE='off'), \
+                patch.object(wma.cluster.ClusterAtlas, 'load', autospec=True,
+                             side_effect=wma.cluster.ClusterAtlas.load) as loader:
+            wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=True)
+            wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=True)
+            self.assertEqual(loader.call_count, 2)
+
+        # Non-Boolean bilateral still raises ValueError
+        import pickle
+        with open(str(self.atlas_p), 'rb') as fh:
+            obj = pickle.load(fh)
+        obj.bilateral = None
+        with open(str(self.atlas_p), 'wb') as fh:
+            pickle.dump(obj, fh)
+        with self.assertRaises(ValueError):
+            wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=True)
+
+    @unittest.skipUnless(wma.gpu.available(), 'CUDA is unavailable')
+    def test_gpu_resident_prepared_atlas_matches_standard_gpu(self):
+        cached = wma.cluster.load_atlas(str(self.atlas_dir), 'atlas', for_labeling=True)
+        dev = wma.gpu.get_device()
+        prepared = {dev: wma.gpu.linalg.prepare_atlas_gpu(cached, device=dev)}
+        q15 = wma.gpu.fiber_tensors.polydata_to_numpy(self.subject, 15)
+
+        _, lbl_std, _, emb_std = wma.cluster.spectral_atlas_label(
+            self.subject, cached, use_gpu=True)
+        _, lbl_res, _, emb_res = wma.cluster.spectral_atlas_label(
+            self.subject, cached, use_gpu=True, queries_15=q15, prepared_gpu=prepared)
+        np.testing.assert_array_equal(lbl_res, lbl_std)
+        np.testing.assert_allclose(emb_res, emb_std, rtol=1e-13, atol=1e-13)
+
+
 if __name__ == '__main__':
     unittest.main()

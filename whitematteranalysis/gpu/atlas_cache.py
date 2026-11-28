@@ -126,3 +126,146 @@ def load_reference(filename, sigmasq, method='Mean', bilateral=True,
             if temporary is not None and os.path.exists(temporary):
                 os.unlink(temporary)
     return coordinates, probabilities
+
+
+def _spectral_cache_file(atlas_p, atlas_vtp):
+    directory = os.environ.get('WMA_ATLAS_CACHE')
+    if directory and directory.lower() in ('off', '0', 'false'):
+        return None
+    if directory:
+        cache_dir = Path(directory).expanduser() / 'spectral-atlas'
+    else:
+        base = os.environ.get('LOCALAPPDATA') if os.name == 'nt' else os.environ.get('XDG_CACHE_HOME')
+        cache_dir = Path(base or Path.home() / '.cache') / 'whitematteranalysis' / 'spectral-atlas'
+    p_src = Path(atlas_p).resolve()
+    v_src = Path(atlas_vtp).resolve()
+    p_stat = p_src.stat()
+    v_stat = v_src.stat()
+    identity = [
+        'spectral_atlas_v1',
+        str(p_src), p_stat.st_size, p_stat.st_mtime_ns, p_stat.st_ctime_ns,
+        str(v_src), v_stat.st_size, v_stat.st_mtime_ns, v_stat.st_ctime_ns,
+        15,
+    ]
+    key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+    return cache_dir / (key + '.npz')
+
+
+def load_spectral_atlas(directory, atlas_name, verbose=False):
+    """Load a spectral ClusterAtlas with compact binary .npz caching for inference.
+
+    Caches only the arrays needed by ``spectral_atlas_label`` (``nystrom_coords`` in
+    ``(m, 15, 3)`` float64 layout, row-sum normalization vectors, and the top
+    ``number_of_eigenvectors + 1`` eigenvector/eigenvalue columns) so subsequent
+    invocations avoid unpickling the full ``atlas.p`` and reading/resampling
+    ``atlas.vtp``. Falls back cleanly to ``ClusterAtlas.load`` on miss or corruption.
+    """
+    from .. import cluster
+
+    if not os.path.isdir(directory):
+        return cluster.ClusterAtlas().load(directory, atlas_name, verbose=verbose)
+
+    fname_base = os.path.join(directory, atlas_name)
+    atlas_p = fname_base + '.p'
+    atlas_vtp = fname_base + '.vtp'
+    if not (os.path.exists(atlas_p) and os.path.exists(atlas_vtp)):
+        return cluster.ClusterAtlas().load(directory, atlas_name, verbose=verbose)
+
+    path = _spectral_cache_file(atlas_p, atlas_vtp)
+    if path is not None:
+        try:
+            with path.open('rb') as source, np.load(source, allow_pickle=False) as saved:
+                nystrom_coords = np.asarray(saved['nystrom_coords'], dtype=np.float64)
+                row_sum_1 = np.asarray(saved['row_sum_1'], dtype=np.float64)
+                row_sum_matrix = np.asarray(saved['row_sum_matrix'], dtype=np.float64)
+                e_vec = np.asarray(saved['e_vec'], dtype=np.float64)
+                e_val = np.asarray(saved['e_val'], dtype=np.float64)
+                e_vec_norm = np.asarray(saved['e_vec_norm'], dtype=np.float64)
+                centroids = np.asarray(saved['centroids'], dtype=np.float64)
+                meta = json.loads(str(saved['metadata'].item()))
+
+            k = int(meta['number_of_eigenvectors'])
+            count = int(meta['top_count'])
+            m = int(nystrom_coords.shape[0])
+            bilateral = meta['bilateral']
+            if not isinstance(bilateral, bool):
+                raise ValueError('Cached bilateral field must be bool')
+            if (nystrom_coords.ndim != 3 or nystrom_coords.shape[1:] != (15, 3)
+                    or row_sum_1.shape != (m,) or row_sum_matrix.shape != (m,)
+                    or e_vec.shape != (m, count) or e_val.shape != (count,)
+                    or e_vec_norm.shape != (count,) or centroids.ndim != 2
+                    or centroids.shape[1] != k):
+                raise ValueError('Invalid spectral atlas cache shapes')
+
+            compact = cluster.ClusterAtlas()
+            compact.row_sum_1 = row_sum_1
+            compact.row_sum_matrix = row_sum_matrix
+            compact.e_vec = e_vec
+            compact.e_val = e_val
+            compact.e_vec_norm = e_vec_norm
+            compact.centroids = centroids
+            compact.number_of_eigenvectors = k
+            compact.sigma = float(meta['sigma'])
+            compact.threshold = float(meta['threshold'])
+            compact.bilateral = bilateral
+            compact.distance_method = str(meta['distance_method'])
+            compact.version = meta.get('version', 1.0)
+            compact.nystrom_coords = nystrom_coords
+            compact.nystrom_count = m
+            compact.nystrom_polydata = None
+            compact.polydata_filename = str(Path(atlas_vtp).resolve())
+            return compact
+        except (OSError, ValueError, TypeError, AttributeError, EOFError, KeyError, zipfile.BadZipFile, json.JSONDecodeError):
+            pass
+
+    full = cluster.ClusterAtlas().load(directory, atlas_name, verbose=verbose)
+    nystrom_coords = fiber_tensors.polydata_to_numpy(full.nystrom_polydata, 15)
+    k = int(full.number_of_eigenvectors)
+    count = min(k + 1, int(full.e_vec.shape[1]))
+
+    full.e_vec = np.ascontiguousarray(full.e_vec[:, -count:], dtype=np.float64)
+    full.e_val = np.ascontiguousarray(full.e_val[-count:], dtype=np.float64)
+    full.e_vec_norm = np.ascontiguousarray(full.e_vec_norm[-count:], dtype=np.float64)
+    full.row_sum_1 = np.ascontiguousarray(full.row_sum_1, dtype=np.float64)
+    full.row_sum_matrix = np.ascontiguousarray(full.row_sum_matrix, dtype=np.float64)
+    full.centroids = np.ascontiguousarray(full.centroids, dtype=np.float64)
+    full.nystrom_coords = nystrom_coords
+    full.nystrom_count = int(nystrom_coords.shape[0])
+    full.pinv_A = None
+
+    if path is not None:
+        meta_json = json.dumps({
+            'number_of_eigenvectors': k,
+            'top_count': count,
+            'sigma': float(full.sigma),
+            'threshold': float(full.threshold),
+            'bilateral': bool(full.bilateral),
+            'distance_method': str(full.distance_method),
+            'version': str(full.version) if not isinstance(full.version, (int, float)) else float(full.version),
+        })
+        temporary = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=str(path.parent), suffix='.npz', delete=False) as output:
+                temporary = output.name
+                np.savez(
+                    output,
+                    nystrom_coords=nystrom_coords,
+                    row_sum_1=full.row_sum_1,
+                    row_sum_matrix=full.row_sum_matrix,
+                    e_vec=full.e_vec,
+                    e_val=full.e_val,
+                    e_vec_norm=full.e_vec_norm,
+                    centroids=full.centroids,
+                    metadata=np.array(meta_json),
+                )
+            os.replace(temporary, str(path))
+        except OSError:
+            pass
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
+
+    if fiber_tensors.distance_supported(full.distance_method):
+        full.nystrom_polydata = None
+    return full

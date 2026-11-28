@@ -635,7 +635,10 @@ def _iter_rectangular_similarity_arrays(queries, fixed, threshold,
     device = _resolve_device(device)
     dtype = torch.float32 if float32_enabled(gpu_float32) else torch.float64
     points_per_fiber = queries.shape[1]
-    fixed = torch.as_tensor(fixed, dtype=dtype, device=device)
+    if torch.is_tensor(fixed) and fixed.device == device and fixed.dtype == dtype:
+        pass
+    else:
+        fixed = torch.as_tensor(fixed, dtype=dtype, device=device)
     triton_2d = (distance_kernel.triton is not None
                  and fixed.is_cuda
                  and dtype in (torch.float64, torch.float32)

@@ -67,6 +67,8 @@ class ClusterAtlas:
         self.row_sum_1 = None
         self.e_vec_norm = None
         self.nystrom_polydata = None
+        self.nystrom_coords = None
+        self.nystrom_count = None
         self.threshold = None
         self.number_of_eigenvectors = None
         self.centroids = None
@@ -85,13 +87,17 @@ class ClusterAtlas:
     def save(self, directory, atlas_name):
         # temporarily remove polydata object to enable pickling
         polydata_tmp = self.nystrom_polydata
+        coords_tmp = getattr(self, 'nystrom_coords', None)
         self.nystrom_polydata = None
+        self.nystrom_coords = None
         fname = os.path.join(directory,atlas_name)
-        pickle.dump(self,open(fname+'.p','wb'))
+        with open(fname + '.p', 'wb') as atlas_file:
+            pickle.dump(self, atlas_file)
         # save the polydata
         io.write_polydata(polydata_tmp, fname+'.vtp')
         # replace the polydata object
         self.nystrom_polydata = polydata_tmp
+        self.nystrom_coords = coords_tmp
 
     def load(self, directory, atlas_name, verbose=False):
         if not os.path.isdir(directory):
@@ -110,9 +116,11 @@ class ClusterAtlas:
             raise "<cluster.py> I/O error"
 
         try:
-            atlas = pickle.load(open(fname_atlas,'rb'))
+            with open(fname_atlas, 'rb') as atlas_file:
+                atlas = pickle.load(atlas_file)
         except UnicodeDecodeError:
-            atlas = pickle.load(open(fname_atlas,'rb'), encoding="latin1")
+            with open(fname_atlas, 'rb') as atlas_file:
+                atlas = pickle.load(atlas_file, encoding="latin1")
         if not isinstance(getattr(atlas, 'bilateral', None), (bool, numpy.bool_)):
             raise ValueError("Atlas must specify a Boolean bilateral field; rebuild the atlas with wm_cluster_atlas.py.")
         atlas.nystrom_polydata = io.read_polydata(fname_polydata)
@@ -134,10 +142,46 @@ class ClusterAtlas:
 
         return(atlas)
 
-def load_atlas(directory, atlas_name):
+def load_atlas(directory, atlas_name, for_labeling=False):
     """ Convenience function to load a spectral cluster atlas """
+    if for_labeling:
+        return gpu.atlas_cache.load_spectral_atlas(directory, atlas_name)
     tmp_atlas = ClusterAtlas()
     return tmp_atlas.load(directory, atlas_name)
+
+
+def _atlas_nystrom_count(atlas):
+    coords = getattr(atlas, 'nystrom_coords', None)
+    if coords is not None:
+        return int(len(coords))
+    if getattr(atlas, 'nystrom_polydata', None) is not None:
+        return int(atlas.nystrom_polydata.GetNumberOfLines())
+    if getattr(atlas, 'nystrom_count', None) is not None:
+        return int(atlas.nystrom_count)
+    return int(len(atlas.row_sum_1))
+
+
+def _ensure_nystrom_polydata(atlas):
+    if getattr(atlas, 'nystrom_polydata', None) is None:
+        fname = getattr(atlas, 'polydata_filename', None)
+        if not fname or not os.path.exists(fname):
+            raise RuntimeError("Atlas is missing nystrom_polydata and polydata_filename")
+        atlas.nystrom_polydata = io.read_polydata(fname)
+    return atlas.nystrom_polydata
+
+
+def _atlas_nystrom_coords(atlas, coordinate_major=False):
+    coords = getattr(atlas, 'nystrom_coords', None)
+    if coords is not None:
+        coords = numpy.asarray(coords, dtype=numpy.float64)
+        if coordinate_major:
+            return numpy.ascontiguousarray(coords.transpose(2, 0, 1)).transpose(1, 2, 0)
+        return coords
+    pd = _ensure_nystrom_polydata(atlas)
+    coords = gpu.fiber_tensors.polydata_to_numpy(pd, 15, coordinate_major=coordinate_major)
+    if not coordinate_major:
+        atlas.nystrom_coords = coords
+    return coords
         
 def hierarchical(input_polydata, number_of_clusters=300,
                  threshold=2, fcluster_threshold=0.4,
@@ -549,8 +593,20 @@ def view_cluster_number(input_polydata, cluster_number, cluster_indices=None):
 
     return ren
 
+def _lookup_prepared_gpu(prepared_gpu, dev):
+    if prepared_gpu is None:
+        return None
+    if dev in prepared_gpu:
+        return prepared_gpu[dev]
+    key = (dev.type, dev.index)
+    if key in prepared_gpu:
+        return prepared_gpu[key]
+    return None
+
+
 def spectral_atlas_label(input_polydata, atlas, number_of_jobs=2,
-                         use_gpu=None, gpu_float32=None):
+                         use_gpu=None, gpu_float32=None,
+                         queries_15=None, prepared_gpu=None):
     """ Use an existing atlas to label a new polydata.
 
     Returns the cluster indices for all the fibers. output_polydata, cluster_numbers, color, embed = wma.cluster.spectral_atlas_label(input_data, atlas)
@@ -558,19 +614,21 @@ def spectral_atlas_label(input_polydata, atlas, number_of_jobs=2,
     """
 
     number_fibers = input_polydata.GetNumberOfLines()
-    sz = atlas.nystrom_polydata.GetNumberOfLines()
+    sz = _atlas_nystrom_count(atlas)
 
     if gpu.use_gpu(use_gpu):
         n_gpus = gpu.visible_device_count()
         base_dev = gpu.get_device()
+        queries = (numpy.asarray(queries_15, dtype=numpy.float64)
+                   if queries_15 is not None
+                   else gpu.fiber_tensors.polydata_to_numpy(input_polydata, 15))
         if n_gpus > 1 and number_fibers >= 16384 and base_dev.type != 'mps':
             from concurrent.futures import ThreadPoolExecutor
             import contextlib
             import torch
 
             print(f"<{os.path.basename(__file__)}> Computing rectangular similarity matrix across {n_gpus} GPUs (fused embedding).")
-            queries = gpu.fiber_tensors.polydata_to_numpy(input_polydata, 15)
-            fixed = gpu.fiber_tensors.polydata_to_numpy(atlas.nystrom_polydata, 15)
+            fixed_host = None if prepared_gpu is not None else _atlas_nystrom_coords(atlas)
             bounds = numpy.linspace(0, number_fibers, n_gpus + 1, dtype=numpy.int64)
             shards = [(i, int(bounds[i]), int(bounds[i + 1]))
                       for i in range(n_gpus) if bounds[i + 1] > bounds[i]]
@@ -582,8 +640,14 @@ def spectral_atlas_label(input_polydata, atlas, number_of_jobs=2,
                        if dev.type == 'cuda' and torch.cuda.is_available()
                        else contextlib.nullcontext())
                 with ctx:
+                    entry = _lookup_prepared_gpu(prepared_gpu, dev)
+                    if entry is not None:
+                        fixed_arg, prepared_arg = entry
+                    else:
+                        fixed_arg = fixed_host if fixed_host is not None else _atlas_nystrom_coords(atlas)
+                        prepared_arg = None
                     blocks = gpu.distance._iter_rectangular_similarity_arrays(
-                        queries[start:end], fixed,
+                        queries[start:end], fixed_arg,
                         atlas.threshold, atlas.sigma,
                         distance_method=atlas.distance_method,
                         bilateral=atlas.bilateral,
@@ -591,7 +655,8 @@ def spectral_atlas_label(input_polydata, atlas, number_of_jobs=2,
                         device=dev)
                     return gpu.linalg.atlas_label_embedding_blocks(
                         blocks, atlas, end - start,
-                        gpu_float32=gpu_float32, device=dev)
+                        gpu_float32=gpu_float32, device=dev,
+                        prepared=prepared_arg)
 
             with ThreadPoolExecutor(max_workers=len(shards)) as executor:
                 shard_results = list(executor.map(_label_shard, shards))
@@ -606,25 +671,34 @@ def spectral_atlas_label(input_polydata, atlas, number_of_jobs=2,
         else:
             # Stream similarity and embedding blocks; retain only CPU results.
             print(f"<{os.path.basename(__file__)}> Computing rectangular similarity matrix on GPU (fused embedding).")
-            blocks = gpu.distance.iter_rectangular_similarity(
-                input_polydata, atlas.nystrom_polydata,
+            entry = _lookup_prepared_gpu(prepared_gpu, base_dev)
+            if entry is not None:
+                fixed_arg, prepared_arg = entry
+            else:
+                fixed_arg = _atlas_nystrom_coords(atlas)
+                prepared_arg = None
+            blocks = gpu.distance._iter_rectangular_similarity_arrays(
+                queries, fixed_arg,
                 atlas.threshold, atlas.sigma, distance_method=atlas.distance_method,
-                bilateral=atlas.bilateral, gpu_float32=gpu_float32)
+                bilateral=atlas.bilateral, gpu_float32=gpu_float32,
+                device=base_dev)
             embed, cluster_idx, dist, row_sum, b_col_sums = \
                 gpu.linalg.atlas_label_embedding_blocks(
-                    blocks, atlas, number_fibers, gpu_float32=gpu_float32)
+                    blocks, atlas, number_fibers, gpu_float32=gpu_float32,
+                    device=base_dev, prepared=prepared_arg)
 
     elif gpu.config.cpu_fast_enabled() and gpu.fiber_tensors.distance_supported(
             atlas.distance_method):
 
         print(f"<{os.path.basename(__file__)}> Computing streamed CPU similarity and embedding.")
         embed, cluster_idx, dist, row_sum, b_col_sums = gpu.cpu_backend.atlas_label(
-            input_polydata, atlas, number_of_jobs=number_of_jobs)
+            input_polydata, atlas, number_of_jobs=number_of_jobs, queries_15=queries_15)
 
     else:
         # 1) Compute fiber similarities (original joblib backend).
+        nystrom_pd = _ensure_nystrom_polydata(atlas)
         B = \
-            _rectangular_similarity_matrix(input_polydata, atlas.nystrom_polydata,
+            _rectangular_similarity_matrix(input_polydata, nystrom_pd,
                                            atlas.threshold, atlas.sigma, number_of_jobs, distance_method=atlas.distance_method,
                                            bilateral=atlas.bilateral, use_gpu=False,
                                            gpu_float32=gpu_float32)
@@ -1196,7 +1270,7 @@ def output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_f
 
     # Figure out file name and mean color for each cluster, and write the individual polydatas
     pd_c_list = mask_all_clusters(output_polydata_s, cluster_numbers_s, len(cluster_indices), preserve_point_data=True,
-                                  preserve_cell_data=True, verbose=False)
+                                  preserve_cell_data=True, verbose=False, number_of_jobs=number_of_jobs)
     print(f"<{os.path.basename(__file__)}> Beginning to save individual clusters as polydata files. TOTAL CLUSTERS:", len(cluster_indices), end=' ')
     fnames = list()
     cluster_colors = list()
@@ -1262,7 +1336,8 @@ def output_and_quality_control_cluster_atlas(atlas, output_polydata_s, subject_f
         del ren
 
 def mask_all_clusters(inpd, cluster_numbers_s, number_of_clusters, color=None,
-                      preserve_point_data=True, preserve_cell_data=False, verbose=True):
+                      preserve_point_data=True, preserve_cell_data=False, verbose=True,
+                      number_of_jobs=1):
     """Split fibers in original order using the vectorized line selector."""
     print(f'<{os.path.basename(__file__)}> Masking all clusters: total ', number_of_clusters)
     labels = numpy.asarray(cluster_numbers_s)
@@ -1275,6 +1350,20 @@ def mask_all_clusters(inpd, cluster_numbers_s, number_of_clusters, color=None,
         order = numpy.flatnonzero(valid)
         order = order[numpy.argsort(indices[order], kind='stable')]
         boundaries = numpy.searchsorted(indices[order], numpy.arange(number_of_clusters + 1))
+        workers = int(number_of_jobs) if number_of_jobs is not None else 1
+        if workers > 1 and number_of_clusters > 1 and not verbose:
+            from concurrent.futures import ThreadPoolExecutor
+
+            point_specs, cell_specs, tensor_names = filter._extract_polydata_schema_and_arrays(
+                inpd, preserve_point_data=preserve_point_data, preserve_cell_data=preserve_cell_data)
+
+            def _build_one(c):
+                return filter._build_polydata_from_indexed_lines(
+                    geometry, order[boundaries[c]:boundaries[c + 1]],
+                    point_specs=point_specs, cell_specs=cell_specs, tensor_names=tensor_names)
+
+            with ThreadPoolExecutor(max_workers=min(workers, number_of_clusters)) as pool:
+                return list(pool.map(_build_one, range(number_of_clusters)))
         return [filter.mask(inpd, None, preserve_point_data=preserve_point_data,
                             preserve_cell_data=preserve_cell_data, verbose=verbose,
                             _geometry=geometry, _line_indices=order[boundaries[c]:boundaries[c + 1]])

@@ -162,6 +162,22 @@ def nystrom_normalize_and_embed_top(B, dhat_a, dhat_b, e_vec_top, e_val_top,
     return V2_out, e_sq_a + v2_sq_sum
 
 
+def prepare_atlas_gpu(atlas, nystrom_coords=None, gpu_float32=None, device=None):
+    """Upload Nystrom reference fibers and spectral projection tensors once per GPU."""
+    if torch is None:
+        raise RuntimeError("torch is not available, cannot use the GPU linalg backend.")
+    _memory.disable_tf32()
+    dev = _resolve_device(device)
+    target_dtype = _resolve_dtype(gpu_float32=gpu_float32)
+    coords = getattr(atlas, 'nystrom_coords', None) if nystrom_coords is None else nystrom_coords
+    if coords is None:
+        from . import fiber_tensors
+        coords = fiber_tensors.polydata_to_numpy(atlas.nystrom_polydata, 15)
+    fixed_g = torch.as_tensor(numpy.ascontiguousarray(coords), dtype=target_dtype, device=dev)
+    prepared = _prepare_atlas(atlas, dtype=target_dtype, device=dev)
+    return fixed_g, prepared
+
+
 def atlas_label_embedding(B, atlas, gpu_float32=None, device=None):
     """GPU equivalent of cluster.spectral_atlas_label steps 2-5.
 
@@ -264,14 +280,15 @@ def _atlas_embedding_block(B, atlas, prepared, device=None, dtype=None):
 
 
 @SmallPages()
-def atlas_label_embedding_blocks(blocks, atlas, number_fibers, gpu_float32=None, device=None):
+def atlas_label_embedding_blocks(blocks, atlas, number_fibers, gpu_float32=None, device=None, prepared=None):
     """Embed each input block without retaining the full similarity or V matrices."""
     if torch is None:
         raise RuntimeError("torch is not available, cannot use the GPU linalg backend.")
     _memory.disable_tf32()
     dev = _resolve_device(device)
     target_dtype = _resolve_dtype(gpu_float32=gpu_float32)
-    prepared = _prepare_atlas(atlas, dtype=target_dtype, device=dev)
+    if prepared is None:
+        prepared = _prepare_atlas(atlas, dtype=target_dtype, device=dev)
     embed_g = torch.empty((number_fibers, atlas.number_of_eigenvectors), dtype=target_dtype, device=dev)
     rows_g = torch.empty(number_fibers, dtype=target_dtype, device=dev)
     columns_g = torch.empty(number_fibers, dtype=target_dtype, device=dev)

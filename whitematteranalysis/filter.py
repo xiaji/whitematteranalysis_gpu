@@ -99,6 +99,103 @@ def _select_vtk_array(values, indices, dtype):
     return output
 
 
+def _extract_polydata_schema_and_arrays(inpd, preserve_point_data=True, preserve_cell_data=True):
+    """Extract read-only NumPy views of point/cell arrays so slice builders stay thread-safe."""
+    from vtk.util import numpy_support
+
+    point_specs = []
+    tensor_names = []
+    if preserve_point_data:
+        inpointdata = inpd.GetPointData()
+        for idx in range(inpointdata.GetNumberOfArrays()):
+            array = inpointdata.GetArray(idx)
+            if array is None:
+                continue
+            name = array.GetName()
+            point_specs.append((name, numpy_support.vtk_to_numpy(array)))
+            if array.GetNumberOfComponents() == 9:
+                tensor_names.append(name)
+
+    cell_specs = []
+    if preserve_cell_data:
+        incelldata = inpd.GetCellData()
+        for idx in range(incelldata.GetNumberOfArrays()):
+            array = incelldata.GetArray(idx)
+            if array is None:
+                continue
+            dtype = array.GetDataType()
+            if dtype == 10:
+                output_dtype = numpy.float32
+            elif dtype == 6:
+                output_dtype = numpy.int32
+            elif dtype == 3:
+                output_dtype = numpy.uint8
+            else:
+                output_dtype = numpy.float32
+            cell_specs.append((array.GetName(), numpy_support.vtk_to_numpy(array), output_dtype))
+
+    return point_specs, cell_specs, tensor_names
+
+
+def _build_polydata_from_indexed_lines(geometry, line_indices, point_specs=(), cell_specs=(),
+                                       tensor_names=(), extra_per_line_point_arrays=()):
+    """Build a vtkPolyData slice using only NumPy/local VTK objects (thread-safe)."""
+    from vtk.util import numpy_support
+
+    offsets, conn, in_points = geometry
+    keep_indices = numpy.asarray(line_indices, dtype=numpy.int64)
+    src_conn, out_offsets = _gather_conn(conn, offsets, keep_indices)
+    total = int(out_offsets[-1]) if out_offsets.size else 0
+
+    outpd = vtk.vtkPolyData()
+    outpoints = vtk.vtkPoints()
+    outpoints.SetData(_select_vtk_array(in_points, src_conn, numpy.float32))
+
+    outlines = vtk.vtkCellArray()
+    offsets_vtk = numpy_support.numpy_to_vtk(
+        out_offsets, deep=True, array_type=vtk.vtkIdTypeArray().GetDataType())
+    conn_vtk = vtk.vtkIdTypeArray()
+    conn_vtk.SetNumberOfValues(total)
+    out_conn = numpy_support.vtk_to_numpy(conn_vtk)
+    for first in range(0, total, 262144):
+        last = min(first + 262144, total)
+        out_conn[first:last] = numpy.arange(first, last, dtype=numpy.int64)
+    outlines.SetData(offsets_vtk, conn_vtk)
+
+    outcelldata = outpd.GetCellData()
+    for name, full, output_dtype in cell_specs:
+        out_array = _select_vtk_array(full, keep_indices, output_dtype)
+        out_array.SetName(name)
+        outcelldata.AddArray(out_array)
+
+    outpointdata = outpd.GetPointData()
+    for name, full in point_specs:
+        out_array = _select_vtk_array(full, src_conn, numpy.float32)
+        out_array.SetName(name)
+        outpointdata.AddArray(out_array)
+
+    line_lengths = out_offsets[1:] - out_offsets[:-1]
+    for name, per_line_vals, out_dtype in extra_per_line_point_arrays:
+        if total == 0:
+            expanded = numpy.empty(0, dtype=out_dtype)
+        else:
+            expanded = numpy.repeat(
+                numpy.asarray(per_line_vals, dtype=out_dtype), line_lengths)
+        out_array = numpy_support.numpy_to_vtk(
+            numpy.ascontiguousarray(expanded, dtype=out_dtype), deep=True)
+        out_array.SetName(name)
+        outpointdata.AddArray(out_array)
+
+    for name in tensor_names:
+        if name in ('tensors', 'Tensors', 'tensor1', 'Tensor1'):
+            outpointdata.SetTensors(outpointdata.GetArray(name))
+            break
+    outcelldata.SetActiveScalars(None)
+    outpd.SetPoints(outpoints)
+    outpd.SetLines(outlines)
+    return outpd
+
+
 def _mean_nearest_neighbor_distance(distances):
     """Mean of the three smallest non-self distances in each row.
 

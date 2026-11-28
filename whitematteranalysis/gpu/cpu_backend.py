@@ -277,7 +277,7 @@ def _atlas_blas_scope(columns, workers):
                 _BLAS_CAP = 0
 
 
-def atlas_label(input_polydata, atlas, number_of_jobs=None):
+def atlas_label(input_polydata, atlas, number_of_jobs=None, queries_15=None):
     """Stream CPU distances and project only the required embedding columns.
 
     Retain O(N * embedding_columns) results, not the full O(N * atlas_size)
@@ -286,8 +286,17 @@ def atlas_label(input_polydata, atlas, number_of_jobs=None):
     from concurrent.futures import ThreadPoolExecutor
     import scipy.cluster.vq
 
-    queries = fiber_tensors.polydata_to_numpy(input_polydata, 15, coordinate_major=True)
-    fixed = fiber_tensors.polydata_to_numpy(atlas.nystrom_polydata, 15, coordinate_major=True)
+    if queries_15 is not None:
+        queries = numpy.ascontiguousarray(
+            numpy.asarray(queries_15, dtype=numpy.float64).transpose(2, 0, 1)).transpose(1, 2, 0)
+    else:
+        queries = fiber_tensors.polydata_to_numpy(input_polydata, 15, coordinate_major=True)
+    nystrom_coords = getattr(atlas, 'nystrom_coords', None)
+    if nystrom_coords is not None:
+        fixed = numpy.ascontiguousarray(
+            numpy.asarray(nystrom_coords, dtype=numpy.float64).transpose(2, 0, 1)).transpose(1, 2, 0)
+    else:
+        fixed = fiber_tensors.polydata_to_numpy(atlas.nystrom_polydata, 15, coordinate_major=True)
     count = atlas.number_of_eigenvectors + 1
     vectors = numpy.ascontiguousarray(atlas.e_vec[:, -count:])
     reciprocal = numpy.divide(1., atlas.e_val[-count:])
