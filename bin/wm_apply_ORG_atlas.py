@@ -91,8 +91,16 @@ _PRESETS = {
 def _build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Apply the ORG white matter atlas in a single in-memory Python process.")
-    parser.add_argument('-i', '--input', required=True,
-                        help='Input tractography (.vtk or .vtp) in RAS coordinates.')
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        '-i', '--input', default=None,
+        help='Input tractography (.vtk or .vtp) in RAS coordinates, or a directory of files for batch mode.')
+    input_group.add_argument(
+        '--input-dir', default=None,
+        help='Directory of input tractography files (.vtk or .vtp) for single-process batch mode.')
+    input_group.add_argument(
+        '--input-list', default=None,
+        help='Text manifest listing input tractography paths (one per line, ignoring # comments).')
     parser.add_argument('-o', '--output', required=True,
                         help='Output root directory; subject outputs are published under <output>/<caseID>.')
     parser.add_argument('-a', '--atlas', required=True,
@@ -108,7 +116,7 @@ def _build_arg_parser():
     parser.add_argument('--fiber-length-max', type=float, default=260.0,
                         help='Maximum fiber length in mm for registration sampling (default: 260).')
     parser.add_argument('-t', '--transform', default=None,
-                        help='Optional initial ITK .tfm transform into adult atlas size.')
+                        help='Optional initial ITK .tfm transform (or directory of per-subject .tfm files) into adult atlas size.')
     parser.add_argument('-j', '--jobs', type=int, default=1,
                         help='Number of CPU/IO worker threads (default: 1).')
     parser.add_argument('--keep-intermediates', type=int, choices=(0, 1, 2), default=0,
@@ -116,6 +124,8 @@ def _build_arg_parser():
                              '1: also keep SeparatedClusters and transforms; 2: keep all stages.')
     parser.add_argument('--no-atomic-publish', action='store_true', default=False,
                         help='Write directly to <output>/<caseID> instead of staging and atomic rename.')
+    parser.add_argument('--continue-on-error', action='store_true', default=False,
+                        help='In batch mode, continue processing remaining subjects if one subject fails.')
     parser.add_argument('-no_xvfb', '--no-xvfb', action='store_true', dest='no_xvfb',
                         help='Disable automatic xvfb-run wrapper when calling Slicer.')
     parser.add_argument('--outlier-std', type=float, default=2.0,
@@ -711,34 +721,188 @@ def _clean_stale_outputs(work_dir):
         fc_dir.rmdir()
 
 
-def run_pipeline(args):
+def _discover_inputs(args):
+    if getattr(args, 'input', None) is not None:
+        raw = Path(args.input)
+        if raw.is_dir():
+            is_batch = True
+            paths = sorted(
+                ((os.path.splitext(p.name)[0], p.resolve()) for p in raw.iterdir()
+                 if p.is_file() and p.suffix.lower() in ('.vtp', '.vtk')),
+                key=lambda item: item[1].name,
+            )
+            if not paths:
+                raise FileNotFoundError(f"No .vtp or .vtk files found in input directory: {raw}")
+        elif raw.is_file():
+            return False, [(os.path.splitext(raw.name)[0], raw.resolve())]
+        else:
+            raise FileNotFoundError(f"Input tractography file does not exist: {raw.resolve()}")
+    elif getattr(args, 'input_dir', None) is not None:
+        is_batch = True
+        raw_dir = Path(args.input_dir)
+        if not raw_dir.is_dir():
+            raise FileNotFoundError(f"Input directory does not exist: {raw_dir.resolve()}")
+        paths = sorted(
+            ((os.path.splitext(p.name)[0], p.resolve()) for p in raw_dir.iterdir()
+             if p.is_file() and p.suffix.lower() in ('.vtp', '.vtk')),
+            key=lambda item: item[1].name,
+        )
+        if not paths:
+            raise FileNotFoundError(f"No .vtp or .vtk files found in input directory: {raw_dir}")
+    else:
+        is_batch = True
+        list_path = Path(args.input_list).resolve()
+        if not list_path.is_file():
+            raise FileNotFoundError(f"Input manifest file does not exist: {list_path}")
+        paths = []
+        for raw_line in list_path.read_text(encoding='utf-8').splitlines():
+            entry = raw_line.strip()
+            if not entry or entry.startswith('#'):
+                continue
+            cand = Path(entry)
+            if not cand.is_absolute():
+                cand = list_path.parent / cand
+            case_id = os.path.splitext(cand.name)[0]
+            resolved = cand.resolve()
+            if not resolved.is_file():
+                raise FileNotFoundError(f"Listed input tractography file does not exist: {resolved}")
+            paths.append((case_id, resolved))
+        if not paths:
+            raise FileNotFoundError(f"Input manifest contains no files: {list_path}")
+
+    seen_cases = {}
+    for cid, p in paths:
+        if cid in seen_cases:
+            raise ValueError(f"Duplicate case_id {cid!r} in batch inputs: {seen_cases[cid]} and {p}")
+        seen_cases[cid] = p
+    return is_batch, paths
+
+
+def _resolve_subject_transform(transform_arg, case_id):
+    if not transform_arg:
+        return None
+    t_path = Path(transform_arg).resolve()
+    if t_path.is_dir():
+        for name in (f'itk_txform_{case_id}.tfm', f'{case_id}.tfm'):
+            cand = t_path / name
+            if cand.is_file():
+                return cand
+        raise FileNotFoundError(f"No initial transform found for case {case_id} in {t_path}")
+    if not t_path.is_file():
+        raise FileNotFoundError(f"Initial transform file not found: {t_path}")
+    return t_path
+
+
+def _resolve_slicer_executable(slicer_arg):
+    if not slicer_arg:
+        return None
+    slicer_candidate = Path(slicer_arg)
+    if slicer_candidate.is_file():
+        return slicer_candidate.resolve()
+    if os.sep not in slicer_arg and (not os.altsep or os.altsep not in slicer_arg):
+        found_slicer = shutil.which(slicer_arg)
+        if found_slicer:
+            return Path(found_slicer).resolve()
+        return None
+    return slicer_candidate.resolve()
+
+
+class _AtlasSession:
+    """Shared atlas assets and optional GPU-resident state across subjects."""
+
+    def __init__(self, args, keep_resident=False):
+        self.resolved_atlas = wma.atlases.resolve_atlas(
+            args.atlas, family=getattr(args, 'atlas_family', 'auto'), validate_mrml=True)
+        self.atlas_base = self.resolved_atlas.base_dir
+        self.reg_atlas_path = self.resolved_atlas.reg_atlas_path
+        self.fc_atlas_dir = self.resolved_atlas.fc_dir
+        self.atlas_cluster_paths = list(self.resolved_atlas.cluster_paths)
+        self.atlas_cluster_names = list(self.resolved_atlas.cluster_names)
+        self.location_data = self.resolved_atlas.location_data
+        self.tract_tasks = _collect_tract_tasks(
+            self.fc_atlas_dir,
+            self.atlas_cluster_names,
+            self.location_data,
+            hemispheric_tracts=self.resolved_atlas.hemispheric_tracts,
+            commissural_tracts=self.resolved_atlas.commissural_tracts,
+        )
+        self.keep_resident = bool(keep_resident)
+        self._reg_atlas_pd = None
+        self._spectral_atlas = None
+        self._prepared_gpu = None
+        self.ref_cache = {} if self.keep_resident else None
+        self.ref_lock = threading.Lock() if self.keep_resident else None
+
+    def get_reg_atlas(self):
+        if self._reg_atlas_pd is None:
+            self._reg_atlas_pd = wma.io.read_polydata(str(self.reg_atlas_path), geometry_only=True)
+        return self._reg_atlas_pd
+
+    def release_reg_atlas(self):
+        if not self.keep_resident:
+            self._reg_atlas_pd = None
+
+    def get_spectral_atlas(self):
+        if self._spectral_atlas is None:
+            atlas = wma.cluster.load_atlas(str(self.fc_atlas_dir), 'atlas', for_labeling=True)
+            number_of_clusters = int(atlas.centroids.shape[0])
+            if number_of_clusters != len(self.atlas_cluster_names):
+                raise RuntimeError(
+                    f"Atlas centroid count ({number_of_clusters}) does not match "
+                    f"cluster VTP count ({len(self.atlas_cluster_names)})")
+            self._spectral_atlas = atlas
+        return self._spectral_atlas
+
+    def get_prepared_gpu(self):
+        if not self.keep_resident or not wma.gpu.use_gpu():
+            return None
+        if self._prepared_gpu is None:
+            atlas = self.get_spectral_atlas()
+            base_dev = wma.gpu.get_device()
+            n_gpus = wma.gpu.visible_device_count() if base_dev.type != 'mps' else 1
+            devices = (
+                [wma.gpu.get_device(i) for i in range(n_gpus)]
+                if base_dev.type != 'mps' and n_gpus >= 1
+                else [base_dev]
+            )
+            prepared = {}
+            for dev in devices:
+                prepared[dev] = wma.gpu.linalg.prepare_atlas_gpu(atlas, device=dev)
+            self._prepared_gpu = prepared
+        return self._prepared_gpu
+
+    def release_spectral_atlas(self):
+        if not self.keep_resident:
+            self._spectral_atlas = None
+            self._prepared_gpu = None
+
+    def close(self):
+        self._prepared_gpu = None
+        self._reg_atlas_pd = None
+        self._spectral_atlas = None
+        if self.ref_cache is not None:
+            self.ref_cache.clear()
+        gc.collect()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+def _run_subject(case_id, input_path, args, session, workers, slicer_path):
     t_start = time.perf_counter()
     timings = {}
 
-    raw_input = Path(args.input)
-    case_id = os.path.splitext(raw_input.name)[0]
-    input_path = raw_input.resolve()
-    if not input_path.is_file():
-        raise FileNotFoundError(f"Input tractography file does not exist: {input_path}")
-
-    resolved_atlas = wma.atlases.resolve_atlas(
-        args.atlas, family=getattr(args, 'atlas_family', 'auto'), validate_mrml=True)
-    atlas_base = resolved_atlas.base_dir
-    reg_atlas_path = resolved_atlas.reg_atlas_path
-    fc_atlas_dir = resolved_atlas.fc_dir
-    atlas_cluster_paths = list(resolved_atlas.cluster_paths)
-    atlas_cluster_names = list(resolved_atlas.cluster_names)
-    location_data = resolved_atlas.location_data
-    tract_tasks = _collect_tract_tasks(
-        fc_atlas_dir,
-        atlas_cluster_names,
-        location_data,
-        hemispheric_tracts=resolved_atlas.hemispheric_tracts,
-        commissural_tracts=resolved_atlas.commissural_tracts,
-    )
-
-    wma.gpu.apply_gpu_arguments(args)
-    workers = _effective_workers(args.jobs)
+    resolved_atlas = session.resolved_atlas
+    atlas_base = session.atlas_base
+    reg_atlas_path = session.reg_atlas_path
+    atlas_cluster_paths = session.atlas_cluster_paths
+    atlas_cluster_names = session.atlas_cluster_names
+    location_data = session.location_data
+    tract_tasks = session.tract_tasks
 
     t0 = time.perf_counter()
     input_pd = wma.io.read_polydata(str(input_path))
@@ -751,29 +915,16 @@ def run_pipeline(args):
 
     pre_fwd_matrix = None
     pre_inv_matrix = None
-    if args.transform:
-        pre_tfm_path = Path(args.transform).resolve()
-        if not pre_tfm_path.is_file():
-            raise FileNotFoundError(f"Initial transform file not found: {pre_tfm_path}")
+    pre_tfm_path = _resolve_subject_transform(args.transform, case_id)
+    if pre_tfm_path is not None:
         pre_fwd_matrix = wma.transform.read_itk_affine_matrix_ras(str(pre_tfm_path), inverse=False)
         pre_inv_matrix = wma.transform.read_itk_affine_matrix_ras(str(pre_tfm_path), inverse=True)
 
     tier1_eligible = (
         args.reg_mode == 'rig'
         and not has_tensors
-        and (args.transform is None or pre_fwd_matrix is not None)
+        and (pre_tfm_path is None or pre_fwd_matrix is not None)
     )
-    slicer_path = None
-    if args.slicer:
-        slicer_candidate = Path(args.slicer)
-        if slicer_candidate.is_file():
-            slicer_path = slicer_candidate.resolve()
-        elif os.sep not in args.slicer and (not os.altsep or os.altsep not in args.slicer):
-            found_slicer = shutil.which(args.slicer)
-            if found_slicer:
-                slicer_path = Path(found_slicer).resolve()
-        else:
-            slicer_path = slicer_candidate.resolve()
     if not tier1_eligible:
         if slicer_path is None or not slicer_path.is_file():
             raise RuntimeError(
@@ -801,7 +952,7 @@ def run_pipeline(args):
             keep = int(args.keep_intermediates)
 
             # Optional initial pre-transform
-            if args.transform:
+            if pre_tfm_path is not None:
                 if pre_fwd_matrix is not None and not has_tensors:
                     input_pd = wma.transform.apply_affine_to_polydata(input_pd, pre_fwd_matrix)
                 else:
@@ -818,7 +969,7 @@ def run_pipeline(args):
 
             # Registration stage
             t0 = time.perf_counter()
-            atlas_reg_pd = wma.io.read_polydata(str(reg_atlas_path), geometry_only=True)
+            atlas_reg_pd = session.get_reg_atlas()
             atlas_id = os.path.splitext(reg_atlas_path.name)[0]
             reg_root = (work_dir / 'TractRegistration') if keep >= 1 else (scratch_dir / 'TractRegistration')
 
@@ -833,6 +984,7 @@ def run_pipeline(args):
                     save_iter_tfms=(keep >= 2),
                 )
                 del atlas_reg_pd
+                session.release_reg_atlas()
                 timings['registration'] = time.perf_counter() - t0
 
                 t0 = time.perf_counter()
@@ -874,6 +1026,7 @@ def run_pipeline(args):
                     save_iter_tfms=(keep >= 2),
                 )
                 del atlas_reg_pd
+                session.release_reg_atlas()
                 timings['registration'] = time.perf_counter() - t0
 
                 t0 = time.perf_counter()
@@ -900,13 +1053,10 @@ def run_pipeline(args):
 
             # Spectral atlas labeling + in-memory per-cluster split or indexed partition
             t0 = time.perf_counter()
-            atlas = wma.cluster.load_atlas(str(fc_atlas_dir), 'atlas', for_labeling=True)
+            atlas = session.get_spectral_atlas()
             number_of_clusters = int(atlas.centroids.shape[0])
             atlas_bilateral = bool(atlas.bilateral)
-            if number_of_clusters != len(atlas_cluster_names):
-                raise RuntimeError(
-                    f"Atlas centroid count ({number_of_clusters}) does not match "
-                    f"cluster VTP count ({len(atlas_cluster_names)})")
+            prepared_gpu = session.get_prepared_gpu()
 
             backend = 'gpu' if wma.gpu.use_gpu() else ('cpu' if wma.gpu.config.cpu_fast_enabled() else None)
             use_indexed = (
@@ -923,7 +1073,8 @@ def run_pipeline(args):
                 if backend is not None:
                     queries_15 = wma.gpu.fiber_tensors.polydata_to_numpy(filtered_reg_pd, 15)
                 labeled_pd, cluster_numbers, color, embed = wma.cluster.spectral_atlas_label(
-                    filtered_reg_pd, atlas, number_of_jobs=workers, queries_15=queries_15)
+                    filtered_reg_pd, atlas, number_of_jobs=workers,
+                    queries_15=queries_15, prepared_gpu=prepared_gpu)
                 if use_indexed:
                     labels_arr = numpy.asarray(cluster_numbers, dtype=numpy.int64)
                     valid_order = numpy.flatnonzero(labels_arr >= 0)
@@ -954,7 +1105,8 @@ def run_pipeline(args):
                 use_indexed = False
                 empty_pd = _empty_like_schema(filtered_reg_pd)
                 cluster_pds = [_empty_like_schema(empty_pd) for _ in range(number_of_clusters)]
-            del filtered_reg_pd, atlas
+            del filtered_reg_pd, atlas, prepared_gpu
+            session.release_spectral_atlas()
             gc.collect()
             timings['clustering'] = time.perf_counter() - t0
 
@@ -970,7 +1122,8 @@ def run_pipeline(args):
                     has_existing_hemi, existing_hemi_labels,
                     atlas_cluster_paths, atlas_cluster_names, atlas_bilateral,
                     location_data, args.outlier_sigma, args.outlier_std,
-                    backend, workers, verbose=args.verbose)
+                    backend, workers, verbose=args.verbose,
+                    ref_cache=session.ref_cache, ref_lock=session.ref_lock)
                 del cluster_line_indices, queries_15, labeled_geometry, existing_hemi_labels
                 gc.collect()
                 timings['outlier_and_hemisphere'] = time.perf_counter() - t0
@@ -995,7 +1148,8 @@ def run_pipeline(args):
                 cleaned_pds, log_rows, outlier_removed, retained_fibers, nonempty_clusters = _outlier_and_assess_clusters(
                     cluster_pds, atlas_cluster_paths, atlas_bilateral,
                     location_data, args.outlier_sigma, args.outlier_std,
-                    backend, workers, verbose=args.verbose)
+                    backend, workers, verbose=args.verbose,
+                    ref_cache=session.ref_cache, ref_lock=session.ref_lock)
                 del cluster_pds
                 gc.collect()
 
@@ -1229,13 +1383,115 @@ def run_pipeline(args):
             shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
-    return final_dir
+    return final_dir, qc_summary
+
+
+def _run_pipeline_with_status(args):
+    is_batch, input_paths = _discover_inputs(args)
+    wma.gpu.apply_gpu_arguments(args)
+    workers = _effective_workers(args.jobs)
+    slicer_path = _resolve_slicer_executable(args.slicer)
+    output_root = Path(args.output).resolve()
+
+    with _AtlasSession(args, keep_resident=is_batch) as session:
+        if not is_batch:
+            case_id, subj_path = input_paths[0]
+            final_dir, _ = _run_subject(case_id, subj_path, args, session, workers, slicer_path)
+            return final_dir, 0
+
+        output_root.mkdir(parents=True, exist_ok=True)
+        batch_start = time.perf_counter()
+        records = []
+        succeeded = 0
+        failed = 0
+
+        for idx, (case_id, subj_path) in enumerate(input_paths, start=1):
+            subj_start = time.perf_counter()
+            try:
+                final_dir, qc = _run_subject(case_id, subj_path, args, session, workers, slicer_path)
+                succeeded += 1
+                records.append({
+                    'index': idx,
+                    'case_id': case_id,
+                    'input_file': str(subj_path),
+                    'output_dir': str(final_dir),
+                    'status': 'ok',
+                    'total_seconds': round(time.perf_counter() - subj_start, 6),
+                    'retained_clustered_fibers': qc['retained_clustered_fibers'],
+                    'stage_timings_s': qc['stage_timings_s'],
+                })
+            except Exception as exc:
+                failed += 1
+                records.append({
+                    'index': idx,
+                    'case_id': case_id,
+                    'input_file': str(subj_path),
+                    'status': 'failed',
+                    'total_seconds': round(time.perf_counter() - subj_start, 6),
+                    'error': f'{type(exc).__name__}: {exc}',
+                })
+                if not args.continue_on_error:
+                    batch_summary = {
+                        'atlas_dir': str(session.atlas_base),
+                        'atlas_family': session.resolved_atlas.family,
+                        'reg_mode': args.reg_mode,
+                        'total_subjects': len(input_paths),
+                        'succeeded_subjects': succeeded,
+                        'failed_subjects': failed,
+                        'total_wall_seconds': round(time.perf_counter() - batch_start, 6),
+                        'subjects': records,
+                    }
+                    tmp_path = None
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                                'w', dir=str(output_root), suffix='.json',
+                                delete=False, encoding='utf-8') as fh:
+                            tmp_path = fh.name
+                            fh.write(json.dumps(batch_summary, indent=2) + '\n')
+                        os.replace(tmp_path, str(output_root / 'batch_qc_summary.json'))
+                    finally:
+                        if tmp_path is not None and os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+                    raise
+            finally:
+                gc.collect()
+
+        batch_summary = {
+            'atlas_dir': str(session.atlas_base),
+            'atlas_family': session.resolved_atlas.family,
+            'reg_mode': args.reg_mode,
+            'total_subjects': len(input_paths),
+            'succeeded_subjects': succeeded,
+            'failed_subjects': failed,
+            'total_wall_seconds': round(time.perf_counter() - batch_start, 6),
+            'subjects': records,
+        }
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    'w', dir=str(output_root), suffix='.json',
+                    delete=False, encoding='utf-8') as fh:
+                tmp_path = fh.name
+                fh.write(json.dumps(batch_summary, indent=2) + '\n')
+            os.replace(tmp_path, str(output_root / 'batch_qc_summary.json'))
+        finally:
+            if tmp_path is not None and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+        return output_root, failed
+
+
+def run_pipeline(args):
+    result_path, _ = _run_pipeline_with_status(args)
+    return result_path
 
 
 def main():
     parser = _build_arg_parser()
     args = parser.parse_args()
-    run_pipeline(args)
+    _, failed = _run_pipeline_with_status(args)
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

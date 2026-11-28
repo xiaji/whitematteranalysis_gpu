@@ -967,6 +967,117 @@ class ORGPipelineCLITests(unittest.TestCase):
                 self.assertIsNotNone(space_idx)
                 self.assertEqual(space_idx.GetValue(0), 'RAS')
 
+    def test_batch_mode_reuses_resident_atlas_and_handles_manifests_and_errors(self):
+        org_cli = _load_module('wm_apply_ORG_atlas_batch', ORG_CLI_PATH)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            atlas_root = root / 'ORG-Atlas'
+            _build_synthetic_org_atlas(atlas_root)
+
+            fibers_a = (
+                _bundle_coords(-35.0, 0.0, 5, n_pts=21, step=3.0, seed=111)
+                + _bundle_coords(35.0, 0.0, 5, n_pts=21, step=3.0, seed=112)
+                + _bundle_coords(0.0, 35.0, 5, n_pts=21, step=3.0, commissural=True, seed=113)
+            )
+            fibers_b = (
+                _bundle_coords(-35.0, 0.0, 4, n_pts=21, step=3.0, seed=114)
+                + _bundle_coords(35.0, 0.0, 4, n_pts=21, step=3.0, seed=115)
+                + _bundle_coords(0.0, 35.0, 4, n_pts=21, step=3.0, commissural=True, seed=116)
+            )
+            in_dir = root / 'subjects'
+            in_dir.mkdir()
+            sub_a = in_dir / 'sub-01.vtp'
+            sub_b = in_dir / 'sub-02.vtp'
+            wma.io.write_polydata(_make_tract_polydata(fibers_a, tags=[float(i + 1) for i in range(len(fibers_a))]), str(sub_a))
+            wma.io.write_polydata(_make_tract_polydata(fibers_b, tags=[float(i + 100) for i in range(len(fibers_b))]), str(sub_b))
+
+            # Single-subject reference for sub-02
+            out_single = root / 'out_single'
+            with patch.object(sys, 'argv', [
+                str(ORG_CLI_PATH), '-i', str(sub_b), '-o', str(out_single),
+                '-a', str(atlas_root), '-r', 'rig', '-j', '2', '-gpu', 'off']):
+                org_cli.main()
+
+            # Batch mode via --input-dir loads registration atlas & spectral atlas only ONCE
+            out_batch = root / 'out_batch'
+            orig_read = wma.io.read_polydata
+            reg_reads = []
+
+            def _counting_read(path, *a, **kw):
+                if Path(path).name == 'registration_atlas.vtk':
+                    reg_reads.append(path)
+                return orig_read(path, *a, **kw)
+
+            with patch.object(wma.io, 'read_polydata', side_effect=_counting_read), \
+                    patch.object(wma.cluster, 'load_atlas', wraps=wma.cluster.load_atlas) as atlas_loader, \
+                    patch.object(sys, 'argv', [
+                        str(ORG_CLI_PATH), '--input-dir', str(in_dir), '-o', str(out_batch),
+                        '-a', str(atlas_root), '-r', 'rig', '-j', '2', '-gpu', 'off']):
+                org_cli.main()
+
+            self.assertEqual(len(reg_reads), 1)
+            self.assertEqual(atlas_loader.call_count, 1)
+            self.assertEqual(atlas_loader.call_args.kwargs.get('for_labeling'), True)
+
+            batch_qc = json.loads((out_batch / 'batch_qc_summary.json').read_text())
+            self.assertEqual(batch_qc['total_subjects'], 2)
+            self.assertEqual(batch_qc['succeeded_subjects'], 2)
+            self.assertEqual(batch_qc['failed_subjects'], 0)
+
+            qc_single_b = json.loads((out_single / 'sub-02' / 'qc_summary.json').read_text())
+            qc_batch_b = json.loads((out_batch / 'sub-02' / 'qc_summary.json').read_text())
+            self.assertEqual(qc_batch_b['tracts'], qc_single_b['tracts'])
+            self.assertEqual(qc_batch_b['retained_clustered_fibers'], qc_single_b['retained_clustered_fibers'])
+
+            # -i <dir> + per-subject transform directory support
+            tfm_dir = root / 'tfms'
+            tfm_dir.mkdir()
+            tx = vtk.vtkTransform()
+            tx.Translate(5.0, -3.0, 2.0)
+            wma.io.write_transforms_to_itk_format([tx], str(tfm_dir), ['sub-01'])
+            wma.io.write_transforms_to_itk_format([tx], str(tfm_dir), ['sub-02'])
+            out_dir_i = root / 'out_batch_i_tfm'
+            with patch.object(sys, 'argv', [
+                str(ORG_CLI_PATH), '-i', str(in_dir), '-o', str(out_dir_i),
+                '-a', str(atlas_root), '-t', str(tfm_dir), '-r', 'rig', '-j', '1', '-gpu', 'off']):
+                org_cli.main()
+            self.assertTrue((out_dir_i / 'sub-01' / 'qc_summary.json').is_file())
+            self.assertTrue((out_dir_i / 'sub-02' / 'qc_summary.json').is_file())
+
+            # --input-list with blank/comment lines + --continue-on-error + empty polydata failure
+            bad_sub = root / 'sub-bad.vtp'
+            empty_pd = vtk.vtkPolyData()
+            empty_pd.SetPoints(vtk.vtkPoints())
+            empty_pd.SetLines(vtk.vtkCellArray())
+            wma.io.write_polydata(empty_pd, str(bad_sub))
+            manifest = root / 'subjects.txt'
+            manifest.write_text(f"# batch list\n\n{sub_a.name}\n{bad_sub}\n", encoding='utf-8')
+            # Write relative sub_a from root? Put symlink/copy or use full path so relative resolves cleanly
+            manifest.write_text(f"# batch list\n\nsubjects/{sub_a.name}\n{bad_sub}\n", encoding='utf-8')
+            out_err = root / 'out_continue_err'
+            with patch.object(sys, 'argv', [
+                str(ORG_CLI_PATH), '--input-list', str(manifest), '-o', str(out_err),
+                '-a', str(atlas_root), '-r', 'rig', '-j', '1', '-gpu', 'off', '--continue-on-error']):
+                with self.assertRaises(SystemExit) as cm:
+                    org_cli.main()
+                self.assertNotEqual(cm.exception.code, 0)
+            err_qc = json.loads((out_err / 'batch_qc_summary.json').read_text())
+            self.assertEqual(err_qc['succeeded_subjects'], 1)
+            self.assertEqual(err_qc['failed_subjects'], 1)
+            self.assertEqual(err_qc['subjects'][0]['status'], 'ok')
+            self.assertEqual(err_qc['subjects'][1]['status'], 'failed')
+
+            # Duplicate case_id across .vtp and .vtk raises ValueError before processing
+            dup_vtk = root / 'sub-01.vtk'
+            wma.io.write_polydata(_make_tract_polydata(fibers_a), str(dup_vtk))
+            dup_manifest = root / 'dup.txt'
+            dup_manifest.write_text(f"{sub_a}\n{dup_vtk}\n", encoding='utf-8')
+            with patch.object(sys, 'argv', [
+                str(ORG_CLI_PATH), '--input-list', str(dup_manifest), '-o', str(root / 'out_dup'),
+                '-a', str(atlas_root), '-r', 'rig', '-gpu', 'off']):
+                with self.assertRaisesRegex(ValueError, 'Duplicate case_id'):
+                    org_cli.main()
+
 
 if __name__ == '__main__':
     unittest.main()
