@@ -32,44 +32,25 @@ CPU outputs were byte-identical to joblib. GPU membership, connectivity and
 attributes matched; maximum coordinate difference: **1.91e-6 mm**.
 See the [acceleration overview](doc/acceleration.md) for details.
 
-### Single-process ORG CLI & Phase 2 GPU updates (`fan93`, 2x RTX 3090)
+### Single-process ORG CLI & Phase 2–4 GPU updates (`fan93`, 2x RTX 3090)
 
-For tensor-free rigid ORG parcellation, [bin/wm_apply_ORG_atlas.py](bin/wm_apply_ORG_atlas.py) runs
-registration, spectral clustering, outlier removal, pure-Python affine hardening,
-hemisphere separation and anatomical tract assembly in a single Python process
-with no 3D Slicer or SlicerDMRI subprocesses required (recording `qc_summary.json`
-and publishing atomically by default):
+For tensor-free rigid ORG parcellation (single-subject or persistent multi-subject batch),
+[bin/wm_apply_ORG_atlas.py](bin/wm_apply_ORG_atlas.py) runs registration, spectral clustering,
+outlier removal, pure-Python affine hardening, hemisphere separation and anatomical tract
+assembly in a single Python process with no 3D Slicer or SlicerDMRI subprocesses required
+(recording `qc_summary.json` / `batch_qc_summary.json` and publishing atomically by default):
 
 ```shell
+# Single subject (zero-intermediate Tier-1 fast path is enabled by default)
 wm_apply_ORG_atlas.py -i subject.vtp -o output_dir -a /path/to/ORG-Atlases -r rig -j 4 -gpu on
+
+# Persistent multi-subject batch (reuses spectral atlas + GPU-resident tensors + outlier cache across subjects)
+wm_apply_ORG_atlas.py --input-dir subjects/ -o batch_out -a /path/to/ORG-Atlases -r rig -j 4 -gpu on --continue-on-error
 ```
 
-On `sub-13086` (**340,795 streamlines**, `ORG-RegAtlas-100HCP` + `ORG-800FC-100HCP`,
-dual NVIDIA RTX 3090, warm `float64` atlas cache, `-r rig -j 4 -gpu on`),
-`wm_apply_ORG_atlas.py` completed end-to-end in **2:05.21 (125.21 s)** with
-**4,057.2 MiB** peak RSS (`hardening_backend: pure_python_affine`), writing all
-**76** `AnatomicalTracts/T_*.vtp` outputs (74 curated bundles plus left/right
-`T_FalsePositive`). In microbenchmarks on RTX 3090, Phase 2 adds FP32 + arbitrary
-`1 <= P <= 64` points-per-fiber Triton kernels (`5.9x` faster warm `spectral_atlas_label`
-and `3.2x` faster warm registration in `float32`), split-C low-VRAM `nearest_centroids`
-(`88x–111x` faster than `torch.cdist` in `float32`, `22x–25x` in `float64`),
-and multi-GPU scheduling (`1.63x` on 340k `float64` labeling and `1.78x` on 800-cluster
-outlier removal across 2 GPUs).
+Phase 4 adds three P0 end-to-end optimizations—**zero-intermediate indexed ORG parcellation** (`--keep-intermediates 0` skipping 800-cluster VTK materialization and per-cluster affine/hemisphere copies), a **`1.2 MiB` binary `.npz` spectral atlas inference cache** (`WMA_ATLAS_CACHE/spectral-atlas/`) with **GPU-resident atlas prep**, and **persistent multi-subject batch mode** (`-i <dir>` / `--input-dir` / `--input-list`). On `sub-13086` (**340,795 streamlines**, `ORG-RegAtlas-100HCP` + `ORG-800FC-100HCP`, dual NVIDIA RTX 3090, `-r rig -j 4 -gpu on`), end-to-end wall time drops from Phase 2's **2:05.21 (125.21 s)** (`90.237 s` `clustering`) to **39.76 s** (cold cache, `float64`), **29.78 s** (warm cache, `float64`, **`4.20x` speedup** with **`28.5x` faster clustering** at `3.171 s`), and **25.12 s** (warm cache, `-gpu_float32`, **`0.996 s` clustering**) with identical `76` `AnatomicalTracts/T_*.vtp` bundles (`max_coord_diff = 0.000e+00` vs `--keep-intermediates 2` on real 5k parity test). In persistent 2-subject batch mode (`sub-13001` 326k + `sub-13086` 341k fibers, warm `float64`), both whole-brain subjects complete in **55.30 s** total (`21.19 s` for `sub-13086`).
 
-Phase 3 extends nonrigid B-spline acceleration, atlas construction, and multi-atlas
-support: `NonrigidObjective` adds cached 1D separable GPU prefiltering and an unrolled
-1-thread-per-point Triton kernel (`2.08x–2.82x` faster per evaluation in `float64`,
-`2.23x–4.21x` in `float32`), opt-in `WMA_NONRIGID_ANALYTIC_GRAD=1` L-BFGS-B
-analytic gradients (`10.89x` faster at `R=4`), and vectorized `105^3` BSpline ITK
-`.tfm` export (`2.209 s`). Atlas construction adds `pinv_A` reuse and column-tiled
-GPU Nyström projection in `cluster.spectral`, plus `O(N)` GPU LOO scoring in
-`compute_cluster_loo_similarity` (`4.82x` faster, `max_diff = 4.163e-17`), while
-`whitematteranalysis.atlases` and `--atlas-family {auto,org,east-west,naba}` support
-validated ORG (`76` `T_*.vtp`), East-West (`76`), and NABA (`78`) pipelines, and
-opt-in `WMA_GPU_PROCESS_POOL=1` enables multi-process linear groupwise GPU workers.
-See [doc/acceleration.md](doc/acceleration.md#phase-2-benchmarks-fan93-rtx-3090)
-and [Phase 3 benchmarks](doc/acceleration.md#phase-3-benchmarks-fan93-rtx-3090)
-for complete Benchmarks A–F tables.
+In earlier Phase 2–3 updates on RTX 3090, WMA also added FP32 + arbitrary `1 <= P <= 64` Triton kernels, split-C low-VRAM `nearest_centroids` (`88x–111x` vs `torch.cdist` in `float32`), multi-GPU labeling/outlier dispatch, cached 1D separable GPU B-spline prefiltering + 1-thread-per-point Triton kernel + `WMA_NONRIGID_ANALYTIC_GRAD=1` L-BFGS-B gradients (`10.89x` faster at `R=4`) and vectorized `105^3` `.tfm` export, GPU `pinv_A` reuse + `O(N)` LOO similarity (`4.82x` faster), and validated multi-atlas support (`--atlas-family {auto,org,east-west,naba}` yielding `76` / `76` / `78` `T_*.vtp` bundles). See [doc/acceleration.md](doc/acceleration.md#phase-2-benchmarks-fan93-rtx-3090), [Phase 3 benchmarks](doc/acceleration.md#phase-3-benchmarks-fan93-rtx-3090), and [Phase 4 (P0) benchmarks](doc/acceleration.md#phase-4-p0-benchmarks-fan93-rtx-3090) for complete Benchmarks A–G tables.
 
 # GPU and 3D Slicer quick start
 
@@ -117,7 +98,7 @@ Linux / Python 3.8 and Slicer 5.2.2 / Python 3.9 were tested; Windows has not be
 | `WMA_GPU_FLOAT32=1` | Opt into float32; default is float64 |
 | `WMA_GPU_STRICT=1` | Use strict non-fused float64 registration reductions for bit-exact parity |
 | `WMA_GPU_MPS=1` | Opt into experimental Apple Silicon MPS when `WMA_GPU_FLOAT32=1` (`-gpu_float32`) and CUDA is absent |
-| `WMA_ATLAS_CACHE=/path/to/cache` | Override the automatic outlier atlas cache; `off` disables it |
+| `WMA_ATLAS_CACHE=/path/to/cache` | Override the automatic atlas cache directory (outlier reference caches and `.npz` spectral atlas inference caches); `off` disables both |
 
 These environment variables apply to the Python/CLI backend. Slicer pages provide
 their own Backend selection. Some CLI tools also expose `-gpu auto|on|off`,

@@ -80,6 +80,18 @@ Source: [CPU backend](../whitematteranalysis/gpu/cpu_backend.py),
   labeled tractogram after splitting, before the cluster writers start.
 - Atlas construction reuses the accelerated distance/similarity operations.
   Sampling and clustering settings are kept consistent across backends.
+- **Lightweight spectral atlas inference cache & GPU-resident prep:** Calling
+  `wma.cluster.load_atlas(..., for_labeling=True)` (used by `bin/wm_apply_ORG_atlas.py`)
+  reads or writes a compact binary archive at
+  `<WMA_ATLAS_CACHE>/spectral-atlas/<sha256>.npz` (`allow_pickle=False`)
+  containing precomputed `(m, 15, 3)` `nystrom_coords`, `row_sum_1`,
+  `row_sum_matrix`, top `k + 1` slices of `e_vec`/`e_val`/`e_vec_norm`,
+  `centroids`, and validated metadata (including strict Boolean `bilateral`),
+  avoiding unpickling the full `atlas.p` and reading/resampling `atlas.vtp` on
+  warm runs (`1.2 MiB` for `ORG-800FC-100HCP`). Callers can pre-upload atlas
+  tensors to CUDA with `whitematteranalysis.gpu.linalg.prepare_atlas_gpu` and
+  reuse `prepared_gpu` across subjects, and `mask_all_clusters(..., number_of_jobs=...)`
+  parallelizes polydata cluster splitting when cluster intermediates are saved.
 
 Source: [CPU labeling](../whitematteranalysis/gpu/cpu_backend.py),
 [GPU distances](../whitematteranalysis/gpu/distance.py),
@@ -176,13 +188,28 @@ tract assembly run on the CPU:
 - **Tier 3 (Full SlicerDMRI hardening):** Legacy Slicer `FiberBundleNode`
   hardening remains active when tensor arrays are present and SlicerDMRI is
   installed.
-- **Single-process ORG pipeline:** [bin/wm_apply_ORG_atlas.py](../bin/wm_apply_ORG_atlas.py)
-  orchestrates registration, 40 mm length filtering, spectral clustering,
-  multi-GPU/threaded outlier removal + hemisphere assessment, tiered hardening
-  + separation, and anatomical tract assembly in one Python process (using
-  `ThreadPoolExecutor` / `use_threads=True` VTP writes after CUDA init to avoid
-  post-CUDA `fork()` hazards, writing `qc_summary.json`, and staging outputs
-  atomically).
+- **Single-process ORG pipeline (zero-intermediate indexed fast path):**
+  [bin/wm_apply_ORG_atlas.py](../bin/wm_apply_ORG_atlas.py) orchestrates
+  registration, 40 mm length filtering, spectral clustering, multi-GPU/threaded
+  outlier removal + hemisphere assessment, tiered hardening + separation, and
+  anatomical tract assembly in one Python process (using `ThreadPoolExecutor` /
+  `use_threads=True` VTP writes after CUDA init to avoid post-CUDA `fork()`
+  hazards, writing `qc_summary.json`, and staging outputs atomically). On the
+  default Tier-1 `pure_python_affine` path (`--keep-intermediates 0`), it reuses
+  a single whole-brain `queries_15` tensor across `spectral_atlas_label` and
+  indexed cluster outlier scoring, runs vectorized 40-point hemisphere
+  assessment directly on point arrays, applies a single `apply_affine_to_polydata`
+  pass to the full tractogram, and assembles all `AnatomicalTracts/T_*.vtp`
+  bundles directly in parallel—skipping 800 intermediate cluster VTP objects,
+  per-cluster affine copies, and 2,400 hemisphere splits.
+- **Persistent multi-subject batch mode:** Passing `-i <dir>` (when `<dir>` is a
+  directory), `--input-dir <dir>`, or `--input-list <manifest.txt>` processes
+  multiple `.vtp`/`.vtk` inputs in one process while `_AtlasSession` keeps
+  `registration_atlas.vtk`, the spectral `.npz` atlas, GPU-resident `prepared_gpu`,
+  and a thread-safe in-memory 800-cluster outlier reference cache alive across
+  subjects. Supports per-subject `-t <dir>` transform directories,
+  `--continue-on-error` (with non-zero exit when any subject fails), and
+  atomic `batch_qc_summary.json`.
 
 ### Legacy Slicer batching notes (shell pipeline)
 
@@ -413,4 +440,66 @@ Both `east-west/ATLAS.json` and `naba/ATLAS.json` also passed `--atlas-family au
 | `cluster.spectral` (`N=4000, m=1000, k=10`, shared host load, warm GPU `3`) | `23.328 s` | `19.995 s` | **1.17x** | Sign-aligned `emb_max_diff = 4.194e-11`; `pinv_max_diff = 6.931e-07` |
 | `cluster.spectral` (`N=10000, m=1500, k=200`, shared host load, warm GPU `3`) | `38.818 s` | `33.448 s` | **1.16x** | Sign-aligned `emb_max_diff = 1.395e-10`; `pinv_max_diff = 4.210e-06` |
 
-Under low host CPU load on first-call GPU `5` (`N=4000, m=1000, k=10`, including CUDA/cuSOLVER init), `cluster.spectral` measured `1.268 s` CPU vs `2.216 s` cold-JIT GPU (`emb_max_diff = 4.194e-11`). For multi-GPU linear groupwise registration, `WMA_GPU_PROCESS_POOL=1` spawn dispatch and pickling parity passed unit verification (`test_congeal_multisubject_gpu_process_pool_worker_and_dispatch`), while live 2-GPU wall-time measurement on `fan93` was skipped after host GPU `2` entered a PCIe/NVML hardware fault (`0000:56:00.0: Unknown Error`).
+Under low host CPU load on first-call GPU `5` (`N=4000, m=1000, k=10`, including CUDA/cuSOLVER init), `cluster.spectral` measured `1.268 s` CPU vs `2.216 s` cold-JIT GPU (`emb_max_diff = 4.194e-11`). For multi-GPU linear groupwise registration, `WMA_GPU_PROCESS_POOL=1` spawn dispatch and pickling parity passed unit verification (`test_congeal_multisubject_gpu_process_pool_worker_and_dispatch`), while live 2-GPU wall-time measurement on `fan93` was deferred after host GPU `2` entered a PCIe/NVML hardware fault (see [Benchmark G4](#phase-4-p0-benchmarks-fan93-rtx-3090) below after host recovery).
+
+## Phase 4 (P0) benchmarks (`fan93`, RTX 3090)
+
+Measured on `fan93` (`NVIDIA GeForce RTX 3090` dual GPUs, PyTorch `2.8.0+cu128`,
+Triton `3.4.0`, SciPy `1.13.1`, NumPy `2.0.2`, VTK `9.6.2`) using geometry-only
+`sub-13086` (**340,795 fibers**) and `sub-13001` (**325,659 fibers**) with
+`ORG-RegAtlas-100HCP` + `ORG-800FC-100HCP` (`-r rig -j 4 -gpu on`,
+`hardening_backend = "pure_python_affine"`, `WMA_ATLAS_CACHE`).
+
+### Benchmark G1: Real-data parity (`5,000`-fiber `sub-13086`, GPUs `0, 5`, `--keep-intermediates 0` vs `2`)
+
+| Check | `--keep-intermediates 0` (Indexed) | `--keep-intermediates 2` (Legacy Clusters) | Parity |
+| --- | ---: | ---: | --- |
+| `T_*.vtp` bundles written | `76` | `76` | Exact (`76 / 76`) |
+| Total fibers across all 76 bundles | `509` | `509` | `0` diffs across all 76 bundles |
+| `qc_summary.json` counts | `Pure Python` affine (`76` tracts written) | `Pure Python` affine (`76` tracts written) | Exact match (`input`, `registered`, `filtered`, `excluded_short`, `outlier_removed`, `retained_clustered`, `anatomical_tracts_written`) |
+| Point coordinate difference | — | — | `max_coord_diff = 0.000e+00` |
+
+### Benchmark G2: End-to-end 340k `sub-13086` (`GPUs 0, 5`, `-r rig -j 4 -gpu on`) vs Phase 2 Benchmark D
+
+All Phase 4 runs preserved exact fiber outputs against Phase 2 Benchmark D:
+`float64` runs matched `48,906` retained clustered fibers and `37,323` fibers
+across `76` `T_*.vtp` bundles; `-gpu_float32` matched `48,497` retained and
+`37,007` fibers across `76` bundles. The `ORG-800FC-100HCP` binary `.npz`
+spectral cache occupied **`1.2 MiB`**.
+
+| Run | Wall Time (`/usr/bin/time -v`) | Pipeline `total` | `load_input` | `registration` | `clustering` | `outlier_and_hemisphere` | `hardening_and_separation` | `tract_assembly` | Peak RSS | Speedup vs Phase 2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Phase 2 `float64` (warm `f64` outlier cache) | `2:05.21` (`125.21 s`) | — | — | — | `90.237 s` | `5.581 s` | — | — | `4,057.22 MiB` | `1.00x` |
+| **Phase 4 cold cache (`float64`, P0)** | **0:39.76** (`39.76 s`) | `35.634 s` | `12.267 s` | `7.037 s` | `3.568 s` | `7.143 s` | `1.100 s` | `2.330 s` | `4,057.36 MiB` | **3.15x** |
+| **Phase 4 warm `.npz` + outlier cache (`float64`)** | **0:29.78** (`29.78 s`) | `27.016 s` | `9.800 s` | `5.792 s` | `3.171 s` | `2.588 s` | `1.116 s` | `2.433 s` | `4,059.13 MiB` | **4.20x** (`28.5x` clustering) |
+| **Phase 4 warm `-gpu_float32`** | **0:25.12** (`25.12 s`) | `22.391 s` | `9.612 s` | `4.250 s` | `0.996 s` | `1.954 s` | `0.948 s` | `2.279 s` | `4,059.11 MiB` | **4.98x** vs P2 `f64` (**5.47x** vs P2 `f32`) |
+
+### Benchmark G3: Persistent single-process 2-subject batch (`--input-dir`, GPUs `0, 5`, warm `float64` cache)
+
+Batch input: `sub-13001` (`325,659` fibers -> `92,410` retained) followed by
+`sub-13086` (`340,795` fibers -> `48,906` retained) in one process
+(`total_subjects = 2`, `succeeded_subjects = 2`, `failed_subjects = 0`, Peak RSS
+`5,262,820 KiB` / `5,139.47 MiB`).
+
+| Metric / Subject | Wall Time | `load_input` | `registration` | `forward_transform` | `length_filter` | `clustering` | `outlier_and_hemisphere` | `hardening_and_separation` | `tract_assembly` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Subject 1 (`sub-13001`, 326k) | `31.328 s` | `8.524 s` | `5.472 s` | `1.048 s` | `1.054 s` | `2.181 s` | `7.694 s` | `1.218 s` | `4.135 s` |
+| Subject 2 (`sub-13086`, 341k) | **21.186 s** | `10.344 s` | **2.565 s** | `1.036 s` | `1.074 s` | **1.683 s** | **1.112 s** | `0.965 s` | `2.406 s` |
+| **Full 2-subject batch (`/usr/bin/time -v`)** | **55.30 s** (`52.604 s` session) | — | — | — | — | — | — | — | — |
+
+On Subject 2 (`sub-13086`), keeping `registration_atlas.vtk`, GPU-resident
+`prepared_gpu`, and the in-memory 800-cluster outlier reference cache resident
+cut compute+hardening time (excluding initial VTP file read) to **`10.841 s`**.
+
+### Benchmark G4: Live 2-GPU `WMA_GPU_PROCESS_POOL` scaling (`MultiSubjectRegistration`, GPUs `0, 4`, `4 x 2,000` fibers, `Affine`, `maxfun=60`, `parallel_jobs=4`)
+
+| Configuration | Cold-init `run1` | Warm `run2` | Max Transform Diff vs `1 GPU` |
+| --- | ---: | ---: | ---: |
+| `1 GPU` (`WMA_GPU_PROCESS_POOL=0`) | `1.833 s` | `0.132 s` | `0` (ref) |
+| `2 GPUs` threaded (`WMA_GPU_PROCESS_POOL=0`) | — | `0.115 s` | — |
+| `2 GPUs` spawn pool (`WMA_GPU_PROCESS_POOL=1`) | `4.023 s` | `3.361 s` | `0.000e+00` |
+
+Spawn process-pool dispatch matches single-GPU transforms bitwise
+(`0.000e+00`), while fixed spawn/IPC startup overhead (`~3.2 s`) exceeds the
+compute runtime for small `4 x 2,000` COBYLA workloads and is intended for longer
+large-cohort linear registration jobs.
