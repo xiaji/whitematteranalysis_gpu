@@ -164,21 +164,6 @@ class FileStageTests(unittest.TestCase):
             self.assertTrue(found)
             np.testing.assert_array_equal(labels, [6., 0., 13.])
 
-    @unittest.skipUnless(shutil.which('bash'), 'Bash is required for the ORG shell workflow')
-    def test_parallel_catalogue_resume_requires_every_cluster(self):
-        source = (ROOT/'bin/wm_apply_ORG_atlas_to_subject.sh').read_text()
-        start = source.index('function all_clusters_present {')
-        function = source[start:source.index('\n}', start)+2]
-        directory = self.directory/'incomplete catalogue'
-        directory.mkdir()
-        for index in range(1, 801):
-            if index != 42:
-                (directory/('cluster_%05d.vtp' % index)).touch()
-        command = ['bash', '-c', function+'\nall_clusters_present "$1"', '--', str(directory)]
-        self.assertNotEqual(subprocess.run(command).returncode, 0)
-        (directory/'cluster_00042.vtp').touch()
-        self.assertEqual(subprocess.run(command).returncode, 0)
-
     def test_parallel_worker_errors_fail_the_command(self):
         source = self.directory/'missing labels'
         source.mkdir()

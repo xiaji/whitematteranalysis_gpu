@@ -1,7 +1,7 @@
 # Command-line reference
 
-This reference covers all **28 top-level scripts in `bin/`**, including the
-internal Slicer transform helper.
+This reference covers the **Python CLI scripts in `bin/`**, including
+`wm_apply_ORG_atlas.py` (`wma org`) and the internal Slicer transform helper.
 Each entry describes the current implementation, its arguments, output and an
 example. Defaults below are effective runtime defaults, including defaults set
 after argument parsing. Flag spelling and capitalization matter.
@@ -12,9 +12,7 @@ Install this checkout with `python -m pip install .`; see the
 [README](../README.md#1-command-line-interface-conda--pip--uv) for CPU/GPU dependencies. Examples
 below run from the repository root and use placeholder paths. Replace these with
 your files. Installed Python scripts can also be invoked directly, for example
-`wm_cluster_from_atlas.py --help`. The shell pipeline calls these installed
-commands through `PATH`, so installation is required even when running it from
-the checkout.
+`wm_cluster_from_atlas.py --help`, or through the unified `wma` CLI (`wma list`).
 
 - Tractography inputs are VTK PolyData `.vtk` or `.vtp`, in **RAS coordinates,
   millimeters**. Most directory arguments scan files directly inside the named
@@ -30,10 +28,9 @@ the checkout.
   transform helper can reuse existing outputs.
 - Commands that render images need a working VTK/OpenGL display. Use `-norender`
   where available, or run under `xvfb-run -a` on a suitably configured headless
-  Linux system. The shell pipeline's `-x 1` selects its virtual-display path.
-- Shell examples use POSIX syntax. The `.sh` pipeline requires Bash and its shell
-  utilities; these examples are not native PowerShell commands. Python scripts
-  use the same arguments across platforms with native paths.
+  Linux system.
+- Examples below use POSIX syntax; Python scripts use the same arguments across
+  platforms with native paths.
 
 ### Shared acceleration options
 
@@ -75,13 +72,13 @@ python bin/wm_cluster_from_atlas.py \
 `-j` / `--jobs` controls parallelism where a command exposes it; it does not
 select a GPU. `WMA_CPU_THREADS` sets the accelerated CPU budget, and
 `WMA_ATLAS_CACHE` controls the reusable outlier reference cache. See the
-[README settings](../README.md#python--command-line) for other environment options.
+[README configuration](../README.md#configuration) for other environment options.
 
 ## Command index
 
 | Workflow | Scripts |
 | --- | --- |
-| Full pipeline and atlas download | [wm_apply_ORG_atlas_to_subject.sh](#wm_apply_org_atlas_to_subjectsh), [wm_download_anatomically_curated_atlas.py](#wm_download_anatomically_curated_atlaspy) |
+| Full pipeline and atlas download | [wm_apply_ORG_atlas.py](#wm_apply_org_atlaspy), [wm_download_anatomically_curated_atlas.py](#wm_download_anatomically_curated_atlaspy) |
 | Registration and transforms | [wm_register_to_atlas_new.py](#wm_register_to_atlas_newpy), [wm_register_multisubject_faster.py](#wm_register_multisubject_fasterpy), [wm_harden_transform.py](#wm_harden_transformpy), [harden_transform_with_slicer.py](#harden_transform_with_slicerpy) |
 | Atlas construction and parcellation | [wm_cluster_atlas.py](#wm_cluster_atlaspy), [wm_cluster_from_atlas.py](#wm_cluster_from_atlaspy), [wm_cluster_remove_outliers.py](#wm_cluster_remove_outlierspy), [wm_assess_cluster_location_by_hemisphere.py](#wm_assess_cluster_location_by_hemispherepy), [wm_separate_clusters_by_hemisphere.py](#wm_separate_clusters_by_hemispherepy), [wm_append_clusters_to_anatomical_tracts.py](#wm_append_clusters_to_anatomical_tractspy) |
 | Preprocessing, merging and formats | [wm_preprocess_all.py](#wm_preprocess_allpy), [wm_remove_data_along_tracts.py](#wm_remove_data_along_tractspy), [wm_append_clusters.py](#wm_append_clusterspy), [wm_vtp2vtk.py](#wm_vtp2vtkpy), [wm_create_mrml_file.py](#wm_create_mrml_filepy), [wm_change_nrrd_dir.py](#wm_change_nrrd_dirpy) |
@@ -90,59 +87,28 @@ select a GPU. `WMA_CPU_THREADS` sets the accelerated CPU budget, and
 
 ## Full pipeline and atlas download
 
-### wm_apply_ORG_atlas_to_subject.sh
+### wm_apply_ORG_atlas.py
 
-[Source](../bin/wm_apply_ORG_atlas_to_subject.sh). Apply the ORG atlas to one
-whole-brain tractogram: registration, labeling, outlier removal, hemisphere
-assessment, inverse transformation to subject space, hemisphere separation and
-anatomical tract assembly. Diffusion-measure export is optional. Requires
-installed WMA commands and Slicer with **SlicerDMRI**.
-
-The shell pipeline passes the atlas hemisphere-location table to outlier
-removal, which labels the outlier outputs and writes the existing assessment
-marker. The standalone assessment stage then skips its extra read and rewrite.
-
-| Argument | Default / requirement | Meaning |
-| --- | --- | --- |
-| `-i FILE` | Required | Input subject tractography. |
-| `-o DIR` | Required | Output root; a subject subdirectory is derived from the input filename. |
-| `-a DIR` | Required | Atlas parent containing `ORG-RegAtlas-100HCP/` and `ORG-800FC-100HCP/`. |
-| `-s FILE` | Required | Slicer executable, not its containing directory. |
-| `-t FILE` | None | Initial transform into atlas-compatible adult brain size; its inverse is included when returning results to subject space. |
-| `-r {rig,nonrig}` | `rig` | `rig` runs the `rigid_affine_fast` preset (rigid **and affine**). `nonrig` runs affine followed by nonrigid registration. |
-| `-n N` | `1` | Worker count for supported CPU/file-processing stages. |
-| `-g {auto,on,off}` | `WMA_GPU`, otherwise `auto` | Backend selection; also accepts `1` / `0` for on / off. Unlike the Python tools, this shell option reads `WMA_GPU` as its default. |
-| `-x {0,1}` | `0` | Use a virtual X display for Slicer/rendering when `1`. Requires the corresponding Xvfb utilities. |
-| `-d {0,1}` | `0` | Export diffusion measurements when `1`; requires `-m`. |
-| `-m FILE` | None | SlicerDMRI `FiberTractMeasurements` CLI executable for `-d 1`. |
-| `-c {0,1,2}` | `0` | Cleanup: `0` retains intermediates; `1` removes initial and transformed bilateral clusters; `2` additionally removes registration temporaries and outlier-removed bilateral clusters. |
-| `-h` | Help | Print usage (currently exits with status 1). |
+[Source](../bin/wm_apply_ORG_atlas.py) (also invoked as `wma org`). Single-process
+Python pipeline for ORG, East-West, and NABA whole-brain parcellation (rigid+affine
+`-r rig` or nonrigid B-spline `-r nonrig`, single subject `-i` or persistent batch
+`--input-dir` / `--input-list`). Replaces the legacy Slicer-dependent bash script
+with pure-Python/VTK transform hardening and zero-intermediate execution
+(`--keep-intermediates 0`).
 
 ```shell
-WMA_GPU_DEVICES=0 bash bin/wm_apply_ORG_atlas_to_subject.sh \
-  -i data/subject.vtk -o work/pipeline_gpu \
-  -a atlases/ORG-Atlases-1.2 -s /path/to/Slicer \
-  -n 4 -g on -r rig -x 1 -c 0
+# Single-subject rigid+affine parcellation
+wma org -i data/subject.vtp -o work/pipeline_gpu -a atlases/ORG-Atlases -r rig -j 4 -gpu on
 
-# CPU matrix: use a separate output directory
-WMA_CPU_FAST=1 WMA_CPU_THREADS=4 bash bin/wm_apply_ORG_atlas_to_subject.sh \
-  -i data/subject.vtk -o work/pipeline_cpu \
-  -a atlases/ORG-Atlases-1.2 -s /path/to/Slicer \
-  -n 4 -g off -r rig -x 1 -c 0
+# Nonrigid B-spline parcellation with fused analytic GPU gradients
+WMA_NONRIGID_ANALYTIC_GRAD=1 wma org -i data/subject.vtp -o work/pipeline_nonrig -a atlases/ORG-Atlases -r nonrig -j 4 -gpu on
 
-# Original joblib: same pipeline, separate output directory
-WMA_CPU_FAST=0 bash bin/wm_apply_ORG_atlas_to_subject.sh \
-  -i data/subject.vtk -o work/pipeline_joblib \
-  -a atlases/ORG-Atlases-1.2 -s /path/to/Slicer \
-  -n 4 -g off -r rig -x 1 -c 0
+# Persistent multi-subject batch
+wma org --input-dir subjects/ -o work/batch_out -a atlases/ORG-Atlases -r rig -j 4 -gpu on --continue-on-error
 ```
 
-Outputs under `<output>/<subject>/` include `TractRegistration/`,
-`FiberClustering/{InitialClusters,OutlierRemovedClusters,TransformedClusters,SeparatedClusters}/`
-and `AnatomicalTracts/`. The current ORG-800 catalogue produces 74 anatomical
-tract files. Completion markers can skip completed stages on reruns. Intermediate
-VTPs use lossless LZ4 by default; final outputs use zlib. Set
-`WMA_VTP_COMPRESSION=zlib` to override intermediate compression.
+Run `wma org --help` or see [AGENTS.md](../AGENTS.md) for the full option list and
+`qc_summary.json` / `batch_qc_summary.json` output schema.
 
 ### wm_download_anatomically_curated_atlas.py
 
