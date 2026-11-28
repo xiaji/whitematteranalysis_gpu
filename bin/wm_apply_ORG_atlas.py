@@ -409,7 +409,7 @@ def _compute_cluster_outlier_scores(subject_array, atlas_array, total_similarity
     distance_method = 'Mean'
     n_atlas = len(atlas_array)
     if backend == 'gpu':
-        similarity_sums, _ = wma.gpu.distance.similarity_row_sums_from_arrays(
+        similarity_sums = wma.gpu.distance.similarity_row_sums_from_arrays(
             subject_array, atlas_array, 0.0, distance_method=distance_method,
             bilateral=atlas_bilateral, sigmasq=sigmasq,
             sqrt_distance_sums=False, device=device)

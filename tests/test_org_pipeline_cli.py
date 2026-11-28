@@ -1078,6 +1078,47 @@ class ORGPipelineCLITests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Duplicate case_id'):
                     org_cli.main()
 
+    def test_indexed_outlier_gpu_scoring_single_return_and_cuda_pipeline(self):
+        org_cli = _load_module('wm_apply_ORG_atlas_gpu_score', ORG_CLI_PATH)
+        subj_arr = np.zeros((3, 15, 3), dtype=np.float64)
+        atlas_arr = np.zeros((4, 15, 3), dtype=np.float64)
+        atlas_sim = np.ones(4, dtype=np.float64)
+        mock_sums = np.array([4.0, 2.0, 1.0], dtype=np.float64)
+        with patch.object(wma.gpu.distance, 'similarity_row_sums_from_arrays',
+                          return_value=mock_sums) as sim_mock, \
+                patch.object(wma.gpu.distance, 'refine_outlier_probabilities_from_arrays',
+                             return_value=(mock_sums / 4.0, atlas_sim, False)):
+            scores, cutoff = org_cli._compute_cluster_outlier_scores(
+                subj_arr, atlas_arr, atlas_sim, 400.0, 2.0, False, 'gpu')
+        sim_mock.assert_called_once()
+        self.assertFalse(sim_mock.call_args.kwargs['sqrt_distance_sums'])
+        np.testing.assert_allclose(scores, mock_sums / 4.0)
+        self.assertAlmostEqual(float(cutoff), 1.0)
+
+        if wma.gpu.config.cuda_available():
+            saved_req = wma.gpu.config.requested
+            self.addCleanup(setattr, wma.gpu.config, 'requested', saved_req)
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                atlas_root = root / 'ORG-Atlas'
+                _build_synthetic_org_atlas(atlas_root)
+                fibers = (
+                    _bundle_coords(-35.0, 0.0, 4, n_pts=21, step=3.0, seed=121)
+                    + _bundle_coords(35.0, 0.0, 4, n_pts=21, step=3.0, seed=122)
+                    + _bundle_coords(0.0, 35.0, 4, n_pts=21, step=3.0, commissural=True, seed=123)
+                )
+                subj_path = root / 'sub-gpu.vtp'
+                wma.io.write_polydata(_make_tract_polydata(fibers), str(subj_path))
+                out_gpu = root / 'out_gpu'
+                with patch.object(sys, 'argv', [
+                    str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_gpu),
+                    '-a', str(atlas_root), '-r', 'rig', '-j', '2', '-gpu', 'on',
+                    '--keep-intermediates', '0']):
+                    org_cli.main()
+                qc = json.loads((out_gpu / 'sub-gpu' / 'qc_summary.json').read_text())
+                self.assertTrue(qc['gpu_used'])
+                self.assertEqual(qc['anatomical_tracts_written'], qc['anatomical_tracts_expected'])
+
 
 if __name__ == '__main__':
     unittest.main()
