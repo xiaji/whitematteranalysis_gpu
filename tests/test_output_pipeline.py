@@ -16,7 +16,7 @@ from vtk.util.numpy_support import numpy_to_vtk
 import whitematteranalysis as wma
 
 
-def baseline_module(name, path, revision="7a5e5b8"):
+def baseline_module(name, path, revision="e2b69b3"):
     module = types.ModuleType(name)
     module.__package__ = name.rsplit(".", 1)[0]
     module.__file__ = path

@@ -26,7 +26,7 @@ def compare(functions, repeats):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline', default='592eefa')
+    parser.add_argument('--baseline', default='af46e08')
     parser.add_argument('--repeat', type=int, default=5)
     parser.add_argument('--queries', type=int, default=512)
     parser.add_argument('--workers', type=int, nargs='+', default=[1, 4])

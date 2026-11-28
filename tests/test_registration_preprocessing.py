@@ -47,7 +47,7 @@ class RegistrationPreprocessingTests(unittest.TestCase):
     def setUpClass(cls):
         cls.original = baseline_module(
             'whitematteranalysis._oldfilter_registration_preprocess',
-            'filter.py', '95ef896')
+            'filter.py', 'd8447aa')
 
     def assert_polydata_bytes_equal(self, expected, actual):
         with tempfile.TemporaryDirectory() as directory:

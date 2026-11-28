@@ -1,0 +1,35 @@
+WhiteMatterAnalysis GPU — Provenance & Attribution Notice
+=========================================================
+
+This software is distributed under the 3D Slicer Contribution and Software
+License Agreement Version 1.0 (see License.txt; redistributions must include
+Part B).
+
+Codebase Provenance
+-------------------
+
+1. Upstream WhiteMatterAnalysis (SlicerDMRI)
+   - Source: https://github.com/SlicerDMRI/whitematteranalysis
+   - Original Authors: Lauren J. O'Donnell, Fan Zhang, Isaiah Norton, Ye Wu,
+     Yogesh Rathi, Nikos Makris, Carl-Fredrik Westin, and contributors
+     (Brigham and Women's Hospital, Inc. / SlicerDMRI).
+   - Scope: Core diffusion MRI streamline tractography I/O, registration,
+     spectral clustering, anatomical outlier removal, tract measurement,
+     utilities, and legacy `bin/wm_*.py` CLI scripts (initial repository
+     import commits `92c3548..6c0a795`).
+
+2. Initial GPU & Vectorized CPU Acceleration Foundation
+   - Source: NeuroDMRI/whitematteranalysis_gpu
+   - Author: Yijie Li (`yishengpoxiao`)
+   - Scope: Initial PyTorch GPU backend, tiled CPU backend, streaming
+     geometry/laterality optimizations, and baseline parity tests/benchmarks.
+
+3. Triton Kernels, Slicer-Free Nonrigid Pipeline, SDK & Packaging
+   - Source: https://github.com/xiaji/whitematteranalysis_gpu
+   - Author: xiaji
+   - Scope: Custom 2D Triton kernels (distance, embedding, split-C nearest
+     centroids, O(N + R^3) nonrigid B-spline backward, batched kmeans2),
+     pure-Python/VTK affine/BSpline/Composite transform hardening,
+     zero-intermediate single-process ORG/East-West/NABA parcellation engine,
+     `whitematteranalysis.pipelines` Python SDK, unified `wma` CLI, PEP 621
+     packaging, multi-target Docker/Apptainer containers, and CI.

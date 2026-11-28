@@ -29,7 +29,7 @@ class EmbeddingKernelTests(unittest.TestCase):
         import torch
         from test_output_pipeline import baseline_module
         original = baseline_module('whitematteranalysis.gpu._normalizationbaseline',
-                                   'gpu/linalg.py', '8f83f6f')
+                                   'gpu/linalg.py', '318a392')
         import types
         rng = np.random.RandomState(81)
         atlas = types.SimpleNamespace(number_of_eigenvectors=3, row_sum_1=np.ones(257),

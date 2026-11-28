@@ -16,8 +16,8 @@ from test_output_pipeline import baseline_module
 class GeometryViewTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.old_filter = baseline_module('whitematteranalysis._geometry_filter', 'filter.py', '710f7d4')
-        cls.old_fibers = baseline_module('whitematteranalysis._geometry_fibers', 'fibers.py', '710f7d4')
+        cls.old_filter = baseline_module('whitematteranalysis._geometry_filter', 'filter.py', '5dfe576')
+        cls.old_fibers = baseline_module('whitematteranalysis._geometry_fibers', 'fibers.py', '5dfe576')
 
     def test_views_and_detached_mask_output(self):
         data = polydata(11)

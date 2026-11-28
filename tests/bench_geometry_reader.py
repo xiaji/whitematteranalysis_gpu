@@ -16,7 +16,7 @@ def main():
     parser.add_argument('--atlas', required=True)
     parser.add_argument('--stride', type=int, default=25)
     parser.add_argument('--repeat', type=int, default=5)
-    parser.add_argument('--baseline', default='ff8bacb')
+    parser.add_argument('--baseline', default='ad97f03')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     original = baseline_module('whitematteranalysis._readbenchmark', 'io.py', args.baseline)

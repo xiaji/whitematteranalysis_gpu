@@ -15,7 +15,7 @@ from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 import whitematteranalysis as wma
 
 ROOT = Path(__file__).resolve().parents[1]
-BASELINE = 'd80c014'
+BASELINE = 'c7c95be'
 
 
 def tractography(count=9):

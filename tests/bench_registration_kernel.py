@@ -18,7 +18,7 @@ from whitematteranalysis.register_two_subjects import RegisterTractography
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', help='Optional real tractography vtk/vtp file')
-    parser.add_argument('--baseline', default='406c585', help='Git revision to compare')
+    parser.add_argument('--baseline', default='4b8ffac', help='Git revision to compare')
     parser.add_argument('--fixed', type=int, default=3000)
     parser.add_argument('--moving', type=int, default=1000)
     parser.add_argument('--repeat', type=int, default=20)

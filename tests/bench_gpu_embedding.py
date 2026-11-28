@@ -39,7 +39,7 @@ def main():
     parser.add_argument('--input')
     parser.add_argument('--fibers', type=int, default=8192)
     parser.add_argument('--repeat', type=int, default=5)
-    parser.add_argument('--baseline', default='cffed63')
+    parser.add_argument('--baseline', default='60aad24')
     parser.add_argument('--exact', action='store_true', help='Require exact embedding equality')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()

@@ -76,7 +76,7 @@ class RegistrationTests(unittest.TestCase):
         import torch
         from test_output_pipeline import baseline_module
         original = baseline_module('whitematteranalysis.gpu._eagerbaseline',
-                                   'gpu/registration.py', '60c7b2d')
+                                   'gpu/registration.py', '69854a7')
         rng = np.random.RandomState(43)
         for points in (1, 10, 15, 32, 50):
             fixed = gpu._prepare_fixed(rng.normal(size=(3, 257, points)) * 40.,

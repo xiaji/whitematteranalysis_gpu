@@ -17,7 +17,7 @@ def main():
     parser.add_argument('--output', required=True, help='New benchmark directory')
     parser.add_argument('--backend', choices=('cpu', 'gpu'), default='gpu')
     parser.add_argument('--jobs', type=int, default=4)
-    parser.add_argument('--baseline', default='d68372a')
+    parser.add_argument('--baseline', default='9d172d3')
     parser.add_argument('--repeat', type=int, default=2)
     args = parser.parse_args()
     output = Path(args.output).resolve()

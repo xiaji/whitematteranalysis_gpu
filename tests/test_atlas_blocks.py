@@ -34,7 +34,7 @@ class AtlasTests(unittest.TestCase):
     def test_negative_rows_and_input_preservation(self):
         import torch
         original = baseline_module('whitematteranalysis.gpu._packedbaseline',
-                                   'gpu/linalg.py', 'cffed63')
+                                   'gpu/linalg.py', '60aad24')
         rng = np.random.RandomState(43)
         atlas = types.SimpleNamespace(number_of_eigenvectors=3,
             row_sum_1=np.ones(11), row_sum_matrix=-2. * np.ones(11),

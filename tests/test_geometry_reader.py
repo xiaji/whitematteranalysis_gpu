@@ -28,7 +28,7 @@ def assert_geometry(test, expected, actual):
 class GeometryReaderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.original = baseline_module('whitematteranalysis._readerbaseline', 'io.py', 'ff8bacb')
+        cls.original = baseline_module('whitematteranalysis._readerbaseline', 'io.py', 'ad97f03')
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()

@@ -37,7 +37,7 @@ def compare(functions, repeats):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline', default='710f7d4')
+    parser.add_argument('--baseline', default='5dfe576')
     parser.add_argument('--repeat', type=int, default=5)
     parser.add_argument('--bilateral', action='store_true')
     parser.add_argument('--input')

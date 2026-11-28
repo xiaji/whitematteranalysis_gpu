@@ -37,7 +37,7 @@ class DistanceKernelTests(unittest.TestCase):
         import torch
         from test_output_pipeline import baseline_module
         original = baseline_module('whitematteranalysis.gpu._gaussianbaseline',
-                                   'gpu/distance.py', '8f83f6f')
+                                   'gpu/distance.py', '318a392')
         torch.manual_seed(83)
         for points, dtype in product((10, 15, 50), (torch.float64, torch.float32)):
             fixed = torch.randn((37, points, 3), dtype=dtype, device='cuda')
@@ -55,7 +55,7 @@ class DistanceKernelTests(unittest.TestCase):
         import torch
         from test_output_pipeline import baseline_module
         original = baseline_module('whitematteranalysis.gpu._scratchbaseline',
-                                   'gpu/distance.py', '97bc764')
+                                   'gpu/distance.py', '9c53829')
         rng = np.random.RandomState(78)
         with patch.object(distance_kernel, 'triton', None):
             for points, dtype, strided in product((10, 50), (torch.float32, torch.float64), (False, True)):

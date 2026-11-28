@@ -29,7 +29,7 @@ def main():
     parser.add_argument('input')
     parser.add_argument('--atlas')
     parser.add_argument('--repeat', type=int, default=3)
-    parser.add_argument('--baseline', default='710f7d4')
+    parser.add_argument('--baseline', default='5dfe576')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     old_filter = baseline_module('whitematteranalysis._geometryfilter', 'filter.py', args.baseline)

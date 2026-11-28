@@ -21,7 +21,7 @@ class CPUTilingTests(unittest.TestCase):
     def test_query_coordinate_layouts(self):
         from test_output_pipeline import baseline_module
         original = baseline_module('whitematteranalysis.gpu._querylayoutbaseline',
-                                   'gpu/cpu_backend.py', 'bf9fd0e')
+                                   'gpu/cpu_backend.py', 'ce6c389')
         rng = np.random.RandomState(86)
         for points in (1, 15, 129):
             queries = rng.normal(size=(17, points, 3))
@@ -47,7 +47,7 @@ class CPUTilingTests(unittest.TestCase):
     def test_automatic_tiles_match_frozen_backend(self):
         from test_output_pipeline import baseline_module
         original = baseline_module('whitematteranalysis.gpu._tilesbaseline',
-                                   'gpu/cpu_backend.py', '8f83f6f')
+                                   'gpu/cpu_backend.py', '318a392')
         rng = np.random.RandomState(82)
         for n, m in ((17, 2500), (513, 257)):
             for dtype in (np.float64, np.float32):
@@ -75,7 +75,7 @@ class CPUTilingTests(unittest.TestCase):
 
     def test_point_major_metrics_and_extremes(self):
         from test_output_pipeline import baseline_module
-        original = baseline_module('whitematteranalysis.gpu._plane_baseline', 'gpu/cpu_backend.py', '592eefa')
+        original = baseline_module('whitematteranalysis.gpu._plane_baseline', 'gpu/cpu_backend.py', 'af46e08')
         rng = np.random.RandomState(53)
         with np.errstate(all='ignore'), warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
@@ -99,7 +99,7 @@ class CPUTilingTests(unittest.TestCase):
 
     def test_point_major_strict_special_parameters(self):
         from test_output_pipeline import baseline_module
-        original = baseline_module('whitematteranalysis.gpu._strictplane_baseline', 'gpu/cpu_backend.py', '592eefa')
+        original = baseline_module('whitematteranalysis.gpu._strictplane_baseline', 'gpu/cpu_backend.py', 'af46e08')
         rng = np.random.RandomState(55)
         fixed = rng.normal(size=(257, 15, 3))
         queries = fixed[:17].copy()

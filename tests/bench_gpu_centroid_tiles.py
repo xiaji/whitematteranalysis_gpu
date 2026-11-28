@@ -16,7 +16,7 @@ from test_output_pipeline import baseline_module
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--baseline', default='cef12ca')
+    parser.add_argument('--baseline', default='9246711')
     parser.add_argument('--repeat', type=int, default=31)
     parser.add_argument('--input')
     parser.add_argument('--atlas')

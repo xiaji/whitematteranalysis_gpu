@@ -69,7 +69,7 @@ class LateralityTests(unittest.TestCase):
         np.testing.assert_array_equal(actual, np.full(37, 257.))
 
     def compare_pipeline(self, gpu):
-        original = baseline_module('whitematteranalysis._lateralitybaseline', 'laterality.py', 'ff8bacb')
+        original = baseline_module('whitematteranalysis._lateralitybaseline', 'laterality.py', 'ad97f03')
         # The preceding NumPy-index None check was invalid; use the corrected
         # index formula in both implementations to isolate matrix streaming.
         original.compute_laterality_index = wma.laterality.compute_laterality_index

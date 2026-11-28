@@ -9,7 +9,7 @@
 
 **GPU-accelerated diffusion MRI streamline tractography registration, spectral clustering, and Slicer-free white matter parcellation.**
 
-[Overview](#overview) · [Benchmarks](#benchmarks) · [CLI](#1-command-line-interface-conda--pip--uv) · [Python SDK](#2-python-sdk-whitematteranalysispipelines) · [Docker & HPC](#3-docker--apptainer-hpc) · [Configuration](#configuration) · [Docs](#documentation) · [FAQ](#faq) · [Citation](#citation)
+[Overview](#overview) · [Benchmarks](#benchmarks) · [CLI](#1-command-line-interface-conda--pip--uv) · [Python SDK](#2-python-sdk-whitematteranalysispipelines) · [Docker & HPC](#3-docker--apptainer-hpc) · [Configuration](#configuration) · [Docs](#documentation) · [FAQ](#faq) · [Citation](#citation--attribution)
 
 ---
 
@@ -275,9 +275,9 @@ Yes. When CUDA or PyTorch is absent, CLI commands fall back to the multi-threade
 
 ---
 
-## Citation
+## Citation & Attribution
 
-Released under the [3D Slicer Contribution and Software License Agreement v1.0](License.txt) (BSD-style; redistributions must include Part B). If you use WhiteMatterAnalysis or the ORG white matter atlas in your research, please cite:
+Released under the [3D Slicer Contribution and Software License Agreement v1.0](License.txt) (BSD-style; redistributions must include Part B). Full codebase provenance and contributor attribution (upstream `SlicerDMRI/whitematteranalysis`, initial GPU/CPU acceleration by Yijie Li, and subsequent Triton/SDK/container engineering by `xiaji`) are documented in [NOTICE](NOTICE). If you use WhiteMatterAnalysis or the ORG white matter atlas in your research, please cite:
 
 1. Zhang, F., Wu, Y., Norton, I., Rathi, Y., Makris, N., & O'Donnell, L. J. (2018). An anatomically curated fiber clustering white matter atlas for consistent white matter tract parcellation across the lifespan. *NeuroImage*, 179, 429–447.
 2. O'Donnell, L. J., Wells III, W. M., Golby, A. J., & Westin, C.-F. (2012). Unbiased groupwise registration of white matter tractography. *MICCAI*, 123–130.

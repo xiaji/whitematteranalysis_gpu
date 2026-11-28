@@ -47,7 +47,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('input')
     parser.add_argument('atlas')
-    parser.add_argument('--baseline', default='3891846')
+    parser.add_argument('--baseline', default='5ad9464')
     parser.add_argument('--fibers', type=int, default=2048)
     parser.add_argument('--repeat', type=int, default=5)
     parser.add_argument('--workers', type=int, default=4)

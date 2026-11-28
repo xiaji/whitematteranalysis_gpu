@@ -34,7 +34,7 @@ def main():
     parser.add_argument('atlas')
     parser.add_argument('--fibers', type=int, default=2048)
     parser.add_argument('--repeats', type=int, default=3)
-    parser.add_argument('--baseline', default='60c7b2d')
+    parser.add_argument('--baseline', default='69854a7')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     cpu = wma.gpu.cpu_backend

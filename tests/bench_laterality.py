@@ -20,7 +20,7 @@ def main():
     parser.add_argument('--fibers', type=int, default=2048)
     parser.add_argument('--backend', choices=('cpu', 'gpu'), default='gpu')
     parser.add_argument('--repeat', type=int, default=5)
-    parser.add_argument('--baseline', default='ff8bacb')
+    parser.add_argument('--baseline', default='ad97f03')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
     if args.input:

@@ -1,4 +1,4 @@
-"""Compare fused distances, colors, coefficient reuse and atlas overlap with b2ce685."""
+"""Compare fused distances, colors, coefficient reuse and atlas overlap with 2a4fcdc."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -40,11 +40,11 @@ def main():
     parser.add_argument('--atlas', default='/data/software/ORG-Atlases/ORG-800FC-100HCP')
     parser.add_argument('--full', action='store_true')
     args = parser.parse_args()
-    olddistance = baseline_module('whitematteranalysis.gpu._olddistance', 'gpu/distance.py', 'b2ce685')
-    oldlinalg = baseline_module('whitematteranalysis.gpu._oldlinalg', 'gpu/linalg.py', 'b2ce685')
-    oldbspline = baseline_module('whitematteranalysis.gpu._oldbspline', 'gpu/bspline.py', 'b2ce685')
-    oldregistration = baseline_module('whitematteranalysis.gpu._oldregistration', 'gpu/registration.py', 'b2ce685')
-    oldcluster = baseline_module('whitematteranalysis._oldcluster', 'cluster.py', 'b2ce685')
+    olddistance = baseline_module('whitematteranalysis.gpu._olddistance', 'gpu/distance.py', '2a4fcdc')
+    oldlinalg = baseline_module('whitematteranalysis.gpu._oldlinalg', 'gpu/linalg.py', '2a4fcdc')
+    oldbspline = baseline_module('whitematteranalysis.gpu._oldbspline', 'gpu/bspline.py', '2a4fcdc')
+    oldregistration = baseline_module('whitematteranalysis.gpu._oldregistration', 'gpu/registration.py', '2a4fcdc')
+    oldcluster = baseline_module('whitematteranalysis._oldcluster', 'cluster.py', '2a4fcdc')
     rng = np.random.RandomState(42)
     f = torch.tensor(rng.normal(size=(2500, 15, 3))*40, device='cuda')
     q = torch.tensor(rng.normal(size=(2048, 15, 3))*40, device='cuda')

@@ -365,7 +365,7 @@ exactly (`max_diff = 0.00e+00`, `idx_eq = True`):
 | `float32` | `(16384, 800, 10)` | `27.552 ms` | `0.247 ms` | **111.49x** | `51.22 MiB` -> `6.00 MiB` |
 | `float32` | `(2048, 800, 20)` | `3.501 ms` | `0.147 ms` | **23.87x** | `6.89 MiB` -> `0.78 MiB` |
 
-Versus Phase 1's `float64`/`P=10`-only 2D tiled kernel (`c92e92d`, `bench_gpu_centroid_tiles.py`),
+Versus Phase 1's `float64`/`P=10`-only 2D tiled kernel (`12cf30d`, `bench_gpu_centroid_tiles.py`),
 Phase 2 generalizes to `float32` and `1 <= P <= 64` while cutting peak extra tensor
 allocations by ~29x–50x (`13,139,968 B -> 262,144 B` at `(2048, 800, 10)`;
 `52,559,872 B -> 1,048,576 B` at `(8192, 800, 10)`; `13,139,968 B -> 458,752 B` at

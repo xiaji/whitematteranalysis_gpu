@@ -27,7 +27,7 @@ def main():
     previous = types.ModuleType('previous_hardening')
     previous.__file__ = str(ROOT / 'bin/harden_transform_with_slicer.py')
     source = subprocess.check_output(['git', '-C', str(ROOT), 'show',
-        '60c7b2d:bin/harden_transform_with_slicer.py'], text=True)
+        '69854a7:bin/harden_transform_with_slicer.py'], text=True)
     exec(compile(source, previous.__file__, 'exec'), previous.__dict__)
     spec = importlib.util.spec_from_file_location('current_hardening', previous.__file__)
     current = importlib.util.module_from_spec(spec)
