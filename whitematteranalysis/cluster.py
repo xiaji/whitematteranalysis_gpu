@@ -214,6 +214,21 @@ def hierarchical(input_polydata, number_of_clusters=300,
     return output_polydata, cluster_idx
 
 
+def _pseudoinverse_from_eigh(e_val, e_vec):
+    """Compute symmetric pseudoinverse from eigendecomposition without divide-by-zero warnings."""
+    e_val = numpy.asarray(e_val)
+    e_vec = numpy.asarray(e_vec)
+    max_abs_ev = float(numpy.max(numpy.abs(e_val))) if e_val.size else 0.0
+    if numpy.issubdtype(e_val.dtype, numpy.floating) and numpy.finfo(e_val.dtype).bits <= 32:
+        cutoff = float(numpy.finfo(e_val.dtype).eps) * max(e_val.size, 1) * max_abs_ev
+    else:
+        cutoff = 1e-15 * max_abs_ev
+    nonzero = numpy.abs(e_val) > cutoff
+    inv_e_val = numpy.zeros_like(e_val)
+    numpy.divide(1.0, e_val, out=inv_e_val, where=nonzero)
+    return (e_vec * inv_e_val[None, :]) @ e_vec.T
+
+
 def nearPSD(A, epsilon=0, eig=None):
     """Project a symmetric matrix to the nearest correlation-style PSD matrix via eigh."""
     if eig is not None:
@@ -393,12 +408,7 @@ def spectral(input_polydata, number_of_clusters=200,
             # Calculate the sum of the partial rows we've computed:
             atlas.row_sum_1 = numpy.sum(A, axis=0) + numpy.sum(B.T, axis=0)  
             if e_val_a is not None:
-                max_abs_ev = numpy.max(numpy.abs(e_val_a)) if e_val_a.size else 0.0
-                cutoff = 1e-15 * max_abs_ev
-                nonzero = numpy.abs(e_val_a) > cutoff
-                inv_e_val = numpy.zeros_like(e_val_a)
-                numpy.divide(1.0, e_val_a, out=inv_e_val, where=nonzero)
-                atlas.pinv_A = (e_vec_a * inv_e_val[None, :]) @ e_vec_a.T
+                atlas.pinv_A = _pseudoinverse_from_eigh(e_val_a, e_vec_a)
             else:
                 atlas.pinv_A = numpy.linalg.pinv(A)
 

@@ -284,18 +284,34 @@ class WMACLITests(unittest.TestCase):
         self.assertIn('harden', cmd_names)
         self.assertTrue(all(item['available'] for item in payload['commands']))
 
-    def test_masked_pinv_reciprocal_preserves_float32_dtype(self):
+    def test_pseudoinverse_from_eigh_preserves_float32_and_row_sum_accuracy(self):
+        import warnings
         import numpy as np
-        e_val_a = np.array([0.0, 2.0, -4.0], dtype=np.float32)
-        e_vec_a = np.eye(3, dtype=np.float32)
-        max_abs_ev = np.max(np.abs(e_val_a))
-        nonzero = np.abs(e_val_a) > (1e-15 * max_abs_ev)
-        inv_e_val = np.zeros_like(e_val_a)
-        np.divide(1.0, e_val_a, out=inv_e_val, where=nonzero)
-        pinv_a = (e_vec_a * inv_e_val[None, :]) @ e_vec_a.T
-        self.assertEqual(inv_e_val.dtype, np.float32)
+        from whitematteranalysis import cluster
+
+        # Nearly identical fibers in float32 (A[0,1] = 1 - 2**-24) must yield ~[0.5, 0.5]
+        # row-sum weights rather than catastrophic cancellation to [0, 0].
+        A = np.eye(100, dtype=np.float32)
+        A[0, 1] = A[1, 0] = np.float32(1.0 - 2.0**-24)
+        e_val, e_vec = np.linalg.eigh(A)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            pinv_a = cluster._pseudoinverse_from_eigh(e_val, e_vec)
         self.assertEqual(pinv_a.dtype, np.float32)
-        np.testing.assert_allclose(np.diag(pinv_a), [0.0, 0.5, -0.25], rtol=1e-6)
+        self.assertEqual(caught, [])
+        weights = np.ones(100, dtype=np.float32) @ pinv_a
+        np.testing.assert_allclose(weights[:2], [0.5, 0.5], atol=1e-4)
+        np.testing.assert_allclose(weights[2:], 1.0, atol=1e-4)
+
+        # Float64 zero eigenvalue should not emit divide-by-zero warnings and stay float64.
+        e_val64 = np.array([0.0, 2.0, -4.0], dtype=np.float64)
+        e_vec64 = np.eye(3, dtype=np.float64)
+        with warnings.catch_warnings(record=True) as caught64:
+            warnings.simplefilter('always')
+            pinv64 = cluster._pseudoinverse_from_eigh(e_val64, e_vec64)
+        self.assertEqual(pinv64.dtype, np.float64)
+        self.assertEqual(caught64, [])
+        np.testing.assert_allclose(np.diag(pinv64), [0.0, 0.5, -0.25], rtol=1e-12)
 
 
 if __name__ == '__main__':

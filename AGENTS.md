@@ -1,6 +1,6 @@
 # AGENTS.md — Machine-Readable Guide for AI Agents
 
-This repository (`whitematteranalysis_gpu`) is a **headless, pure-Python + CUDA/Triton toolkit** for diffusion MRI (dMRI) streamline tractography registration, spectral fiber clustering, outlier removal, and white matter atlas parcellation (ORG, East-West, NABA). No GUI or 3D Slicer is required for tensor-free `.vtk`/`.vtp` tractograms (3D Slicer `-s` is only needed for per-point diffusion tensor reorientation or unsupported `-t` pre-transforms).
+This repository (`whitematteranalysis_gpu`) is a **headless, pure-Python + CUDA/Triton toolkit** for diffusion MRI (dMRI) streamline tractography registration, spectral fiber clustering, outlier removal, and white matter atlas parcellation (ORG, East-West, NABA). No GUI or 3D Slicer is required for standard geometry/scalar `.vtk`/`.vtp` tractograms (3D Slicer `-s` is only needed when point/cell data contains active vectors, normals, tensors, or 9-component numeric arrays, or for unsupported `-t` pre-transforms).
 
 ## 1. Environment Discovery (Run First)
 

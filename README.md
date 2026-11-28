@@ -38,7 +38,7 @@ Evaluated on dual NVIDIA RTX 3090 GPUs (PyTorch `2.8.0+cu128`, Triton `3.4.0`, `
 | Zero-intermediate (`--keep-intermediates 0`, warm cache, `float32`) | **25.12 s** (`4.98x`) | **1.00 s** | `37,007` fibers / 76 `T_*.vtp` |
 | Persistent 2-subject batch (326k + 341k fibers, warm `float64`) | **55.30 s** (**21.19 s** on `sub-13086`) | Resident GPU reuse | 76 `T_*.vtp` tracts / subject |
 
-*Coordinate parity (`0.000e+00` max point difference across all 76 tracts between `--keep-intermediates 0` and `2`) was verified on the 5,000-fiber `sub-13086` check (Benchmark G1); the 340,795-fiber runs above verify exact retained (`48,906`) and output (`37,323`) fiber counts against Phase 2 Benchmark D (Benchmark G2).*
+*Coordinate parity (`0.000e+00` max point difference across all 76 tracts between `--keep-intermediates 0` and `2`) was verified on the 5,000-fiber `sub-13086` check (Benchmark G1); the 340,795-fiber runs above matched the Phase 2 Benchmark D baseline at the same precision (`48,906` retained / `37,323` tract fibers for `float64`; `48,497` retained / `37,007` tract fibers for `float32`, Benchmark G2).*
 
 ### Nonrigid Registration, Transform Hardening & Atlas Construction
 
@@ -262,7 +262,7 @@ CLI flags (`-gpu`, `-gpu_float32`, `-gpu_devices`) take precedence when passed e
 ## FAQ
 
 **Is 3D Slicer required for ORG white matter parcellation?**  
-No, for standard workflows. Tensor-free `.vtk` and `.vtp` tractograms run end to end in pure Python and VTK for both rigid (`-r rig`) and nonrigid (`-r nonrig`) modes. 3D Slicer (`-s`) is only required when reorienting per-point diffusion tensors or when an initial pre-transform passed via `-t` cannot be parsed in both directions by `read_itk_transform_ras()`.
+No, for standard geometry/scalar `.vtk` and `.vtp` tractograms—both rigid (`-r rig`) and nonrigid (`-r nonrig`) modes run end to end in pure Python and VTK. 3D Slicer (`-s`) is only required when point or cell data contains active vectors, normals, tensors, or any 9-component numeric array (`transform.has_tensor_arrays()`), or when an initial pre-transform passed via `-t` cannot be parsed in both directions by `read_itk_transform_ras()`.
 
 **Which container tag should I pull?**  
 Use `:latest` (`:cu124`, CUDA 12.4 / PTX 8.4) for broad compatibility on Linux NVIDIA drivers `>= 550`. Use `:cu128` (CUDA 12.8 / PTX 8.7) on Blackwell GPUs or drivers `>= 570`, or `:cpu` on machines without GPUs.
@@ -271,7 +271,7 @@ Use `:latest` (`:cu124`, CUDA 12.4 / PTX 8.4) for broad compatibility on Linux N
 No. `torch` and `triton` are optional and omitted from default dependencies in [pyproject.toml](pyproject.toml), so existing Conda CUDA packages remain untouched.
 
 **Does it run without a GPU?**  
-Yes. When CUDA or PyTorch is absent, pipelines fall back to the multi-threaded vectorized CPU backend under auto mode (`-gpu auto` / `gpu=None`) or explicit CPU mode (`-gpu off` / `gpu=False`). Note that `-gpu on` and `gpu=True` explicitly require a GPU and raise an error if no compatible GPU is available.
+Yes. When CUDA or PyTorch is absent, CLI commands fall back to the multi-threaded vectorized CPU backend under `-gpu auto` (which overrides `WMA_GPU=on`) or `-gpu off`. In the Python SDK, `gpu=None` inherits the current process/environment setting (so pass `gpu=False` when CPU execution is required even if `WMA_GPU=on` is set). Note that `-gpu on` and `gpu=True` explicitly require a GPU and raise an error if none is available.
 
 ---
 
