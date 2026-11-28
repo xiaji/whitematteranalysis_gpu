@@ -1,6 +1,6 @@
 # AGENTS.md — Machine-Readable Guide for AI Agents
 
-This repository (`whitematteranalysis_gpu`) is a **headless, pure-Python + CUDA/Triton toolkit** for diffusion MRI (dMRI) streamline tractography registration, spectral fiber clustering, outlier removal, and white matter atlas parcellation (ORG, East-West, NABA). No GUI or 3D Slicer is required for standard geometry/scalar `.vtk`/`.vtp` tractograms (3D Slicer `-s` is only needed when point/cell data contains active vectors, normals, tensors, or 9-component numeric arrays, or for unsupported `-t` pre-transforms).
+This repository (`fast-wma`, Python package `whitematteranalysis`) is a **headless, pure-Python + CUDA/Triton toolkit** for diffusion MRI (dMRI) streamline tractography registration, spectral fiber clustering, outlier removal, and white matter atlas parcellation (ORG, East-West, NABA). No GUI or 3D Slicer is required for standard geometry/scalar `.vtk`/`.vtp` tractograms (3D Slicer `-s` is only needed when point/cell data contains active vectors, normals, tensors, or 9-component numeric arrays, or for unsupported `-t` pre-transforms).
 
 ## 1. Environment Discovery (Run First)
 
@@ -23,13 +23,13 @@ Key fields from `wma doctor --json`:
 - **Never overwrite an existing CUDA PyTorch installation**: `torch` and `triton` are intentionally excluded from default dependencies in `pyproject.toml`.
 - Existing Conda GPU environment:
   ```shell
-  pip install --no-build-isolation "git+https://github.com/xiaji/whitematteranalysis_gpu.git@main"
+  pip install --no-build-isolation "git+https://github.com/xiaji/fast-wma.git@main"
   ```
 - Optional `.h5` ITK transform support: add `[h5]` extra.
 - Containerized execution (no local Python setup):
-  - Default GPU (driver `>= 550`, PTX 8.4): `ghcr.io/xiaji/whitematteranalysis_gpu:latest` (`:cu124`)
-  - Blackwell / driver `>= 570` (PTX 8.7): `ghcr.io/xiaji/whitematteranalysis_gpu:cu128`
-  - CPU-only: `ghcr.io/xiaji/whitematteranalysis_gpu:cpu`
+  - Default GPU (driver `>= 550`, PTX 8.4): `ghcr.io/xiaji/fast-wma:latest` (`:cu124`)
+  - Blackwell / driver `>= 570` (PTX 8.7): `ghcr.io/xiaji/fast-wma:cu128`
+  - CPU-only: `ghcr.io/xiaji/fast-wma:cpu`
   - Mount caches at `/tmp/wma-cache` (atlas + Triton + matplotlib caches).
 
 ## 3. Canonical Invocation Interfaces

@@ -16,7 +16,7 @@ FROM ${CPU_BASE_IMAGE} AS cpu
 ARG WMA_EXTRAS
 LABEL org.opencontainers.image.title="WhiteMatterAnalysis (CPU)" \
       org.opencontainers.image.description="WhiteMatterAnalysis streamline tractography and ORG parcellation (CPU image)" \
-      org.opencontainers.image.source="https://github.com/xiaji/whitematteranalysis_gpu"
+      org.opencontainers.image.source="https://github.com/xiaji/fast-wma"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -66,7 +66,7 @@ FROM ${GPU_BASE_IMAGE} AS gpu
 ARG WMA_EXTRAS
 LABEL org.opencontainers.image.title="WhiteMatterAnalysis GPU" \
       org.opencontainers.image.description="CUDA/Triton-accelerated WhiteMatterAnalysis tractography and ORG parcellation" \
-      org.opencontainers.image.source="https://github.com/xiaji/whitematteranalysis_gpu"
+      org.opencontainers.image.source="https://github.com/xiaji/fast-wma"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \

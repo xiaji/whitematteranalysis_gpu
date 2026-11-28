@@ -56,7 +56,7 @@ all = [
 wma = "whitematteranalysis.cli:main"
 
 [project.urls]
-Repository = "https://github.com/xiaji/whitematteranalysis_gpu"
+Repository = "https://github.com/xiaji/fast-wma"
 Upstream = "https://github.com/SlicerDMRI/whitematteranalysis"
 
 [tool.setuptools]

@@ -1,4 +1,4 @@
-# WhiteMatterAnalysis GPU
+# Fast-WMA (WhiteMatterAnalysis GPU)
 
 > GPU-accelerated diffusion MRI (dMRI) streamline tractography registration, spectral fiber clustering, and Slicer-free ORG white matter parcellation (CLI, Python SDK, and Docker/Apptainer).
 

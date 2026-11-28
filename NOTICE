@@ -1,5 +1,5 @@
-WhiteMatterAnalysis GPU — Provenance & Attribution Notice
-=========================================================
+Fast-WMA (WhiteMatterAnalysis GPU) — Provenance & Attribution Notice
+====================================================================
 
 This software is distributed under the 3D Slicer Contribution and Software
 License Agreement Version 1.0 (see License.txt; redistributions must include
@@ -25,7 +25,7 @@ Codebase Provenance
      geometry/laterality optimizations, and baseline parity tests/benchmarks.
 
 3. Triton Kernels, Slicer-Free Nonrigid Pipeline, SDK & Packaging
-   - Source: https://github.com/xiaji/whitematteranalysis_gpu
+   - Source: https://github.com/xiaji/fast-wma
    - Author: xiaji
    - Scope: Custom 2D Triton kernels (distance, embedding, split-C nearest
      centroids, O(N + R^3) nonrigid B-spline backward, batched kmeans2),

@@ -1,13 +1,13 @@
-# WhiteMatterAnalysis GPU
+# Fast-WMA
 
-[![CI](https://github.com/xiaji/whitematteranalysis_gpu/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaji/whitematteranalysis_gpu/actions/workflows/ci.yml)
+[![CI](https://github.com/xiaji/fast-wma/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaji/fast-wma/actions/workflows/ci.yml)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB.svg)](pyproject.toml)
 [![CUDA 12.4 | 12.8](https://img.shields.io/badge/CUDA-12.4%20%7C%2012.8-76B900.svg)](Dockerfile)
 [![PyTorch + Triton](https://img.shields.io/badge/backend-PyTorch%20%2B%20Triton%20%7C%20CPU-EE4C2C.svg)](doc/acceleration.md)
 [![Container](https://img.shields.io/badge/GHCR-Docker%20%7C%20Apptainer-2496ED.svg)](.github/workflows/docker-publish.yml)
 [![License: 3D Slicer](https://img.shields.io/badge/license-3D%20Slicer%20(BSD--style)-blue.svg)](License.txt)
 
-**Headless, GPU-accelerated diffusion MRI streamline tractography registration, spectral fiber clustering, and Slicer-free white matter parcellation—built for CLI, Python SDK, Docker/HPC, and AI agents.**
+**Headless, GPU-accelerated WhiteMatterAnalysis (WMA) for diffusion MRI streamline tractography registration, spectral fiber clustering, and Slicer-free white matter parcellation—built for CLI, Python SDK, Docker/HPC, and AI agents.**
 
 [Overview](#overview) · [Benchmarks](#benchmarks) · [CLI](#1-command-line-interface-conda--pip--uv) · [Python SDK](#2-python-sdk-whitematteranalysispipelines) · [Docker & HPC](#3-docker--apptainer-hpc) · [Agents](#ai-agent--automation-interface) · [Atlases](#supported-atlases) · [Configuration](#configuration) · [FAQ](#faq) · [Citation](#citation--attribution)
 
@@ -18,7 +18,7 @@
 
 ## Overview
 
-**WhiteMatterAnalysis GPU** (`whitematteranalysis`) accelerates whole-brain diffusion MRI (dMRI) streamline tractography registration, Nyström spectral fiber clustering, anatomical outlier removal, and automated white matter tract parcellation across the **ORG** (O'Donnell Research Group), **East-West**, and **NABA** atlases.
+**Fast-WMA** (`whitematteranalysis`) accelerates whole-brain diffusion MRI (dMRI) streamline tractography registration, Nyström spectral fiber clustering, anatomical outlier removal, and automated white matter tract parcellation across the **ORG** (O'Donnell Research Group), **East-West**, and **NABA** atlases.
 
 - **Headless & Slicer-Free**: Runs rigid, affine, and 3D cubic B-spline nonrigid parcellation end to end in a single Python process via pure-Python/VTK transform hardening—no GUI, 3D Slicer, or Xvfb required for standard geometry/scalar `.vtk` and `.vtp` tractograms.
 - **CUDA & Triton Acceleration**: Custom 2D Triton kernels for pairwise streamline distances, spectral embedding, split-C nearest centroids, `O(N + R^3)` nonrigid B-spline analytic gradients, and batched `kmeans2`, with multi-GPU dispatch and a vectorized multi-threaded CPU fallback.
@@ -75,16 +75,16 @@ Pure-Python PEP 621 packaging ([pyproject.toml](pyproject.toml)) requires no com
 ```shell
 # Option A: Existing Conda GPU environment (recommended)
 conda activate <your-gpu-env>
-pip install --no-build-isolation "git+https://github.com/xiaji/whitematteranalysis_gpu.git@main"
+pip install --no-build-isolation "git+https://github.com/xiaji/fast-wma.git@main"
 # Optional ITK .h5 transform support:
-# pip install --no-build-isolation "whitematteranalysis[h5] @ git+https://github.com/xiaji/whitematteranalysis_gpu.git@main"
+# pip install --no-build-isolation "whitematteranalysis[h5] @ git+https://github.com/xiaji/fast-wma.git@main"
 
 # Option B: Fresh virtual environment with uv (omit torch install for CPU-only)
 uv venv .venv && source .venv/bin/activate
 uv pip install torch --index-url https://download.pytorch.org/whl/cu124   # Driver >= 550
 # For Blackwell GPUs (driver >= 570), use CUDA 12.8 instead:
 # uv pip install torch --index-url https://download.pytorch.org/whl/cu128
-uv pip install "git+https://github.com/xiaji/whitematteranalysis_gpu.git@main"
+uv pip install "git+https://github.com/xiaji/fast-wma.git@main"
 
 # Verify active backend, CUDA/Triton availability, and atlas cache path
 wma doctor
@@ -150,7 +150,7 @@ with ORGParcellationPipeline(
 
 ### 3. Docker & Apptainer (HPC)
 
-Prebuilt images are published to `ghcr.io/xiaji/whitematteranalysis_gpu` via [GitHub Actions](.github/workflows/docker-publish.yml). Atlases are mounted at runtime, and caches default to `/tmp/wma-cache` for rootless `--user` and read-only Apptainer/Singularity execution.
+Prebuilt images are published to `ghcr.io/xiaji/fast-wma` via [GitHub Actions](.github/workflows/docker-publish.yml). Atlases are mounted at runtime, and caches default to `/tmp/wma-cache` for rootless `--user` and read-only Apptainer/Singularity execution.
 
 | Image Tag | Base Runtime | Driver & Architecture Support |
 | --- | --- | --- |
@@ -161,10 +161,10 @@ Prebuilt images are published to `ghcr.io/xiaji/whitematteranalysis_gpu` via [Gi
 #### Docker
 
 ```shell
-docker pull ghcr.io/xiaji/whitematteranalysis_gpu:latest
+docker pull ghcr.io/xiaji/fast-wma:latest
 
 # Probe container runtime in JSON
-docker run --rm --gpus all ghcr.io/xiaji/whitematteranalysis_gpu:latest doctor --json
+docker run --rm --gpus all ghcr.io/xiaji/fast-wma:latest doctor --json
 
 # Batch ORG parcellation (non-root user + persistent host cache)
 docker run --rm --gpus all --user "$(id -u):$(id -g)" \
@@ -172,13 +172,13 @@ docker run --rm --gpus all --user "$(id -u):$(id -g)" \
   -v /data/ORG-Atlases:/atlas:ro \
   -v /data/output:/output \
   -v /data/wma_cache:/tmp/wma-cache \
-  ghcr.io/xiaji/whitematteranalysis_gpu:latest \
+  ghcr.io/xiaji/fast-wma:latest \
   org --input-dir /input -o /output -a /atlas -r rig -j 4 -gpu on --continue-on-error
 
 # Run a custom Python SDK script inside the container
 docker run --rm --gpus all --entrypoint python \
   -v /data:/data -v /work/run.py:/run.py:ro \
-  ghcr.io/xiaji/whitematteranalysis_gpu:latest /run.py
+  ghcr.io/xiaji/fast-wma:latest /run.py
 ```
 
 <details>
@@ -186,13 +186,13 @@ docker run --rm --gpus all --entrypoint python \
 
 ```shell
 # Default CUDA 12.4 GPU image
-docker build -t wma-gpu:cu124 .
+docker build -t fast-wma:cu124 .
 
 # CUDA 12.8 / Blackwell GPU image
-docker build --build-arg GPU_BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime -t wma-gpu:cu128 .
+docker build --build-arg GPU_BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime -t fast-wma:cu128 .
 
 # Lightweight CPU image
-docker build --target cpu -t wma-cpu:latest .
+docker build --target cpu -t fast-wma:cpu .
 ```
 
 </details>
@@ -200,11 +200,11 @@ docker build --target cpu -t wma-cpu:latest .
 #### Apptainer / Singularity (Slurm HPC)
 
 ```shell
-apptainer pull wma-gpu-cu124.sif docker://ghcr.io/xiaji/whitematteranalysis_gpu:latest
+apptainer pull fast-wma-cu124.sif docker://ghcr.io/xiaji/fast-wma:latest
 
 apptainer exec --nv \
   -B /data/subjects:/input:ro,/data/ORG-Atlases:/atlas:ro,/data/output:/output,/scratch/wma_cache:/tmp/wma-cache \
-  wma-gpu-cu124.sif \
+  fast-wma-cu124.sif \
   wma org --input-dir /input -o /output -a /atlas -r rig -j 4 -gpu on --continue-on-error
 ```
 
