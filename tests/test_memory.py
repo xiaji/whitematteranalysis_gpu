@@ -3,7 +3,10 @@ import os
 from threading import Event, Thread
 import unittest
 from unittest.mock import Mock, patch
-from joblib.externals import cloudpickle
+try:
+    import cloudpickle
+except ImportError:
+    from joblib.externals import cloudpickle
 
 from whitematteranalysis import _memory
 
