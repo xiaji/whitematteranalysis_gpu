@@ -1,5 +1,6 @@
 # Git and editor metadata
 .git
+.github
 .gitignore
 .superpowers
 .pytest_cache

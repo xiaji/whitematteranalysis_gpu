@@ -58,6 +58,7 @@ class PackagingMetadataTests(unittest.TestCase):
         self.assertTrue(dockerignore.is_file())
 
         df_text = dockerfile.read_text(encoding='utf-8')
+        self.assertIn('ARG GPU_BASE_IMAGE=pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime', df_text)
         self.assertIn('AS cpu', df_text)
         self.assertIn('AS gpu', df_text)
         # Default target (last stage) must be the GPU image.
@@ -68,6 +69,18 @@ class PackagingMetadataTests(unittest.TestCase):
         self.assertIn('libxt6', df_text)
         self.assertIn('WMA_ATLAS_CACHE=/tmp/wma-cache/atlas', df_text)
         self.assertIn('TRITON_CACHE_DIR=/tmp/wma-cache/triton', df_text)
+
+        wf_path = ROOT / '.github' / 'workflows' / 'docker-publish.yml'
+        self.assertTrue(wf_path.is_file())
+        wf_text = wf_path.read_text(encoding='utf-8')
+        self.assertIn('REGISTRY: ghcr.io', wf_text)
+        self.assertIn('packages: write', wf_text)
+        self.assertIn('variant: cu124', wf_text)
+        self.assertIn('variant: cu128', wf_text)
+        self.assertIn('variant: cpu', wf_text)
+        self.assertIn('pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime', wf_text)
+        self.assertIn('pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime', wf_text)
+        self.assertIn('pull_request', wf_text)
 
         patterns = [
             line.strip()

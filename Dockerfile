@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
 
-ARG GPU_BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+# Default to PyTorch 2.6 + CUDA 12.4 (PTX 8.4, compatible with NVIDIA Linux drivers >= 550
+# across V100/T4/RTX 20xx-40xx/A100/H100). Override for Blackwell / R570+ hosts, e.g.:
+#   --build-arg GPU_BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
+ARG GPU_BASE_IMAGE=pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 ARG CPU_BASE_IMAGE=python:3.11-slim-bookworm
 ARG WMA_EXTRAS=h5
 
@@ -56,7 +59,7 @@ CMD ["--help"]
 # -----------------------------------------------------------------------------
 # Default CUDA + Triton GPU image (Slicer-free rigid/nonrigid ORG parcellation)
 #   docker build -t wma-gpu:0.4.0 .
-#   docker build --build-arg GPU_BASE_IMAGE=pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime -t wma-gpu:cu124 .
+#   docker build --build-arg GPU_BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime -t wma-gpu:cu128 .
 # -----------------------------------------------------------------------------
 FROM ${GPU_BASE_IMAGE} AS gpu
 

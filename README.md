@@ -142,18 +142,27 @@ with ORGParcellationPipeline("/path/to/ORG-Atlases", reg_mode="rig", jobs=4, gpu
 ### Docker & Apptainer (HPC)
 
 The repository includes a multi-target [Dockerfile](Dockerfile) (`gpu` default + `cpu` lightweight
-target) for Slicer-free rigid and nonrigid ORG parcellation. Atlases are mounted at runtime rather
-than baked into the image, and caches default under `/tmp/wma-cache` so non-root `--user` runs and
-read-only Apptainer/Singularity containers work out of the box.
+target) and a GitHub Actions workflow ([.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml))
+that publishes prebuilt images to GitHub Container Registry (`ghcr.io/xiaji/whitematteranalysis_gpu`).
+
+The default GPU image uses **`pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime`** (Triton PTX 8.4,
+compatible with NVIDIA Linux drivers `>= 550` across V100 / T4 / RTX 20xx–40xx / A100 / H100).
+A `cu128` variant (`pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime`, for Blackwell / R570+ drivers)
+and a lightweight `cpu` variant are also published. Atlases are mounted at runtime rather than baked
+into the image, and caches default under `/tmp/wma-cache` so non-root `--user` runs and read-only
+Apptainer/Singularity containers work out of the box.
 
 ```shell
-# Build GPU image (default: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime; override GPU_BASE_IMAGE if needed)
+# Pull prebuilt image from GHCR (default :latest is cu124; also available: :cu128, :cpu)
+docker pull ghcr.io/xiaji/whitematteranalysis_gpu:latest
+
+# Or build locally (default: CUDA 12.4; override GPU_BASE_IMAGE for CUDA 12.8 / Blackwell)
 docker build -t wma-gpu:0.4.0 .
-# Or build lightweight CPU-only image:
+# docker build --build-arg GPU_BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime -t wma-gpu:cu128 .
 # docker build --target cpu -t wma-cpu:0.4.0 .
 
 # 1. Inspect CUDA, Triton, VTK, and cache status inside the container
-docker run --rm --gpus all wma-gpu:0.4.0 doctor
+docker run --rm --gpus all ghcr.io/xiaji/whitematteranalysis_gpu:latest doctor
 
 # 2. Single-subject ORG parcellation (mount data, atlas, output, and persistent cache)
 docker run --rm --gpus all --user "$(id -u):$(id -g)" \
@@ -161,7 +170,8 @@ docker run --rm --gpus all --user "$(id -u):$(id -g)" \
   -v /data/ORG-Atlases:/atlas:ro \
   -v /data/output:/output \
   -v /data/wma_cache:/tmp/wma-cache \
-  wma-gpu:0.4.0 org -i /input/sub-01.vtp -o /output -a /atlas -r rig -j 4 -gpu on
+  ghcr.io/xiaji/whitematteranalysis_gpu:latest \
+  org -i /input/sub-01.vtp -o /output -a /atlas -r rig -j 4 -gpu on
 
 # 3. Persistent multi-subject batch parcellation
 docker run --rm --gpus all --user "$(id -u):$(id -g)" \
@@ -169,22 +179,22 @@ docker run --rm --gpus all --user "$(id -u):$(id -g)" \
   -v /data/ORG-Atlases:/atlas:ro \
   -v /data/output:/output \
   -v /data/wma_cache:/tmp/wma-cache \
-  wma-gpu:0.4.0 org --input-dir /input -o /output -a /atlas -r rig -j 4 -gpu on --continue-on-error
+  ghcr.io/xiaji/whitematteranalysis_gpu:latest \
+  org --input-dir /input -o /output -a /atlas -r rig -j 4 -gpu on --continue-on-error
 
 # 4. Run a custom Python SDK script inside the container
 docker run --rm --gpus all --entrypoint python \
   -v /data:/data -v /work/run.py:/run.py:ro \
-  wma-gpu:0.4.0 /run.py
+  ghcr.io/xiaji/whitematteranalysis_gpu:latest /run.py
 ```
 
-For Slurm / HPC clusters using Apptainer (Singularity), convert the saved Docker image and run with `--nv`:
+For Slurm / HPC clusters using Apptainer (Singularity), pull directly from GHCR and run with `--nv`:
 
 ```shell
-docker save wma-gpu:0.4.0 -o wma-gpu-0.4.0.tar
-apptainer build wma-gpu-0.4.0.sif docker-archive://wma-gpu-0.4.0.tar
+apptainer pull wma-gpu-cu124.sif docker://ghcr.io/xiaji/whitematteranalysis_gpu:latest
 apptainer exec --nv \
   -B /data/subjects:/input:ro,/data/ORG-Atlases:/atlas:ro,/data/output:/output,/scratch/wma_cache:/tmp/wma-cache \
-  wma-gpu-0.4.0.sif wma org --input-dir /input -o /output -a /atlas -r rig -j 4 -gpu on
+  wma-gpu-cu124.sif wma org --input-dir /input -o /output -a /atlas -r rig -j 4 -gpu on
 ```
 
 Install the CUDA-enabled PyTorch build matching your Python, GPU and NVIDIA
