@@ -1,6 +1,6 @@
 # AGENTS.md — Machine-Readable Guide for AI Agents
 
-This repository (`whitematteranalysis_gpu`) is a **headless, pure-Python + CUDA/Triton toolkit** for diffusion MRI (dMRI) streamline tractography registration, spectral fiber clustering, outlier removal, and white matter atlas parcellation (ORG, East-West, NABA). No GUI or 3D Slicer is required for tensor-free `.vtk`/`.vtp` tractograms.
+This repository (`whitematteranalysis_gpu`) is a **headless, pure-Python + CUDA/Triton toolkit** for diffusion MRI (dMRI) streamline tractography registration, spectral fiber clustering, outlier removal, and white matter atlas parcellation (ORG, East-West, NABA). No GUI or 3D Slicer is required for tensor-free `.vtk`/`.vtp` tractograms (3D Slicer `-s` is only needed for per-point diffusion tensor reorientation or unsupported `-t` pre-transforms).
 
 ## 1. Environment Discovery (Run First)
 
@@ -12,7 +12,7 @@ wma list --json
 ```
 
 Key fields from `wma doctor --json`:
-- `runtime.effective_backend`: `"cuda"`, `"mps"`, `"cpu_fast"`, or `"cpu_legacy"`
+- `runtime.effective_backend`: `"cuda"`, `"mps"`, `"cpu_fast"`, `"cpu_legacy"`, or `"error (<reason>)"` (for example, when `WMA_GPU=on` is set on a machine with no usable GPU; `wma doctor --json` still exits `0`, so check that this value does not start with `"error"` before assuming a usable backend)
 - `optional.torch.cuda_available`, `optional.torch.cuda_devices[]`: GPU count, name, compute capability, VRAM (GiB)
 - `optional.triton`: installed Triton version (`null` falls back to PyTorch CUDA)
 - `optional.h5py`: non-null if ITK `.h5` transform files are supported
@@ -75,8 +75,8 @@ WMA_NONRIGID_ANALYTIC_GRAD=1 wma org -i /data/sub-01.vtp -o /out -a /atlas/ORG-A
 # Multi-subject persistent batch
 wma org --input-dir /data/subjects -o /out -a /atlas/ORG-Atlases -r rig -j 4 -gpu on --continue-on-error
 
-# Standalone affine / BSpline / Composite transform hardening (no 3D Slicer)
-wma harden --pure-python -i -j 4 /in_dir /out_dir /path/to/transform.tfm
+# Standalone affine / BSpline / Composite transform hardening (no 3D Slicer; add -i to invert)
+wma harden --pure-python -j 4 /in_dir /out_dir -t /path/to/transform.tfm
 ```
 
 ## 4. Input / Output Contract
@@ -88,13 +88,13 @@ wma harden --pure-python -i -j 4 /in_dir /out_dir /path/to/transform.tfm
   - `<output>/<case_id>/AnatomicalTracts/anatomical_tracts_complete.log`
   - `<output>/<case_id>/qc_summary.json` — includes `case_id`, `atlas_family`, `reg_mode`, `hardening_backend`, `gpu_used`, `gpu_float32`, `input_fibers`, `filtered_fibers`, `outlier_removed_fibers`, `retained_clustered_fibers`, `anatomical_tracts_written`, `tracts` (`{name: {fibers, points}}`), `stage_timings_s`.
   - `<output>/batch_qc_summary.json` (batch mode) — includes `total_subjects`, `succeeded_subjects`, `failed_subjects`, `total_wall_seconds`, `subjects[]`.
-- **Exit Codes (`wma`)**: `0` = success, `1` = runtime failure or any failed subject in batch mode, `2` = invalid CLI arguments / unknown command.
+- **Exit Codes**: `wma org`, `wma doctor`, `wma list`, and `wma harden` return `0` on success, `1` on runtime failure (or any failed subject in `wma org --input-dir` batch mode), and `2` on invalid CLI arguments or unknown commands. Legacy wrapped `bin/wm_*.py` commands (`wma build-atlas`, `wma cluster`, `wma register`, `wma separate`, `wma download-atlas`) may call bare `exit()` on validation errors and return `0`; verify expected outputs or prefer `wma org` / the Python SDK for automation.
 
 ## 5. Performance & Resource Controls
 
 - **Multi-GPU**: Set `WMA_GPU_DEVICES=0,1` (or `-gpu_devices 0,1`).
-- **Shared / Low-VRAM GPU**: Cap assumed free VRAM via `WMA_GPU_MAX_VRAM_GIB=<float>` (e.g., `8.0`); kernels automatically tile and fall back cleanly on OOM.
-- **Speed vs Precision**: `float64` is default (`0.000e+00` delta vs full-intermediate); opt into `float32` via `-gpu_float32` / `WMA_GPU_FLOAT32=1` / `gpu_float32=True`.
+- **Shared / Low-VRAM GPU**: Cap assumed free VRAM via `WMA_GPU_MAX_VRAM_GIB=<float>` (e.g., `8.0`) to guide adaptive GPU tile sizing. Bounded CPU fallback on OOM applies only to supported host-returning operations (see `doc/acceleration.md`); GPU-tensor-returning APIs such as `gpu.distance.rectangular_similarity_tensor()` re-raise OOM if even a single-row tile does not fit.
+- **Speed vs Precision**: `float64` is default (`0.000e+00` coordinate delta vs full-intermediate on 5,000-fiber parity checks); opt into `float32` via `-gpu_float32` / `WMA_GPU_FLOAT32=1` / `gpu_float32=True`.
 - **Cache Persistence**: Set `WMA_ATLAS_CACHE=/persistent/dir` (and `TRITON_CACHE_DIR=/persistent/dir/triton`) across runs; set `WMA_ATLAS_CACHE=off` to disable.
 - **Nonrigid Speed**: Always set `WMA_NONRIGID_ANALYTIC_GRAD=1` when using `-r nonrig` on CUDA GPUs.
 

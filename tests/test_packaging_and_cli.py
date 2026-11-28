@@ -270,7 +270,8 @@ class WMACLITests(unittest.TestCase):
     def test_list_json_and_agent_docs_present(self):
         self.assertTrue((ROOT / 'AGENTS.md').is_file())
         self.assertTrue((ROOT / 'llms.txt').is_file())
-        self.assertFalse((ROOT / 'slicer').exists())
+        self.assertFalse((ROOT / 'slicer' / 'CMakeLists.txt').exists())
+        self.assertFalse((ROOT / 'slicer' / 'WhiteMatterAnalysisGPU' / 'WhiteMatterAnalysisGPU.py').exists())
 
         buf = io.StringIO()
         with patch('sys.stdout', buf):
@@ -282,6 +283,19 @@ class WMACLITests(unittest.TestCase):
         self.assertIn('org', cmd_names)
         self.assertIn('harden', cmd_names)
         self.assertTrue(all(item['available'] for item in payload['commands']))
+
+    def test_masked_pinv_reciprocal_preserves_float32_dtype(self):
+        import numpy as np
+        e_val_a = np.array([0.0, 2.0, -4.0], dtype=np.float32)
+        e_vec_a = np.eye(3, dtype=np.float32)
+        max_abs_ev = np.max(np.abs(e_val_a))
+        nonzero = np.abs(e_val_a) > (1e-15 * max_abs_ev)
+        inv_e_val = np.zeros_like(e_val_a)
+        np.divide(1.0, e_val_a, out=inv_e_val, where=nonzero)
+        pinv_a = (e_vec_a * inv_e_val[None, :]) @ e_vec_a.T
+        self.assertEqual(inv_e_val.dtype, np.float32)
+        self.assertEqual(pinv_a.dtype, np.float32)
+        np.testing.assert_allclose(np.diag(pinv_a), [0.0, 0.5, -0.25], rtol=1e-6)
 
 
 if __name__ == '__main__':

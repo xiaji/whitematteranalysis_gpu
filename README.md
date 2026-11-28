@@ -5,7 +5,7 @@
 [![CUDA 12.4 | 12.8](https://img.shields.io/badge/CUDA-12.4%20%7C%2012.8-76B900.svg)](Dockerfile)
 [![PyTorch + Triton](https://img.shields.io/badge/backend-PyTorch%20%2B%20Triton%20%7C%20CPU-EE4C2C.svg)](doc/acceleration.md)
 [![Container](https://img.shields.io/badge/GHCR-Docker%20%7C%20Apptainer-2496ED.svg)](.github/workflows/docker-publish.yml)
-[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](License.txt)
+[![License: 3D Slicer](https://img.shields.io/badge/license-3D%20Slicer%20(BSD--style)-blue.svg)](License.txt)
 
 **GPU-accelerated diffusion MRI streamline tractography registration, spectral clustering, and Slicer-free white matter parcellation.**
 
@@ -20,7 +20,7 @@
 - **Slicer-Free Pipeline**: Runs rigid, affine, and 3D cubic B-spline nonrigid parcellation end to end in a single Python process using pure-Python/VTK transform hardening—no 3D Slicer or Xvfb required for tensor-free tractograms.
 - **CUDA & Triton Acceleration**: Custom 2D Triton kernels for pairwise fiber distances, spectral embedding, split-C nearest centroids, `O(N + R^3)` nonrigid analytic gradients, and batched `kmeans2`, with automatic multi-GPU dispatch and a vectorized CPU fallback.
 - **Zero-Intermediate Execution & Caching**: Partitioned in-memory tract assembly (`--keep-intermediates 0`) avoids writing 800 intermediate cluster VTPs, paired with `.npz` spectral/outlier atlas caches and persistent multi-subject GPU state reuse.
-- **Numerical Fidelity**: Defaults to `float64` (`0.000e+00` coordinate delta against full-intermediate runs), with opt-in `float32` for maximum throughput.
+- **Numerical Fidelity**: Defaults to `float64` (`0.000e+00` max coordinate delta against full-intermediate runs on 5,000-fiber parity checks; exact fiber-count parity on full 340k whole-brain runs), with opt-in `float32` for maximum throughput.
 
 ---
 
@@ -30,13 +30,15 @@ Evaluated on dual NVIDIA RTX 3090 GPUs (PyTorch `2.8.0+cu128`, Triton `3.4.0`, `
 
 ### Whole-Brain ORG Parcellation (`sub-13086`, 340,795 streamlines, `-r rig -j 4 -gpu on`)
 
-| Pipeline Mode | Wall Time | Clustering | Output Parity |
+| Pipeline Mode | Wall Time | Clustering | Output Check (340k Subject) |
 | --- | ---: | ---: | --- |
-| Baseline GPU (`--keep-intermediates 2`, cold cache) | 125.21 s | 90.24 s | 76 `T_*.vtp` tracts |
-| Zero-intermediate (`--keep-intermediates 0`, cold, `float64`) | **39.76 s** | 13.73 s | `0.000e+00` max coord diff |
-| Zero-intermediate (`--keep-intermediates 0`, warm, `float64`) | **29.78 s** (`4.20x`) | **3.17 s** (`28.5x`) | `0.000e+00` max coord diff |
-| Zero-intermediate (`--keep-intermediates 0`, warm, `float32`) | **25.12 s** (`4.98x`) | **1.00 s** | 76 `T_*.vtp` tracts |
-| Persistent 2-subject batch (326k + 341k fibers, `float64`) | **55.30 s** (**21.19 s** on `sub-13086`) | Resident GPU reuse | 76 `T_*.vtp` tracts / subject |
+| Baseline GPU (Phase 2, `--keep-intermediates 2`, warm `f64` outlier cache) | 125.21 s | 90.24 s | `37,323` fibers / 76 `T_*.vtp` |
+| Zero-intermediate (`--keep-intermediates 0`, cold cache, `float64`) | **39.76 s** (`3.15x`) | **3.57 s** (`25.3x`) | Exact fiber-count match (`37,323` / 76 tracts) |
+| Zero-intermediate (`--keep-intermediates 0`, warm cache, `float64`) | **29.78 s** (`4.20x`) | **3.17 s** (`28.5x`) | Exact fiber-count match (`37,323` / 76 tracts) |
+| Zero-intermediate (`--keep-intermediates 0`, warm cache, `float32`) | **25.12 s** (`4.98x`) | **1.00 s** | `37,007` fibers / 76 `T_*.vtp` |
+| Persistent 2-subject batch (326k + 341k fibers, warm `float64`) | **55.30 s** (**21.19 s** on `sub-13086`) | Resident GPU reuse | 76 `T_*.vtp` tracts / subject |
+
+*Coordinate parity (`0.000e+00` max point difference across all 76 tracts between `--keep-intermediates 0` and `2`) was verified on the 5,000-fiber `sub-13086` check (Benchmark G1); the 340,795-fiber runs above verify exact retained (`48,906`) and output (`37,323`) fiber counts against Phase 2 Benchmark D (Benchmark G2).*
 
 ### Nonrigid Registration, Transform Hardening & Atlas Construction
 
@@ -75,7 +77,10 @@ pip install --no-build-isolation "git+https://github.com/xiaji/whitematteranalys
 
 # Option B: Fresh virtual environment with uv (skip torch install for CPU-only)
 uv venv .venv && source .venv/bin/activate
+# CUDA 12.4 wheel (driver >= 550):
 uv pip install torch --index-url https://download.pytorch.org/whl/cu124
+# For Blackwell GPUs (driver >= 570), use the CUDA 12.8 index instead:
+# uv pip install torch --index-url https://download.pytorch.org/whl/cu128
 uv pip install "git+https://github.com/xiaji/whitematteranalysis_gpu.git@main"
 
 # Verify installation, GPU/Triton status, and cache directory
@@ -94,11 +99,11 @@ WMA_NONRIGID_ANALYTIC_GRAD=1 wma org -i subject.vtp -o output_dir -a /path/to/OR
 # Persistent multi-subject batch parcellation
 wma org --input-dir subjects/ -o batch_out -a /path/to/ORG-Atlases -r rig -j 4 -gpu on --continue-on-error
 
-# Standalone affine / BSpline / Composite transform hardening (.tfm or .h5)
-wma harden --pure-python -i -j 4 input_dir output_dir transform.tfm
+# Standalone affine / BSpline / Composite transform hardening (.tfm or .h5; add -i to invert)
+wma harden --pure-python -j 4 input_dir output_dir -t transform.tfm
 
-# Spectral fiber clustering atlas construction
-wma build-atlas input_dir atlas_out -k 800 -j 4 -gpu on
+# Spectral fiber clustering atlas construction (omit -norender to render QC images when a display/offscreen VTK backend is available)
+wma build-atlas input_dir atlas_out -k 800 -j 4 -norender -gpu on
 ```
 
 All 43 traditional `wm_*.py` entry points (`wm_apply_ORG_atlas.py`, `wm_harden_transform.py`, `wm_cluster_atlas.py`, etc.) are also installed on `PATH`; run `wma list` or see [doc/command-line-reference.md](doc/command-line-reference.md).
@@ -257,7 +262,7 @@ CLI flags (`-gpu`, `-gpu_float32`, `-gpu_devices`) take precedence when passed e
 ## FAQ
 
 **Is 3D Slicer required for ORG white matter parcellation?**  
-No. Tensor-free `.vtk` and `.vtp` tractograms run end to end in pure Python and VTK for both rigid (`-r rig`) and nonrigid (`-r nonrig`) modes. 3D Slicer (`-s`) is only needed when reorienting per-point diffusion tensors.
+No, for standard workflows. Tensor-free `.vtk` and `.vtp` tractograms run end to end in pure Python and VTK for both rigid (`-r rig`) and nonrigid (`-r nonrig`) modes. 3D Slicer (`-s`) is only required when reorienting per-point diffusion tensors or when an initial pre-transform passed via `-t` cannot be parsed in both directions by `read_itk_transform_ras()`.
 
 **Which container tag should I pull?**  
 Use `:latest` (`:cu124`, CUDA 12.4 / PTX 8.4) for broad compatibility on Linux NVIDIA drivers `>= 550`. Use `:cu128` (CUDA 12.8 / PTX 8.7) on Blackwell GPUs or drivers `>= 570`, or `:cpu` on machines without GPUs.
@@ -266,13 +271,13 @@ Use `:latest` (`:cu124`, CUDA 12.4 / PTX 8.4) for broad compatibility on Linux N
 No. `torch` and `triton` are optional and omitted from default dependencies in [pyproject.toml](pyproject.toml), so existing Conda CUDA packages remain untouched.
 
 **Does it run without a GPU?**  
-Yes. When CUDA or PyTorch is absent, all pipelines automatically fall back to the multi-threaded vectorized CPU backend.
+Yes. When CUDA or PyTorch is absent, pipelines fall back to the multi-threaded vectorized CPU backend under auto mode (`-gpu auto` / `gpu=None`) or explicit CPU mode (`-gpu off` / `gpu=False`). Note that `-gpu on` and `gpu=True` explicitly require a GPU and raise an error if no compatible GPU is available.
 
 ---
 
 ## Citation
 
-Released under the [BSD-3-Clause License](License.txt). If you use WhiteMatterAnalysis or the ORG white matter atlas in your research, please cite:
+Released under the [3D Slicer Contribution and Software License Agreement v1.0](License.txt) (BSD-style; redistributions must include Part B). If you use WhiteMatterAnalysis or the ORG white matter atlas in your research, please cite:
 
 1. Zhang, F., Wu, Y., Norton, I., Rathi, Y., Makris, N., & O'Donnell, L. J. (2018). An anatomically curated fiber clustering white matter atlas for consistent white matter tract parcellation across the lifespan. *NeuroImage*, 179, 429–447.
 2. O'Donnell, L. J., Wells III, W. M., Golby, A. J., & Westin, C.-F. (2012). Unbiased groupwise registration of white matter tractography. *MICCAI*, 123–130.

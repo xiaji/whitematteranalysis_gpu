@@ -396,7 +396,7 @@ def spectral(input_polydata, number_of_clusters=200,
                 max_abs_ev = numpy.max(numpy.abs(e_val_a)) if e_val_a.size else 0.0
                 cutoff = 1e-15 * max_abs_ev
                 nonzero = numpy.abs(e_val_a) > cutoff
-                inv_e_val = numpy.zeros_like(e_val_a, dtype=numpy.float64)
+                inv_e_val = numpy.zeros_like(e_val_a)
                 numpy.divide(1.0, e_val_a, out=inv_e_val, where=nonzero)
                 atlas.pinv_A = (e_vec_a * inv_e_val[None, :]) @ e_vec_a.T
             else:

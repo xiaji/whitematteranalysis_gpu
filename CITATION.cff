@@ -3,7 +3,7 @@ title: "WhiteMatterAnalysis GPU"
 message: "If you use this software or the ORG white matter atlas in your research, please cite this repository and the original WhiteMatterAnalysis / ORG atlas publications."
 type: software
 version: "0.4.1"
-license: BSD-3-Clause
+license-url: "https://github.com/xiaji/whitematteranalysis_gpu/blob/main/License.txt"
 repository-code: "https://github.com/xiaji/whitematteranalysis_gpu"
 keywords:
   - diffusion-mri
