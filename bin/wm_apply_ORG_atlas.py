@@ -913,23 +913,22 @@ def _run_subject(case_id, input_path, args, session, workers, slicer_path):
     input_fibers = int(input_pd.GetNumberOfLines())
     has_tensors = wma.transform.has_tensor_arrays(input_pd)
 
-    pre_fwd_matrix = None
-    pre_inv_matrix = None
+    pre_fwd_tx = None
+    pre_inv_tx = None
     pre_tfm_path = _resolve_subject_transform(args.transform, case_id)
     if pre_tfm_path is not None:
-        pre_fwd_matrix = wma.transform.read_itk_affine_matrix_ras(str(pre_tfm_path), inverse=False)
-        pre_inv_matrix = wma.transform.read_itk_affine_matrix_ras(str(pre_tfm_path), inverse=True)
+        pre_fwd_tx = wma.transform.read_itk_transform_ras(str(pre_tfm_path), inverse=False)
+        pre_inv_tx = wma.transform.read_itk_transform_ras(str(pre_tfm_path), inverse=True)
 
     tier1_eligible = (
-        args.reg_mode == 'rig'
-        and not has_tensors
-        and (pre_tfm_path is None or pre_fwd_matrix is not None)
+        not has_tensors
+        and (pre_tfm_path is None or (pre_fwd_tx is not None and pre_inv_tx is not None))
     )
     if not tier1_eligible:
         if slicer_path is None or not slicer_path.is_file():
             raise RuntimeError(
-                "3D Slicer (-s/--slicer) is required for nonrigid registration, "
-                "non-linear pre-transforms, or tensor-bearing tractography.")
+                "3D Slicer (-s/--slicer) is required for tensor-bearing tractography "
+                "or unsupported pre-transforms.")
 
     output_root = Path(args.output).resolve()
     final_dir = output_root / case_id
@@ -953,8 +952,8 @@ def _run_subject(case_id, input_path, args, session, workers, slicer_path):
 
             # Optional initial pre-transform
             if pre_tfm_path is not None:
-                if pre_fwd_matrix is not None and not has_tensors:
-                    input_pd = wma.transform.apply_affine_to_polydata(input_pd, pre_fwd_matrix)
+                if pre_fwd_tx is not None and not has_tensors:
+                    input_pd = wma.transform.apply_transform_to_polydata(input_pd, pre_fwd_tx)
                 else:
                     pre_in = scratch_dir / 'pre_in'
                     pre_out = scratch_dir / 'pre_out'
@@ -990,6 +989,7 @@ def _run_subject(case_id, input_path, args, session, workers, slicer_path):
                 t0 = time.perf_counter()
                 fwd_matrix = _matrix_from_vtk_transform(fwd_transform)
                 inv_matrix = numpy.linalg.inv(fwd_matrix)
+                total_inv_tx = wma.transform.compose_ras_transforms([inv_matrix, pre_inv_tx])
                 reg_pd = wma.transform.apply_affine_to_polydata(input_pd, fwd_matrix)
                 del input_pd
                 gc.collect()
@@ -1012,7 +1012,8 @@ def _run_subject(case_id, input_path, args, session, workers, slicer_path):
                 )
                 affine_pd = wma.transform.apply_affine_to_polydata(input_pd, aff_tx)
                 del input_pd
-                wma.io.write_transforms_to_itk_format([aff_tx], str(aff_out_dir), [case_id])
+                if keep >= 1 or not tier1_eligible:
+                    wma.io.write_transforms_to_itk_format([aff_tx], str(aff_out_dir), [case_id])
                 rig_tfm_path = aff_out_dir / f'itk_txform_{case_id}.tfm'
 
                 nonrig_id = f'{case_id}_reg'
@@ -1030,10 +1031,16 @@ def _run_subject(case_id, input_path, args, session, workers, slicer_path):
                 timings['registration'] = time.perf_counter() - t0
 
                 t0 = time.perf_counter()
-                reg_pd = wma.transform.apply_affine_to_polydata(affine_pd, nonrig_tx)
+                aff_inv_matrix = numpy.linalg.inv(_matrix_from_vtk_transform(aff_tx))
+                nonrig_inv = vtk.vtkBSplineTransform()
+                nonrig_inv.DeepCopy(nonrig_tx)
+                nonrig_inv.Inverse()
+                total_inv_tx = wma.transform.compose_ras_transforms([nonrig_inv, aff_inv_matrix, pre_inv_tx])
+                reg_pd = wma.transform.apply_transform_to_polydata(affine_pd, nonrig_tx)
                 del affine_pd
                 gc.collect()
-                wma.io.write_transforms_to_itk_format([nonrig_tx], str(nonrig_out_dir), [nonrig_id])
+                if keep >= 1 or not tier1_eligible:
+                    wma.io.write_transforms_to_itk_format([nonrig_tx], str(nonrig_out_dir), [nonrig_id])
                 if keep >= 2:
                     wma.io.write_polydata(reg_pd, str(nonrig_out_dir / f'{nonrig_id}_reg.vtk'))
                 nonrig_tfm_path = nonrig_out_dir / f'itk_txform_{nonrig_id}.tfm'
@@ -1128,11 +1135,13 @@ def _run_subject(case_id, input_path, args, session, workers, slicer_path):
                 gc.collect()
                 timings['outlier_and_hemisphere'] = time.perf_counter() - t0
 
-                # Single-pass vectorized affine hardening (points only) + direct tract assembly
+                # Single-pass vectorized affine or VTK nonrigid hardening + direct tract assembly
                 t0 = time.perf_counter()
-                hardening_backend = 'pure_python_affine'
-                total_inv_matrix = (pre_inv_matrix @ inv_matrix) if pre_inv_matrix is not None else inv_matrix
-                hardened_pd = wma.transform.apply_affine_to_polydata(labeled_pd, total_inv_matrix)
+                hardening_backend = (
+                    'pure_python_affine' if isinstance(total_inv_tx, numpy.ndarray)
+                    else 'pure_python_vtk_nonrigid'
+                )
+                hardened_pd = wma.transform.apply_transform_to_polydata(labeled_pd, total_inv_tx)
                 del labeled_pd
                 gc.collect()
                 hardened_geometry = wma.filter._lines_offsets_connectivity(hardened_pd)
@@ -1178,8 +1187,10 @@ def _run_subject(case_id, input_path, args, session, workers, slicer_path):
                 }
 
                 if tier1_eligible:
-                    hardening_backend = 'pure_python_affine'
-                    total_inv_matrix = (pre_inv_matrix @ inv_matrix) if pre_inv_matrix is not None else inv_matrix
+                    hardening_backend = (
+                        'pure_python_affine' if isinstance(total_inv_tx, numpy.ndarray)
+                        else 'pure_python_vtk_nonrigid'
+                    )
                     hardened_for_save = [None] * number_of_clusters if keep >= 2 else None
 
                     def _harden_and_split_one(c_idx):
@@ -1187,7 +1198,7 @@ def _run_subject(case_id, input_path, args, session, workers, slicer_path):
                         pd_clean = cleaned_pds[c_idx]
                         cleaned_pds[c_idx] = None
                         with SmallPages():
-                            pd_h = wma.transform.apply_affine_to_polydata(pd_clean, total_inv_matrix)
+                            pd_h = wma.transform.apply_transform_to_polydata(pd_clean, total_inv_tx)
                             _add_ras_space_field(pd_h)
                             found, labels = read_mask_location_from_vtk(pd_h)
                             if not found or (labels == 0).sum() > 1:

@@ -452,6 +452,59 @@ class HardenWorkerTests(unittest.TestCase):
             )
             self.assertEqual(out1_shift.GetFieldData().GetAbstractArray('SPACE').GetValue(0), 'RAS')
 
+    def test_pure_python_and_auto_harden_valid_bspline_transform(self):
+        with tempfile.TemporaryDirectory(prefix='wma bspline harden ') as temporary:
+            root = Path(temporary)
+            source = root / 'input'
+            out_pure = root / 'out_pure'
+            out_auto = root / 'out_auto'
+            source.mkdir()
+
+            pd_free = self._make_cluster_polydata(
+                [[[-10.0, 5.0, 2.0], [10.0, -5.0, 8.0]]], hemi_labels=[1.0])
+            wma.io.write_polydata(pd_free, str(source / 'cluster_00001.vtp'))
+
+            disp = np.zeros((4, 4, 4, 3), dtype=np.float64)
+            disp[:, :, :, 0] = 3.0
+            disp[:, :, :, 1] = -2.0
+            disp[:, :, :, 2] = 1.5
+            image = vtk.vtkImageData()
+            image.SetDimensions(4, 4, 4)
+            image.SetOrigin(-100.0, -100.0, -100.0)
+            image.SetSpacing(200.0 / 3.0, 200.0 / 3.0, 200.0 / 3.0)
+            from vtk.util.numpy_support import numpy_to_vtk
+            image.GetPointData().SetScalars(numpy_to_vtk(disp.reshape(-1, 3), deep=True))
+            bs = vtk.vtkBSplineTransform()
+            bs.SetBorderModeToZero()
+            bs.SetCoefficientData(image)
+            bs_tfm = Path(wma.io.write_transforms_to_itk_format([bs], str(root), ['bs'])[0])
+
+            stdout_auto = io.StringIO()
+            with patch.object(launcher, '_run_slicer', side_effect=AssertionError('Slicer must not run')), \
+                    patch('sys.stdout', stdout_auto), \
+                    patch('sys.argv', [
+                        'wm_harden_transform.py', str(source), str(out_auto), 'auto',
+                        '-t', str(bs_tfm), '-i', '-j', '1',
+                    ]):
+                launcher.main()
+            self.assertIn('pure-Python/VTK nonrigid', stdout_auto.getvalue())
+            self.assertTrue((out_auto / 'transform_complete.log').is_file())
+
+            with patch('sys.argv', [
+                'wm_harden_transform.py', str(source), str(out_pure),
+                '-t', str(bs_tfm), '-i', '--pure-python',
+            ]):
+                launcher.main()
+
+            out_pd = wma.io.read_polydata(str(out_pure / 'cluster_00001.vtp'))
+            tx_ras = wma.transform.read_itk_transform_ras(str(bs_tfm), inverse=True)
+            expected_pd = wma.transform.apply_transform_to_polydata(pd_free, tx_ras)
+            np.testing.assert_allclose(
+                vtk_to_numpy(out_pd.GetPoints().GetData()),
+                vtk_to_numpy(expected_pd.GetPoints().GetData()),
+                atol=1e-6,
+            )
+
 
 if __name__ == '__main__':
     unittest.main()

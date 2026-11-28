@@ -139,20 +139,20 @@ def _split_hardened_polydata(polydata, out_name, split_output_dir):
     split_polydata(polydata, labels, os.path.basename(str(out_name)), str(split_output_dir))
 
 
-def _load_linear_matrices(transform_paths, inverse, allow_fallback):
-    matrix_cache = {}
+def _load_pure_python_transforms(transform_paths, inverse, allow_fallback):
+    transform_cache = {}
     for tf_path in transform_paths:
         key = str(tf_path)
-        if key not in matrix_cache:
-            mat = wma.transform.read_itk_affine_matrix_ras(key, inverse=inverse)
-            if mat is None:
+        if key not in transform_cache:
+            tx = wma.transform.read_itk_transform_ras(key, inverse=inverse)
+            if tx is None:
                 if allow_fallback:
                     return None
                 raise RuntimeError(
-                    'Pure-Python hardening requires linear ITK affine .tfm transforms; '
-                    'unsupported transform: ' + key)
-            matrix_cache[key] = mat
-    return matrix_cache
+                    'Pure-Python hardening requires linear, BSpline, or composite ITK '
+                    'transforms; unsupported transform: ' + key)
+            transform_cache[key] = tx
+    return transform_cache
 
 
 def _is_lps_polydata(polydata):
@@ -175,7 +175,7 @@ def _set_ras_space_field(polydata):
     polydata.GetFieldData().AddArray(space)
 
 
-def _run_pure_python(inputs, transform_paths, matrix_cache, outdir, workers,
+def _run_pure_python(inputs, transform_paths, transform_cache, outdir, workers,
                      split_output_dir=None, allow_fallback=False):
     cached_polydatas = {}
     if allow_fallback:
@@ -189,7 +189,11 @@ def _run_pure_python(inputs, transform_paths, matrix_cache, outdir, workers,
                 return False
             cached_polydatas[str(pd_path)] = pd
 
-    print('Harden %d files with pure-Python affine (%d worker(s)).' % (len(inputs), workers), flush=True)
+    has_nonlinear = any(not isinstance(tx, numpy.ndarray) for tx in transform_cache.values())
+    label = 'pure-Python/VTK nonrigid' if has_nonlinear else 'pure-Python affine'
+    print('Harden %d files with %s (%d worker(s)).' % (len(inputs), label, workers), flush=True)
+
+    lps_to_ras = numpy.diag([-1.0, -1.0, 1.0, 1.0])
 
     def _harden_one(item):
         pd_path, tf_path = item
@@ -223,10 +227,10 @@ def _run_pure_python(inputs, transform_paths, matrix_cache, outdir, workers,
                     wma.io.write_polydata(pd, str(out_name))
                 hardened = pd
             else:
-                mat = matrix_cache[str(tf_path)]
+                tx = transform_cache[str(tf_path)]
                 if is_lps:
-                    mat = mat @ numpy.diag([-1.0, -1.0, 1.0, 1.0])
-                hardened = wma.transform.apply_affine_to_polydata(pd, mat)
+                    tx = wma.transform.compose_ras_transforms([lps_to_ras, tx])
+                hardened = wma.transform.apply_transform_to_polydata(pd, tx)
                 if out_name.suffix.lower() == '.vtp' or is_lps:
                     _set_ras_space_field(hardened)
                 wma.io.write_polydata(hardened, str(out_name))
@@ -312,9 +316,9 @@ def main():
     expected = {Path(path).name for path in inputs}
 
     if pure_python_requested or auto_requested:
-        matrix_cache = _load_linear_matrices(
+        transform_cache = _load_pure_python_transforms(
             transform_list, args.inverse_transform, allow_fallback=auto_requested)
-        if matrix_cache is not None:
+        if transform_cache is not None:
             if args.prepare_command:
                 prep_started = time.perf_counter()
                 subprocess.run(args.prepare_command, check=True)
@@ -323,7 +327,7 @@ def main():
                 actual = {Path(path).name for path in wma.io.list_vtk_files(str(inputdir))}
                 if actual != expected:
                     raise RuntimeError('Prepared input filenames do not match the catalogue.')
-            if _run_pure_python(inputs, transform_list, matrix_cache, outdir,
+            if _run_pure_python(inputs, transform_list, transform_cache, outdir,
                                 workers, split_output_dir, allow_fallback=auto_requested):
                 actual = {Path(path).name for path in wma.io.list_vtk_files(str(outdir))}
                 if not expected.issubset(actual):

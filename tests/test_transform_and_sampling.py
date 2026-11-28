@@ -353,6 +353,124 @@ class DirectSamplingTests(unittest.TestCase):
         self.assertEqual(out_empty.shape, (3, 0, reg.points_per_fiber))
         self.assertEqual(out_empty.dtype, np.float64)
 
+    def test_read_itk_transform_ras_bspline_composite_and_apply(self):
+        rng = np.random.default_rng(77)
+        nx, ny, nz = 4, 4, 4
+        n_grid = nx * ny * nz
+        coeffs_lps = rng.uniform(-1.5, 1.5, size=(n_grid, 3)).astype(np.float64)
+
+        image = vtk.vtkImageData()
+        image.SetDimensions(nx, ny, nz)
+        image.SetOrigin(-90.0, -90.0, -90.0)
+        image.SetSpacing(60.0, 60.0, 60.0)
+        scalars = numpy_to_vtk(np.ascontiguousarray(coeffs_lps), deep=True)
+        image.GetPointData().SetScalars(scalars)
+        ref_bspline = vtk.vtkBSplineTransform()
+        ref_bspline.SetBorderModeToZero()
+        ref_bspline.SetCoefficientData(image)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bs_path = root / 'bspline.tfm'
+            params_flat = np.concatenate([coeffs_lps[:, 0], coeffs_lps[:, 1], coeffs_lps[:, 2]])
+            bs_path.write_text(
+                '#Insight Transform File V1.0\n'
+                '# Transform 0\n'
+                'Transform: BSplineTransform_double_3_3\n'
+                'Parameters: ' + ' '.join(f'{v:.15g}' for v in params_flat) + '\n'
+                'FixedParameters: 4 4 4 -90 -90 -90 60 60 60 1 0 0 0 1 0 0 0 1\n',
+                encoding='utf-8',
+            )
+
+            tx_inv = wma.transform.read_itk_transform_ras(str(bs_path), inverse=True)
+            tx_fwd = wma.transform.read_itk_transform_ras(str(bs_path), inverse=False)
+            self.assertIsInstance(tx_inv, vtk.vtkAbstractTransform)
+            self.assertIsInstance(tx_fwd, vtk.vtkAbstractTransform)
+
+            pd = _build_polydata(
+                [np.array([[-15.0, 12.0, 5.0], [10.0, -20.0, 18.0]], dtype=np.float64)],
+                point_dtype=np.float64,
+            )
+            out_inv = wma.transform.apply_transform_to_polydata(pd, tx_inv)
+            pts_inv = vtk_to_numpy(out_inv.GetPoints().GetData())
+            # Expected inverse (resampling) in RAS: C * B(C * p_ras)
+            for idx, p_ras in enumerate((np.array([-15.0, 12.0, 5.0]), np.array([10.0, -20.0, 18.0]))):
+                p_lps = np.array([-p_ras[0], -p_ras[1], p_ras[2]])
+                q_lps = np.array(ref_bspline.TransformPoint(p_lps))
+                np.testing.assert_allclose(pts_inv[idx], np.array([-q_lps[0], -q_lps[1], q_lps[2]]), atol=1e-12)
+
+            # Forward then inverse roundtrips back to original coordinates
+            out_roundtrip = wma.transform.apply_transform_to_polydata(out_inv, tx_fwd)
+            np.testing.assert_allclose(
+                vtk_to_numpy(out_roundtrip.GetPoints().GetData()),
+                vtk_to_numpy(pd.GetPoints().GetData()),
+                atol=1e-6,
+            )
+
+            # CompositeTransform: Linear T1 followed by BSpline T2 -> p -> T1(T2(p))
+            comp_path = root / 'composite.tfm'
+            comp_path.write_text(
+                '#Insight Transform File V1.0\n'
+                '# Transform 0\n'
+                'Transform: CompositeTransform_double_3_3\n'
+                'Parameters:\n'
+                'FixedParameters:\n'
+                '# Transform 1\n'
+                'Transform: AffineTransform_double_3_3\n'
+                'Parameters: 1 0 0 0 1 0 0 0 1 2 -3 4\n'
+                'FixedParameters: 0 0 0\n'
+                '# Transform 2\n'
+                'Transform: BSplineTransform_double_3_3\n'
+                'Parameters: ' + ' '.join(f'{v:.15g}' for v in params_flat) + '\n'
+                'FixedParameters: 4 4 4 -90 -90 -90 60 60 60 1 0 0 0 1 0 0 0 1\n',
+                encoding='utf-8',
+            )
+            comp_inv = wma.transform.read_itk_transform_ras(str(comp_path), inverse=True)
+            comp_fwd = wma.transform.read_itk_transform_ras(str(comp_path), inverse=False)
+            out_comp = wma.transform.apply_transform_to_polydata(pd, comp_inv)
+            pts_comp = vtk_to_numpy(out_comp.GetPoints().GetData())
+            # In LPS: T_1 adds (2, -3, 4) after T_2; in RAS that shifts by (-2, +3, +4)
+            np.testing.assert_allclose(pts_comp, pts_inv + np.array([-2.0, 3.0, 4.0]), atol=1e-12)
+            out_comp_rt = wma.transform.apply_transform_to_polydata(out_comp, comp_fwd)
+            np.testing.assert_allclose(
+                vtk_to_numpy(out_comp_rt.GetPoints().GetData()),
+                vtk_to_numpy(pd.GetPoints().GetData()),
+                atol=1e-5,
+            )
+
+            # All-affine composite folds into a single (4, 4) ndarray matching compose_ras_transforms
+            comp_lin = root / 'composite_lin.tfm'
+            comp_lin.write_text(
+                '#Insight Transform File V1.0\n'
+                'Transform: CompositeTransform_double_3_3\n'
+                'Parameters:\nFixedParameters:\n'
+                'Transform: AffineTransform_double_3_3\n'
+                'Parameters: 1 0 0 0 1 0 0 0 1 2 -3 4\n'
+                'FixedParameters: 0 0 0\n'
+                'Transform: AffineTransform_double_3_3\n'
+                'Parameters: 2 0 0 0 2 0 0 0 2 0 0 0\n'
+                'FixedParameters: 0 0 0\n',
+                encoding='utf-8',
+            )
+            lin_mat = wma.transform.read_itk_transform_ras(str(comp_lin), inverse=True)
+            self.assertIsInstance(lin_mat, np.ndarray)
+            expected_lin = wma.transform.compose_ras_transforms([
+                np.diag([2.0, 2.0, 2.0, 1.0]),
+                np.array([[1, 0, 0, -2], [0, 1, 0, 3], [0, 0, 1, 4], [0, 0, 0, 1]], dtype=np.float64),
+            ])
+            np.testing.assert_allclose(lin_mat, expected_lin, atol=1e-12)
+
+            # Malformed parameter count or non-identity direction cosines returns None cleanly
+            bad_bs = root / 'bad_bspline.tfm'
+            bad_bs.write_text(
+                '#Insight Transform File V1.0\n'
+                'Transform: BSplineTransform_double_3_3\n'
+                'Parameters: 0 0 0\n'
+                'FixedParameters: 4 4 4 -90 -90 -90 60 60 60 1 0 0 0 1 0 0 0 1\n',
+                encoding='utf-8',
+            )
+            self.assertIsNone(wma.transform.read_itk_transform_ras(str(bad_bs), inverse=True))
+
 
 if __name__ == '__main__':
     unittest.main()

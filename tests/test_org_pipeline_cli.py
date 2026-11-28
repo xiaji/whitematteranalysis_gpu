@@ -1119,6 +1119,64 @@ class ORGPipelineCLITests(unittest.TestCase):
                 self.assertTrue(qc['gpu_used'])
                 self.assertEqual(qc['anatomical_tracts_written'], qc['anatomical_tracts_expected'])
 
+    def test_slicer_free_nonrigid_mode_keep0_and_keep2_parity(self):
+        org_cli = _load_module('wm_apply_ORG_atlas_nonrig_slicerfree', ORG_CLI_PATH)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            atlas_root = root / 'ORG-Atlas'
+            _build_synthetic_org_atlas(atlas_root)
+            fibers = (
+                _bundle_coords(-35.0, 0.0, 5, n_pts=21, step=3.0, seed=131)
+                + _bundle_coords(35.0, 0.0, 5, n_pts=21, step=3.0, seed=132)
+                + _bundle_coords(0.0, 35.0, 5, n_pts=21, step=3.0, commissural=True, seed=133)
+            )
+            subj_path = root / 'sub-nonrig.vtp'
+            wma.io.write_polydata(_make_tract_polydata(fibers), str(subj_path))
+
+            fast_nonrig = {
+                'grid_resolution': [4],
+                'initial_step': [2],
+                'final_step': [1],
+                'sigma': [10],
+                'iterations': [1],
+                'mean_brain_size': [16],
+                'subject_brain_size': [12],
+                'maxfun': [12],
+                'points_per_fiber': 3,
+            }
+            out_k0 = root / 'out_k0'
+            out_k2 = root / 'out_k2'
+            with patch.dict(org_cli._PRESETS, {'nonrigid': fast_nonrig}):
+                with patch.object(org_cli, '_invoke_slicer_hardening',
+                                  side_effect=AssertionError('Slicer must not run in tensor-free -r nonrig')):
+                    with patch.object(sys, 'argv', [
+                        str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_k0),
+                        '-a', str(atlas_root), '-r', 'nonrig', '-j', '2', '-gpu', 'off',
+                        '--keep-intermediates', '0']):
+                        org_cli.main()
+                    with patch.object(sys, 'argv', [
+                        str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_k2),
+                        '-a', str(atlas_root), '-r', 'nonrig', '-j', '2', '-gpu', 'off',
+                        '--keep-intermediates', '2']):
+                        org_cli.main()
+
+            qc0 = json.loads((out_k0 / 'sub-nonrig' / 'qc_summary.json').read_text())
+            qc2 = json.loads((out_k2 / 'sub-nonrig' / 'qc_summary.json').read_text())
+            self.assertEqual(qc0['hardening_backend'], 'pure_python_vtk_nonrigid')
+            self.assertEqual(qc2['hardening_backend'], 'pure_python_vtk_nonrigid')
+            self.assertEqual(qc0['tracts'], qc2['tracts'])
+            self.assertTrue((out_k2 / 'sub-nonrig' / 'TractRegistration' / 'sub-nonrig_reg' / 'output_tractography' / 'itk_txform_sub-nonrig_reg.tfm').is_file())
+            for tract_name in ('T_AF_left.vtp', 'T_AF_right.vtp', 'T_CC1.vtp'):
+                pd0 = wma.io.read_polydata(str(out_k0 / 'sub-nonrig' / 'AnatomicalTracts' / tract_name))
+                pd2 = wma.io.read_polydata(str(out_k2 / 'sub-nonrig' / 'AnatomicalTracts' / tract_name))
+                self.assertEqual(pd0.GetNumberOfLines(), pd2.GetNumberOfLines())
+                if pd0.GetNumberOfLines() > 0:
+                    np.testing.assert_allclose(
+                        vtk_to_numpy(pd0.GetPoints().GetData()),
+                        vtk_to_numpy(pd2.GetPoints().GetData()),
+                        atol=1e-6,
+                    )
+
 
 if __name__ == '__main__':
     unittest.main()
