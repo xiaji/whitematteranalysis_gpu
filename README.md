@@ -139,6 +139,54 @@ with ORGParcellationPipeline("/path/to/ORG-Atlases", reg_mode="rig", jobs=4, gpu
     print(batch.succeeded, batch.failed, batch.summary_path)
 ```
 
+### Docker & Apptainer (HPC)
+
+The repository includes a multi-target [Dockerfile](Dockerfile) (`gpu` default + `cpu` lightweight
+target) for Slicer-free rigid and nonrigid ORG parcellation. Atlases are mounted at runtime rather
+than baked into the image, and caches default under `/tmp/wma-cache` so non-root `--user` runs and
+read-only Apptainer/Singularity containers work out of the box.
+
+```shell
+# Build GPU image (default: pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime; override GPU_BASE_IMAGE if needed)
+docker build -t wma-gpu:0.4.0 .
+# Or build lightweight CPU-only image:
+# docker build --target cpu -t wma-cpu:0.4.0 .
+
+# 1. Inspect CUDA, Triton, VTK, and cache status inside the container
+docker run --rm --gpus all wma-gpu:0.4.0 doctor
+
+# 2. Single-subject ORG parcellation (mount data, atlas, output, and persistent cache)
+docker run --rm --gpus all --user "$(id -u):$(id -g)" \
+  -v /data/subjects:/input:ro \
+  -v /data/ORG-Atlases:/atlas:ro \
+  -v /data/output:/output \
+  -v /data/wma_cache:/tmp/wma-cache \
+  wma-gpu:0.4.0 org -i /input/sub-01.vtp -o /output -a /atlas -r rig -j 4 -gpu on
+
+# 3. Persistent multi-subject batch parcellation
+docker run --rm --gpus all --user "$(id -u):$(id -g)" \
+  -v /data/subjects:/input:ro \
+  -v /data/ORG-Atlases:/atlas:ro \
+  -v /data/output:/output \
+  -v /data/wma_cache:/tmp/wma-cache \
+  wma-gpu:0.4.0 org --input-dir /input -o /output -a /atlas -r rig -j 4 -gpu on --continue-on-error
+
+# 4. Run a custom Python SDK script inside the container
+docker run --rm --gpus all --entrypoint python \
+  -v /data:/data -v /work/run.py:/run.py:ro \
+  wma-gpu:0.4.0 /run.py
+```
+
+For Slurm / HPC clusters using Apptainer (Singularity), convert the saved Docker image and run with `--nv`:
+
+```shell
+docker save wma-gpu:0.4.0 -o wma-gpu-0.4.0.tar
+apptainer build wma-gpu-0.4.0.sif docker-archive://wma-gpu-0.4.0.tar
+apptainer exec --nv \
+  -B /data/subjects:/input:ro,/data/ORG-Atlases:/atlas:ro,/data/output:/output,/scratch/wma_cache:/tmp/wma-cache \
+  wma-gpu-0.4.0.sif wma org --input-dir /input -o /output -a /atlas -r rig -j 4 -gpu on
+```
+
 Install the CUDA-enabled PyTorch build matching your Python, GPU and NVIDIA
 driver using the [official PyTorch selector](https://pytorch.org/get-started/locally/)
 or [version-specific commands](https://pytorch.org/get-started/previous-versions/).

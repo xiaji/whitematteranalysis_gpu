@@ -1,0 +1,32 @@
+# Git and editor metadata
+.git
+.gitignore
+.superpowers
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.vscode
+.idea
+
+# Python caches and build outputs
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+build
+dist
+.venv
+venv
+
+# Non-runtime repository directories (keep bin/*.py and utilities/*.py for pyproject script-files)
+tests
+bin/tests
+utilities/tests
+doc
+docs
+slicer
+*.jpg
+*.png
+*.vtp
+*.vtk
+*.tfm
+*.h5

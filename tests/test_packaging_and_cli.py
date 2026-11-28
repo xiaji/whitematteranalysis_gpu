@@ -47,6 +47,85 @@ class PackagingMetadataTests(unittest.TestCase):
         self.assertRegex(wma.__version__, r'^\d+\.\d+\.\d+')
         self.assertIn('cli', wma.__all__)
 
+    def test_dockerfile_and_dockerignore_build_context_is_installable(self):
+        import fnmatch
+        import shutil
+        import tempfile
+
+        dockerfile = ROOT / 'Dockerfile'
+        dockerignore = ROOT / '.dockerignore'
+        self.assertTrue(dockerfile.is_file())
+        self.assertTrue(dockerignore.is_file())
+
+        df_text = dockerfile.read_text(encoding='utf-8')
+        self.assertIn('AS cpu', df_text)
+        self.assertIn('AS gpu', df_text)
+        # Default target (last stage) must be the GPU image.
+        self.assertGreater(df_text.index('AS gpu'), df_text.index('AS cpu'))
+        self.assertIn('ENTRYPOINT ["wma"]', df_text)
+        self.assertIn('gcc', df_text)
+        self.assertIn('libgl1', df_text)
+        self.assertIn('libxt6', df_text)
+        self.assertIn('WMA_ATLAS_CACHE=/tmp/wma-cache/atlas', df_text)
+        self.assertIn('TRITON_CACHE_DIR=/tmp/wma-cache/triton', df_text)
+
+        patterns = [
+            line.strip()
+            for line in dockerignore.read_text(encoding='utf-8').splitlines()
+            if line.strip() and not line.strip().startswith('#')
+        ]
+
+        def _is_ignored(rel_posix):
+            parts = rel_posix.split('/')
+            for pat in patterns:
+                if pat.startswith('**/'):
+                    sub = pat[3:]
+                    if any(fnmatch.fnmatch(p, sub) for p in parts) or fnmatch.fnmatch(rel_posix, sub):
+                        return True
+                elif '/' in pat:
+                    if rel_posix == pat or rel_posix.startswith(pat + '/') or fnmatch.fnmatch(rel_posix, pat):
+                        return True
+                else:
+                    if rel_posix == pat or parts[0] == pat or fnmatch.fnmatch(parts[-1], pat):
+                        return True
+            return False
+
+        # Simulate Docker build context filtering and verify wheel builds cleanly from it.
+        with tempfile.TemporaryDirectory(prefix='wma_docker_ctx_') as tmp:
+            ctx = Path(tmp) / 'ctx'
+            whl_dir = Path(tmp) / 'whls'
+            ctx.mkdir()
+            whl_dir.mkdir()
+            for dirpath, dirnames, filenames in os.walk(ROOT):
+                rel_dir = Path(dirpath).relative_to(ROOT)
+                rel_dir_posix = '' if str(rel_dir) == '.' else rel_dir.as_posix()
+                kept_dirs = []
+                for d in dirnames:
+                    rel_child = f'{rel_dir_posix}/{d}' if rel_dir_posix else d
+                    if not _is_ignored(rel_child):
+                        kept_dirs.append(d)
+                        (ctx / rel_child).mkdir(parents=True, exist_ok=True)
+                dirnames[:] = kept_dirs
+                for fname in filenames:
+                    rel_file = f'{rel_dir_posix}/{fname}' if rel_dir_posix else fname
+                    if not _is_ignored(rel_file):
+                        shutil.copy2(Path(dirpath) / fname, ctx / rel_file)
+
+            self.assertFalse((ctx / 'tests').exists())
+            self.assertFalse((ctx / 'slicer').exists())
+            self.assertTrue((ctx / 'pyproject.toml').is_file())
+            self.assertTrue((ctx / 'License.txt').is_file())
+            self.assertTrue((ctx / 'README.md').is_file())
+
+            proc = subprocess.run(
+                [sys.executable, '-m', 'pip', 'wheel', '--no-deps', '--no-build-isolation',
+                 str(ctx), '-w', str(whl_dir)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+            whls = list(whl_dir.glob('whitematteranalysis-*.whl'))
+            self.assertEqual(len(whls), 1)
+
 
 class WMACLITests(unittest.TestCase):
     def test_version_and_help(self):
