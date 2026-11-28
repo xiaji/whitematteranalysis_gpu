@@ -46,6 +46,7 @@ h5 = [
 dev = [
     "pytest>=7.0",
     "pytest-console-scripts",
+    "setuptools>=64",
 ]
 doc = [
     "sphinx",

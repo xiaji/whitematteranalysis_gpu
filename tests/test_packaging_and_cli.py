@@ -117,9 +117,22 @@ class PackagingMetadataTests(unittest.TestCase):
             self.assertTrue((ctx / 'License.txt').is_file())
             self.assertTrue((ctx / 'README.md').is_file())
 
+            pyproject_text = (ctx / 'pyproject.toml').read_text(encoding='utf-8')
+            block = pyproject_text.split('script-files = [', 1)[1].split(']', 1)[0]
+            for rel in re.findall(r'"([^"]+)"', block):
+                self.assertTrue((ctx / rel).is_file(), f'.dockerignore excluded required script: {rel}')
+
+            import importlib.util
+            if importlib.util.find_spec('setuptools.build_meta') is None:
+                self.skipTest('setuptools>=64 is required to build a wheel from the Docker context')
+
+            build_code = (
+                "import sys; from setuptools import build_meta; "
+                "print(build_meta.build_wheel(sys.argv[1]))"
+            )
             proc = subprocess.run(
-                [sys.executable, '-m', 'pip', 'wheel', '--no-deps', '--no-build-isolation',
-                 str(ctx), '-w', str(whl_dir)],
+                [sys.executable, '-c', build_code, str(whl_dir)],
+                cwd=str(ctx),
                 capture_output=True, text=True,
             )
             self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
