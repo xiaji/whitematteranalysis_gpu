@@ -900,6 +900,73 @@ class ORGPipelineCLITests(unittest.TestCase):
                 org_cli.main()
             self.assertEqual(Path(mock_harden.call_args.args[3]).resolve(), slicer_bin.resolve())
 
+    def test_zero_intermediate_indexed_pipeline_matches_keep2_exactly(self):
+        org_cli = _load_module('wm_apply_ORG_atlas_indexed_parity', ORG_CLI_PATH)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            atlas_root = root / 'ORG-Atlas'
+            _build_synthetic_org_atlas(atlas_root)
+
+            fibers = (
+                _bundle_coords(-35.0, 0.0, 6, n_pts=21, step=3.0, seed=101)
+                + _bundle_coords(35.0, 0.0, 6, n_pts=21, step=3.0, seed=102)
+                + _bundle_coords(0.0, 35.0, 6, n_pts=21, step=3.0, commissural=True, seed=103)
+            )
+            tags = [float(i + 1) for i in range(len(fibers))]
+            subj_path = root / 'sub-parity.vtp'
+            wma.io.write_polydata(_make_tract_polydata(fibers, tags=tags), str(subj_path))
+
+            out_ref = root / 'out_keep2'
+            with patch.object(sys, 'argv', [
+                str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_ref),
+                '-a', str(atlas_root), '-r', 'rig', '-j', '2', '-gpu', 'off',
+                '--keep-intermediates', '2']):
+                org_cli.main()
+
+            out_idx = root / 'out_keep0'
+            with patch.object(wma.cluster, 'mask_all_clusters',
+                              side_effect=AssertionError('keep=0 must skip mask_all_clusters')), \
+                    patch.object(sys, 'argv', [
+                        str(ORG_CLI_PATH), '-i', str(subj_path), '-o', str(out_idx),
+                        '-a', str(atlas_root), '-r', 'rig', '-j', '2', '-gpu', 'off',
+                        '--keep-intermediates', '0']):
+                org_cli.main()
+
+            qc_ref = json.loads((out_ref / 'sub-parity' / 'qc_summary.json').read_text())
+            qc_idx = json.loads((out_idx / 'sub-parity' / 'qc_summary.json').read_text())
+            for key in (
+                'input_fibers', 'registered_fibers', 'filtered_fibers',
+                'excluded_short_fibers', 'total_clusters', 'nonempty_clusters',
+                'outlier_removed_fibers', 'retained_clustered_fibers',
+                'anatomical_tracts_expected', 'anatomical_tracts_written', 'tracts',
+            ):
+                self.assertEqual(qc_idx[key], qc_ref[key], f'QC mismatch for {key}')
+
+            for tract_name in ('T_AF_left.vtp', 'T_AF_right.vtp', 'T_CC1.vtp'):
+                pd_ref = wma.io.read_polydata(str(out_ref / 'sub-parity' / 'AnatomicalTracts' / tract_name))
+                pd_idx = wma.io.read_polydata(str(out_idx / 'sub-parity' / 'AnatomicalTracts' / tract_name))
+                self.assertEqual(pd_idx.GetNumberOfLines(), pd_ref.GetNumberOfLines())
+                self.assertEqual(pd_idx.GetNumberOfPoints(), pd_ref.GetNumberOfPoints())
+                np.testing.assert_allclose(
+                    vtk_to_numpy(pd_idx.GetPoints().GetData()),
+                    vtk_to_numpy(pd_ref.GetPoints().GetData()),
+                    rtol=1e-6, atol=1e-6,
+                )
+                for pt_arr in ('fiber_tag', 'HemisphereLocation', 'cluster_idx'):
+                    np.testing.assert_array_equal(
+                        vtk_to_numpy(pd_idx.GetPointData().GetArray(pt_arr)),
+                        vtk_to_numpy(pd_ref.GetPointData().GetArray(pt_arr)),
+                    )
+                for cell_arr in ('ClusterNumber', 'EmbeddingCoordinate'):
+                    np.testing.assert_allclose(
+                        vtk_to_numpy(pd_idx.GetCellData().GetArray(cell_arr)),
+                        vtk_to_numpy(pd_ref.GetCellData().GetArray(cell_arr)),
+                        rtol=1e-6, atol=1e-6,
+                    )
+                space_idx = pd_idx.GetFieldData().GetAbstractArray('SPACE')
+                self.assertIsNotNone(space_idx)
+                self.assertEqual(space_idx.GetValue(0), 'RAS')
+
 
 if __name__ == '__main__':
     unittest.main()

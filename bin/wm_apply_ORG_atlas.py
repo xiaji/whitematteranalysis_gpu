@@ -244,7 +244,22 @@ def _collect_tract_tasks(fc_atlas_dir, atlas_cluster_names, location_data,
     return tasks
 
 
-def _assemble_single_tract(member_pds, output_path):
+def _assemble_single_tract(member_pds, output_path, indexed_source=None):
+    if indexed_source is not None:
+        (hardened_geometry, all_lines, point_specs, cell_specs,
+         tensor_names, extra_per_line_point_arrays) = indexed_source
+        pd_appended = wma.filter._build_polydata_from_indexed_lines(
+            hardened_geometry,
+            all_lines,
+            point_specs=point_specs,
+            cell_specs=cell_specs,
+            tensor_names=tensor_names,
+            extra_per_line_point_arrays=extra_per_line_point_arrays,
+        )
+        _add_ras_space_field(pd_appended)
+        wma.io.write_polydata(pd_appended, str(output_path))
+        return int(pd_appended.GetNumberOfLines()), int(pd_appended.GetNumberOfPoints())
+
     appender = vtk.vtkAppendPolyData()
     for c_idx, pd_cluster in enumerate(member_pds):
         pd_copy = vtk.vtkPolyData()
@@ -315,9 +330,218 @@ def _invoke_slicer_hardening(in_dir, out_dir, tfm_path, slicer_path, jobs,
     return backend
 
 
+def _dispatch_cluster_workers(atlas_cluster_paths, backend, workers, worker_fn):
+    tasks = list(enumerate(atlas_cluster_paths))
+    if backend == 'gpu' and workers > 1:
+        import torch
+        base_device = wma.gpu.get_device()
+        n_gpus = wma.gpu.visible_device_count() if base_device.type != 'mps' else 1
+        thread_local = threading.local()
+
+        def _run_gpu(item):
+            c_idx, ca_path = item
+            dev = wma.gpu.get_device(c_idx % n_gpus) if n_gpus > 1 else base_device
+            dev_ctx = (torch.cuda.device(dev)
+                       if dev.type == 'cuda' and torch.cuda.is_available()
+                       else contextlib.nullcontext())
+            with dev_ctx:
+                if dev.type == 'cuda':
+                    streams = getattr(thread_local, 'streams', None)
+                    if streams is None:
+                        streams = {}
+                        thread_local.streams = streams
+                    stream = streams.get(dev.index)
+                    if stream is None:
+                        stream = torch.cuda.Stream(device=dev)
+                        streams[dev.index] = stream
+                    stream_ctx = torch.cuda.stream(stream)
+                else:
+                    stream_ctx = contextlib.nullcontext()
+                with stream_ctx:
+                    worker_fn(c_idx, ca_path, device=dev)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_run_gpu, tasks))
+    elif workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda item: worker_fn(item[0], item[1]), tasks))
+    else:
+        for c_idx, ca_path in tasks:
+            worker_fn(c_idx, ca_path)
+
+
+def _load_cluster_reference(ca_path, sigmasq, distance_method, atlas_bilateral,
+                            backend, device=None, ref_cache=None, ref_lock=None):
+    if ref_cache is not None:
+        key = (ca_path, float(sigmasq), str(distance_method), bool(atlas_bilateral), str(backend))
+        if ref_lock is not None:
+            with ref_lock:
+                cached = ref_cache.get(key)
+        else:
+            cached = ref_cache.get(key)
+        if cached is not None:
+            return cached
+        loaded = load_reference(
+            ca_path, sigmasq, distance_method, atlas_bilateral, backend, device=device)
+        if ref_lock is not None:
+            with ref_lock:
+                ref_cache.setdefault(key, loaded)
+                return ref_cache[key]
+        ref_cache[key] = loaded
+        return loaded
+    return load_reference(
+        ca_path, sigmasq, distance_method, atlas_bilateral, backend, device=device)
+
+
+def _compute_cluster_outlier_scores(subject_array, atlas_array, total_similarity_atlas,
+                                    sigmasq, outlier_std, atlas_bilateral, backend,
+                                    device=None, verbose=False, c_num=0):
+    distance_method = 'Mean'
+    n_atlas = len(atlas_array)
+    if backend == 'gpu':
+        similarity_sums, _ = wma.gpu.distance.similarity_row_sums_from_arrays(
+            subject_array, atlas_array, 0.0, distance_method=distance_method,
+            bilateral=atlas_bilateral, sigmasq=sigmasq,
+            sqrt_distance_sums=False, device=device)
+        total_similarity_subject = similarity_sums / n_atlas
+        (total_similarity_subject, total_similarity_atlas,
+         refined) = wma.gpu.distance.refine_outlier_probabilities_from_arrays(
+            subject_array, atlas_array, total_similarity_subject,
+            total_similarity_atlas, outlier_std,
+            sigmasq=sigmasq, bilateral=atlas_bilateral,
+            distance_method=distance_method)
+        if verbose and refined:
+            print(f"cluster {c_num} refined near-cutoff probabilities with CPU/NumPy")
+    else:
+        matrix = wma.gpu.cpu_backend._distance_matrix
+        cluster_distances = matrix(
+            subject_array, atlas_array, 0.0,
+            distance_method=distance_method, bilateral=atlas_bilateral,
+            number_of_jobs=1).T
+        cluster_similarity_subject = wma.similarity.distance_to_similarity(
+            cluster_distances, sigmasq)
+        total_similarity_subject = numpy.sum(cluster_similarity_subject, axis=0) / n_atlas
+
+    mean_sim_atlas = numpy.mean(total_similarity_atlas)
+    cluster_std_atlas = numpy.std(total_similarity_atlas)
+    cutoff = mean_sim_atlas - outlier_std * cluster_std_atlas
+    return total_similarity_subject, cutoff
+
+
+_PT_RANGE_40 = numpy.arange(40, dtype=numpy.float64)
+
+
+def _assess_cluster_hemisphere_indexed(kept_lines, c_idx, location_data, geometry,
+                                       has_existing_hemi, existing_hemi_labels):
+    n_kept = len(kept_lines)
+    if n_kept == 0:
+        return numpy.zeros(0, dtype=numpy.float64)
+    if has_existing_hemi:
+        return numpy.asarray(existing_hemi_labels[kept_lines], dtype=numpy.float64)
+
+    label_group = None if location_data is None else location_data[c_idx][1]
+    labels = numpy.zeros(n_kept, dtype=numpy.float64)
+    if label_group in (b'c', b'ng'):
+        labels[:] = 3.0
+        return labels
+
+    offsets, conn, points = geometry
+    starts = offsets[:-1][kept_lines]
+    lengths = offsets[1:][kept_lines] - starts
+    steps = (lengths.astype(numpy.float64) - 1.0) / 39.0
+    local_ids = numpy.rint(_PT_RANGE_40 * steps[:, numpy.newaxis]).astype(numpy.int64)
+    global_ids = conn[starts[:, numpy.newaxis] + local_ids]
+    r_vals = points[global_ids, 0].astype(numpy.float64, copy=False)
+    frac_left = numpy.count_nonzero(r_vals < 0.0, axis=1) / 40.0
+
+    thresh = 0.5001 if label_group == b'h' else 0.6
+    is_left = frac_left > thresh
+    is_right = frac_left < (1.0 - thresh)
+    is_comm = ~(is_left | is_right)
+    labels[is_left] = 1.0
+    labels[is_right] = 2.0
+    if numpy.any(is_comm):
+        if label_group == b'h':
+            labels[is_comm] = 1.0 if int(numpy.count_nonzero(is_left)) <= int(numpy.count_nonzero(is_right)) else 2.0
+        else:
+            labels[is_comm] = 3.0
+    return labels
+
+
+def _outlier_and_assess_indexed(cluster_line_indices, queries_15, geometry,
+                                has_existing_hemi, existing_hemi_labels,
+                                atlas_cluster_paths, atlas_cluster_names,
+                                atlas_bilateral, location_data, outlier_sigma,
+                                outlier_std, backend, workers, verbose=False,
+                                ref_cache=None, ref_lock=None):
+    num_clusters = len(atlas_cluster_paths)
+    kept_by_hemi = {
+        'tracts_left_hemisphere': {},
+        'tracts_right_hemisphere': {},
+        'tracts_commissural': {},
+    }
+    stats = [{'removed': 0, 'retained': 0} for _ in range(num_clusters)]
+    assessed_hemi = None if has_existing_hemi else numpy.zeros(len(queries_15), dtype=numpy.float32)
+    sigmasq = outlier_sigma * outlier_sigma
+    distance_method = 'Mean'
+    empty_idx = numpy.empty(0, dtype=numpy.int64)
+
+    def _process_one(c_idx, ca_path, device=None):
+        c_num = c_idx + 1
+        name = atlas_cluster_names[c_idx]
+        c_lines = cluster_line_indices[c_idx]
+        n_subj = int(len(c_lines))
+        if n_subj == 0:
+            kept_by_hemi['tracts_left_hemisphere'][name] = empty_idx
+            kept_by_hemi['tracts_right_hemisphere'][name] = empty_idx
+            kept_by_hemi['tracts_commissural'][name] = empty_idx
+            return
+
+        atlas_array, total_similarity_atlas = _load_cluster_reference(
+            ca_path, sigmasq, distance_method, atlas_bilateral, backend,
+            device=device, ref_cache=ref_cache, ref_lock=ref_lock)
+        n_atlas = len(atlas_array)
+
+        if n_atlas == 0:
+            keep_lines = c_lines
+            n_rejected = 0
+            n_retained = n_subj
+        else:
+            subject_array = queries_15[c_lines]
+            total_similarity_subject, cutoff = _compute_cluster_outlier_scores(
+                subject_array, atlas_array, total_similarity_atlas,
+                sigmasq, outlier_std, atlas_bilateral, backend,
+                device=device, verbose=verbose, c_num=c_num)
+            keep_mask = total_similarity_subject >= cutoff
+            keep_lines = c_lines[keep_mask]
+            n_retained = int(len(keep_lines))
+            n_rejected = n_subj - n_retained
+
+        labels = _assess_cluster_hemisphere_indexed(
+            keep_lines, c_idx, location_data, geometry,
+            has_existing_hemi, existing_hemi_labels)
+        if len(numpy.where(labels == 0)[0]) > 1:
+            raise RuntimeError(f"Hemisphere labels incomplete for cluster {c_num:05d}")
+        if assessed_hemi is not None and n_retained > 0:
+            assessed_hemi[keep_lines] = labels.astype(numpy.float32)
+
+        kept_by_hemi['tracts_left_hemisphere'][name] = keep_lines[labels == 1]
+        kept_by_hemi['tracts_right_hemisphere'][name] = keep_lines[labels == 2]
+        kept_by_hemi['tracts_commissural'][name] = keep_lines[labels == 3]
+        stats[c_idx]['removed'] = n_rejected
+        stats[c_idx]['retained'] = n_retained
+
+    _dispatch_cluster_workers(atlas_cluster_paths, backend, workers, _process_one)
+    total_removed = sum(s['removed'] for s in stats)
+    total_retained = sum(s['retained'] for s in stats)
+    nonempty = sum(1 for s in stats if s['retained'] > 0)
+    return kept_by_hemi, assessed_hemi, total_removed, total_retained, nonempty
+
+
 def _outlier_and_assess_clusters(cluster_pds, atlas_cluster_paths, atlas_bilateral,
                                  location_data, outlier_sigma, outlier_std,
-                                 backend, workers, verbose=False):
+                                 backend, workers, verbose=False,
+                                 ref_cache=None, ref_lock=None):
     num_clusters = len(atlas_cluster_paths)
     cleaned_pds = [None] * num_clusters
     log_rows = [None] * num_clusters
@@ -340,8 +564,9 @@ def _outlier_and_assess_clusters(cluster_pds, atlas_cluster_paths, atlas_bilater
             return
 
         if backend:
-            atlas_array, total_similarity_atlas = load_reference(
-                ca_path, sigmasq, distance_method, atlas_bilateral, backend, device=device)
+            atlas_array, total_similarity_atlas = _load_cluster_reference(
+                ca_path, sigmasq, distance_method, atlas_bilateral, backend,
+                device=device, ref_cache=ref_cache, ref_lock=ref_lock)
             n_atlas = len(atlas_array)
         else:
             pd_atlas = wma.io.read_polydata(ca_path)
@@ -431,43 +656,7 @@ def _outlier_and_assess_clusters(cluster_pds, atlas_cluster_paths, atlas_bilater
             f"{mean_prob_before}\t{mean_prob_after}"
         )
 
-    tasks = list(enumerate(atlas_cluster_paths))
-    if backend == 'gpu' and workers > 1:
-        import torch
-        base_device = wma.gpu.get_device()
-        n_gpus = wma.gpu.visible_device_count() if base_device.type != 'mps' else 1
-        thread_local = threading.local()
-
-        def _run_gpu(item):
-            c_idx, ca_path = item
-            dev = wma.gpu.get_device(c_idx % n_gpus) if n_gpus > 1 else base_device
-            dev_ctx = (torch.cuda.device(dev)
-                       if dev.type == 'cuda' and torch.cuda.is_available()
-                       else contextlib.nullcontext())
-            with dev_ctx:
-                if dev.type == 'cuda':
-                    streams = getattr(thread_local, 'streams', None)
-                    if streams is None:
-                        streams = {}
-                        thread_local.streams = streams
-                    stream = streams.get(dev.index)
-                    if stream is None:
-                        stream = torch.cuda.Stream(device=dev)
-                        streams[dev.index] = stream
-                    stream_ctx = torch.cuda.stream(stream)
-                else:
-                    stream_ctx = contextlib.nullcontext()
-                with stream_ctx:
-                    _process_one(c_idx, ca_path, device=dev)
-
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(_run_gpu, tasks))
-    elif workers > 1:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            list(pool.map(lambda item: _process_one(item[0], item[1]), tasks))
-    else:
-        for c_idx, ca_path in tasks:
-            _process_one(c_idx, ca_path)
+    _dispatch_cluster_workers(atlas_cluster_paths, backend, workers, _process_one)
 
     total_removed = sum(s['removed'] for s in stats)
     total_retained = sum(s['retained'] for s in stats)
@@ -709,9 +898,9 @@ def run_pipeline(args):
             excluded_short_fibers = registered_fibers - filtered_fibers
             timings['length_filter'] = time.perf_counter() - t0
 
-            # Spectral atlas labeling + in-memory per-cluster split
+            # Spectral atlas labeling + in-memory per-cluster split or indexed partition
             t0 = time.perf_counter()
-            atlas = wma.cluster.load_atlas(str(fc_atlas_dir), 'atlas')
+            atlas = wma.cluster.load_atlas(str(fc_atlas_dir), 'atlas', for_labeling=True)
             number_of_clusters = int(atlas.centroids.shape[0])
             atlas_bilateral = bool(atlas.bilateral)
             if number_of_clusters != len(atlas_cluster_names):
@@ -719,21 +908,50 @@ def run_pipeline(args):
                     f"Atlas centroid count ({number_of_clusters}) does not match "
                     f"cluster VTP count ({len(atlas_cluster_names)})")
 
+            backend = 'gpu' if wma.gpu.use_gpu() else ('cpu' if wma.gpu.config.cpu_fast_enabled() else None)
+            use_indexed = (
+                tier1_eligible
+                and keep == 0
+                and backend is not None
+                and filtered_fibers > 0
+                and wma.filter._lines_offsets_connectivity(filtered_reg_pd) is not None
+            )
+            queries_15 = None
+            cluster_line_indices = None
+            labeled_pd = None
             if filtered_fibers > 0:
+                if backend is not None:
+                    queries_15 = wma.gpu.fiber_tensors.polydata_to_numpy(filtered_reg_pd, 15)
                 labeled_pd, cluster_numbers, color, embed = wma.cluster.spectral_atlas_label(
-                    filtered_reg_pd, atlas, number_of_jobs=workers)
-                cluster_pds = wma.cluster.mask_all_clusters(
-                    labeled_pd, cluster_numbers, number_of_clusters,
-                    preserve_point_data=True, preserve_cell_data=True, verbose=args.verbose)
-                if keep >= 2:
-                    init_dir = work_dir / 'FiberClustering' / 'InitialClusters' / case_id
-                    init_dir.mkdir(parents=True, exist_ok=True)
-                    init_fnames = [str(init_dir / name) for name in atlas_cluster_names]
-                    with _default_lz4_compression():
-                        wma.io.write_polydatas_parallel(
-                            cluster_pds, init_fnames, jobs=workers, use_threads=True)
-                del labeled_pd, cluster_numbers, color, embed
+                    filtered_reg_pd, atlas, number_of_jobs=workers, queries_15=queries_15)
+                if use_indexed:
+                    labels_arr = numpy.asarray(cluster_numbers, dtype=numpy.int64)
+                    valid_order = numpy.flatnonzero(labels_arr >= 0)
+                    valid_order = valid_order[numpy.argsort(labels_arr[valid_order], kind='stable')]
+                    boundaries = numpy.searchsorted(
+                        labels_arr[valid_order], numpy.arange(number_of_clusters + 1))
+                    cluster_line_indices = [
+                        valid_order[boundaries[c]:boundaries[c + 1]]
+                        for c in range(number_of_clusters)
+                    ]
+                    del labels_arr, valid_order, boundaries
+                else:
+                    cluster_pds = wma.cluster.mask_all_clusters(
+                        labeled_pd, cluster_numbers, number_of_clusters,
+                        preserve_point_data=True, preserve_cell_data=True, verbose=args.verbose,
+                        number_of_jobs=workers)
+                    if keep >= 2:
+                        init_dir = work_dir / 'FiberClustering' / 'InitialClusters' / case_id
+                        init_dir.mkdir(parents=True, exist_ok=True)
+                        init_fnames = [str(init_dir / name) for name in atlas_cluster_names]
+                        with _default_lz4_compression():
+                            wma.io.write_polydatas_parallel(
+                                cluster_pds, init_fnames, jobs=workers, use_threads=True)
+                    del labeled_pd
+                    labeled_pd = None
+                del cluster_numbers, color, embed
             else:
+                use_indexed = False
                 empty_pd = _empty_like_schema(filtered_reg_pd)
                 cluster_pds = [_empty_like_schema(empty_pd) for _ in range(number_of_clusters)]
             del filtered_reg_pd, atlas
@@ -742,153 +960,215 @@ def run_pipeline(args):
 
             # Threaded / multi-GPU outlier removal & hemisphere assessment
             t0 = time.perf_counter()
-            backend = 'gpu' if wma.gpu.use_gpu() else ('cpu' if wma.gpu.config.cpu_fast_enabled() else None)
-            cleaned_pds, log_rows, outlier_removed, retained_fibers, nonempty_clusters = _outlier_and_assess_clusters(
-                cluster_pds, atlas_cluster_paths, atlas_bilateral,
-                location_data, args.outlier_sigma, args.outlier_std,
-                backend, workers, verbose=args.verbose)
-            del cluster_pds
-            gc.collect()
+            indexed_assembly = None
+            if use_indexed:
+                labeled_geometry = wma.filter._lines_offsets_connectivity(labeled_pd)
+                has_existing_hemi, existing_hemi_labels = read_mask_location_from_vtk(labeled_pd)
+                (kept_by_hemi, assessed_hemi, outlier_removed,
+                 retained_fibers, nonempty_clusters) = _outlier_and_assess_indexed(
+                    cluster_line_indices, queries_15, labeled_geometry,
+                    has_existing_hemi, existing_hemi_labels,
+                    atlas_cluster_paths, atlas_cluster_names, atlas_bilateral,
+                    location_data, args.outlier_sigma, args.outlier_std,
+                    backend, workers, verbose=args.verbose)
+                del cluster_line_indices, queries_15, labeled_geometry, existing_hemi_labels
+                gc.collect()
+                timings['outlier_and_hemisphere'] = time.perf_counter() - t0
 
-            if keep >= 2:
-                outrem_dir = work_dir / 'FiberClustering' / 'OutlierRemovedClusters' / f'{case_id}_outlier_removed'
-                outrem_dir.mkdir(parents=True, exist_ok=True)
-                with _default_lz4_compression():
-                    wma.io.write_polydatas_parallel(
-                        cleaned_pds, [str(outrem_dir / name) for name in atlas_cluster_names],
-                        jobs=workers, use_threads=True)
-                with (outrem_dir / 'cluster_log.txt').open('w') as lf:
-                    lf.write('cluster\t input_fibers\t output_fibers\t number_removed\t percentage_removed\t '
-                             'mean_distance_before\t mean_distance_after\t mean_probability_before\t mean_probability_after\n')
-                    for row in log_rows:
-                        lf.write(row + '\n')
-                (outrem_dir / 'cluster_location_by_hemisphere.log').write_text(
-                    '<wm_assess_cluster_location_by_hemisphere.py> Done!!!')
-            timings['outlier_and_hemisphere'] = time.perf_counter() - t0
-
-            # Tiered hardening + hemisphere separation
-            t0 = time.perf_counter()
-            separated_map = {
-                'tracts_left_hemisphere': {},
-                'tracts_right_hemisphere': {},
-                'tracts_commissural': {},
-            }
-
-            if tier1_eligible:
+                # Single-pass vectorized affine hardening (points only) + direct tract assembly
+                t0 = time.perf_counter()
                 hardening_backend = 'pure_python_affine'
                 total_inv_matrix = (pre_inv_matrix @ inv_matrix) if pre_inv_matrix is not None else inv_matrix
-                hardened_for_save = [None] * number_of_clusters if keep >= 2 else None
-
-                def _harden_and_split_one(c_idx):
-                    name = atlas_cluster_names[c_idx]
-                    pd_clean = cleaned_pds[c_idx]
-                    cleaned_pds[c_idx] = None
-                    with SmallPages():
-                        pd_h = wma.transform.apply_affine_to_polydata(pd_clean, total_inv_matrix)
-                        _add_ras_space_field(pd_h)
-                        found, labels = read_mask_location_from_vtk(pd_h)
-                        if not found or (labels == 0).sum() > 1:
-                            raise RuntimeError(f"Hemisphere labels missing or incomplete for {name}")
-                        left_pd, right_pd, comm_pd = split_polydata_subsets(pd_h, labels)
-                    separated_map['tracts_left_hemisphere'][name] = left_pd
-                    separated_map['tracts_right_hemisphere'][name] = right_pd
-                    separated_map['tracts_commissural'][name] = comm_pd
-                    if hardened_for_save is not None:
-                        hardened_for_save[c_idx] = pd_h
-
-                if workers > 1:
-                    with ThreadPoolExecutor(max_workers=workers) as pool:
-                        list(pool.map(_harden_and_split_one, range(number_of_clusters)))
-                else:
-                    for idx in range(number_of_clusters):
-                        _harden_and_split_one(idx)
-
-                del cleaned_pds
+                hardened_pd = wma.transform.apply_affine_to_polydata(labeled_pd, total_inv_matrix)
+                del labeled_pd
                 gc.collect()
-
-                if keep >= 2 and hardened_for_save is not None:
-                    tfm_dir = work_dir / 'FiberClustering' / 'TransformedClusters' / case_id
-                    tfm_dir.mkdir(parents=True, exist_ok=True)
-                    with _default_lz4_compression():
-                        wma.io.write_polydatas_parallel(
-                            hardened_for_save, [str(tfm_dir / name) for name in atlas_cluster_names],
-                            jobs=workers, use_threads=True)
-                    (tfm_dir / 'transform_complete.log').write_text(
-                        f'Transforms completed for {number_of_clusters} files.\n')
-                    del hardened_for_save
-
-                if keep >= 1:
-                    sep_dir = work_dir / 'FiberClustering' / 'SeparatedClusters'
-                    with _default_lz4_compression():
-                        for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
-                            (sep_dir / folder).mkdir(parents=True, exist_ok=True)
-                            wma.io.write_polydatas_parallel(
-                                [separated_map[folder][name] for name in atlas_cluster_names],
-                                [str(sep_dir / folder / name) for name in atlas_cluster_names],
-                                jobs=workers, use_threads=True)
-                    (sep_dir / 'hemisphere_separation_complete.log').write_text(
-                        f'Hemisphere separation completed for {number_of_clusters} clusters.\n')
+                hardened_geometry = wma.filter._lines_offsets_connectivity(hardened_pd)
+                point_specs, cell_specs, tensor_names = wma.filter._extract_polydata_schema_and_arrays(
+                    hardened_pd, preserve_point_data=True, preserve_cell_data=True)
+                indexed_assembly = (
+                    kept_by_hemi, assessed_hemi, hardened_geometry,
+                    point_specs, cell_specs, tensor_names,
+                )
+                timings['hardening_and_separation'] = time.perf_counter() - t0
             else:
-                outrem_work = (work_dir / 'FiberClustering' / 'OutlierRemovedClusters' / f'{case_id}_outlier_removed') \
-                    if keep >= 2 else (scratch_dir / 'OutlierRemovedWork')
-                if keep < 2:
-                    outrem_work.mkdir(parents=True, exist_ok=True)
-                    with _default_lz4_compression():
-                        wma.io.write_polydatas_parallel(
-                            cleaned_pds, [str(outrem_work / name) for name in atlas_cluster_names],
-                            jobs=workers, use_threads=True)
-                del cleaned_pds
+                del queries_15
+                cleaned_pds, log_rows, outlier_removed, retained_fibers, nonempty_clusters = _outlier_and_assess_clusters(
+                    cluster_pds, atlas_cluster_paths, atlas_bilateral,
+                    location_data, args.outlier_sigma, args.outlier_std,
+                    backend, workers, verbose=args.verbose)
+                del cluster_pds
                 gc.collect()
 
-                tfm_dir = (work_dir / 'FiberClustering' / 'TransformedClusters' / case_id) \
-                    if keep >= 2 else (scratch_dir / 'TransformedClusters')
-                sep_final_dir = (work_dir / 'FiberClustering' / 'SeparatedClusters') \
-                    if keep >= 1 else (scratch_dir / 'SeparatedClusters')
-                rig_target_dir = (scratch_dir / 'TransformedClustersPre') if args.transform else tfm_dir
-                rig_split_dir = None if args.transform else sep_final_dir
-                tfm_dir.mkdir(parents=True, exist_ok=True)
-                rig_target_dir.mkdir(parents=True, exist_ok=True)
-                sep_final_dir.mkdir(parents=True, exist_ok=True)
+                if keep >= 2:
+                    outrem_dir = work_dir / 'FiberClustering' / 'OutlierRemovedClusters' / f'{case_id}_outlier_removed'
+                    outrem_dir.mkdir(parents=True, exist_ok=True)
+                    with _default_lz4_compression():
+                        wma.io.write_polydatas_parallel(
+                            cleaned_pds, [str(outrem_dir / name) for name in atlas_cluster_names],
+                            jobs=workers, use_threads=True)
+                    with (outrem_dir / 'cluster_log.txt').open('w') as lf:
+                        lf.write('cluster\t input_fibers\t output_fibers\t number_removed\t percentage_removed\t '
+                                 'mean_distance_before\t mean_distance_after\t mean_probability_before\t mean_probability_after\n')
+                        for row in log_rows:
+                            lf.write(row + '\n')
+                    (outrem_dir / 'cluster_location_by_hemisphere.log').write_text(
+                        '<wm_assess_cluster_location_by_hemisphere.py> Done!!!')
+                timings['outlier_and_hemisphere'] = time.perf_counter() - t0
 
-                if args.reg_mode == 'nonrig':
-                    tmp_nonrig = scratch_dir / 'tmp_nonrig'
-                    tmp_nonrig.mkdir(parents=True, exist_ok=True)
-                    _invoke_slicer_hardening(
-                        outrem_work, tmp_nonrig, nonrig_tfm_path, slicer_path, workers,
-                        inverse=True, no_xvfb=args.no_xvfb)
-                    hardening_backend = _invoke_slicer_hardening(
-                        tmp_nonrig, rig_target_dir, rig_tfm_path, slicer_path, workers,
-                        inverse=True, split_output_dir=rig_split_dir, no_xvfb=args.no_xvfb)
+                # Tiered hardening + hemisphere separation
+                t0 = time.perf_counter()
+                separated_map = {
+                    'tracts_left_hemisphere': {},
+                    'tracts_right_hemisphere': {},
+                    'tracts_commissural': {},
+                }
+
+                if tier1_eligible:
+                    hardening_backend = 'pure_python_affine'
+                    total_inv_matrix = (pre_inv_matrix @ inv_matrix) if pre_inv_matrix is not None else inv_matrix
+                    hardened_for_save = [None] * number_of_clusters if keep >= 2 else None
+
+                    def _harden_and_split_one(c_idx):
+                        name = atlas_cluster_names[c_idx]
+                        pd_clean = cleaned_pds[c_idx]
+                        cleaned_pds[c_idx] = None
+                        with SmallPages():
+                            pd_h = wma.transform.apply_affine_to_polydata(pd_clean, total_inv_matrix)
+                            _add_ras_space_field(pd_h)
+                            found, labels = read_mask_location_from_vtk(pd_h)
+                            if not found or (labels == 0).sum() > 1:
+                                raise RuntimeError(f"Hemisphere labels missing or incomplete for {name}")
+                            left_pd, right_pd, comm_pd = split_polydata_subsets(pd_h, labels)
+                        separated_map['tracts_left_hemisphere'][name] = left_pd
+                        separated_map['tracts_right_hemisphere'][name] = right_pd
+                        separated_map['tracts_commissural'][name] = comm_pd
+                        if hardened_for_save is not None:
+                            hardened_for_save[c_idx] = pd_h
+
+                    if workers > 1:
+                        with ThreadPoolExecutor(max_workers=workers) as pool:
+                            list(pool.map(_harden_and_split_one, range(number_of_clusters)))
+                    else:
+                        for idx in range(number_of_clusters):
+                            _harden_and_split_one(idx)
+
+                    del cleaned_pds
+                    gc.collect()
+
+                    if keep >= 2 and hardened_for_save is not None:
+                        tfm_dir = work_dir / 'FiberClustering' / 'TransformedClusters' / case_id
+                        tfm_dir.mkdir(parents=True, exist_ok=True)
+                        with _default_lz4_compression():
+                            wma.io.write_polydatas_parallel(
+                                hardened_for_save, [str(tfm_dir / name) for name in atlas_cluster_names],
+                                jobs=workers, use_threads=True)
+                        (tfm_dir / 'transform_complete.log').write_text(
+                            f'Transforms completed for {number_of_clusters} files.\n')
+                        del hardened_for_save
+
+                    if keep >= 1:
+                        sep_dir = work_dir / 'FiberClustering' / 'SeparatedClusters'
+                        with _default_lz4_compression():
+                            for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
+                                (sep_dir / folder).mkdir(parents=True, exist_ok=True)
+                                wma.io.write_polydatas_parallel(
+                                    [separated_map[folder][name] for name in atlas_cluster_names],
+                                    [str(sep_dir / folder / name) for name in atlas_cluster_names],
+                                    jobs=workers, use_threads=True)
+                        (sep_dir / 'hemisphere_separation_complete.log').write_text(
+                            f'Hemisphere separation completed for {number_of_clusters} clusters.\n')
                 else:
-                    hardening_backend = _invoke_slicer_hardening(
-                        outrem_work, rig_target_dir, rig_tfm_path, slicer_path, workers,
-                        inverse=True, split_output_dir=rig_split_dir, no_xvfb=args.no_xvfb)
+                    outrem_work = (work_dir / 'FiberClustering' / 'OutlierRemovedClusters' / f'{case_id}_outlier_removed') \
+                        if keep >= 2 else (scratch_dir / 'OutlierRemovedWork')
+                    if keep < 2:
+                        outrem_work.mkdir(parents=True, exist_ok=True)
+                        with _default_lz4_compression():
+                            wma.io.write_polydatas_parallel(
+                                cleaned_pds, [str(outrem_work / name) for name in atlas_cluster_names],
+                                jobs=workers, use_threads=True)
+                    del cleaned_pds
+                    gc.collect()
 
-                if args.transform:
-                    hardening_backend = _invoke_slicer_hardening(
-                        rig_target_dir, tfm_dir, pre_tfm_path, slicer_path, workers,
-                        inverse=True, split_output_dir=sep_final_dir, no_xvfb=args.no_xvfb)
+                    tfm_dir = (work_dir / 'FiberClustering' / 'TransformedClusters' / case_id) \
+                        if keep >= 2 else (scratch_dir / 'TransformedClusters')
+                    sep_final_dir = (work_dir / 'FiberClustering' / 'SeparatedClusters') \
+                        if keep >= 1 else (scratch_dir / 'SeparatedClusters')
+                    rig_target_dir = (scratch_dir / 'TransformedClustersPre') if args.transform else tfm_dir
+                    rig_split_dir = None if args.transform else sep_final_dir
+                    tfm_dir.mkdir(parents=True, exist_ok=True)
+                    rig_target_dir.mkdir(parents=True, exist_ok=True)
+                    sep_final_dir.mkdir(parents=True, exist_ok=True)
 
-                if keep >= 1:
-                    (sep_final_dir / 'hemisphere_separation_complete.log').write_text(
-                        f'Hemisphere separation completed for {number_of_clusters} clusters.\n')
+                    if args.reg_mode == 'nonrig':
+                        tmp_nonrig = scratch_dir / 'tmp_nonrig'
+                        tmp_nonrig.mkdir(parents=True, exist_ok=True)
+                        _invoke_slicer_hardening(
+                            outrem_work, tmp_nonrig, nonrig_tfm_path, slicer_path, workers,
+                            inverse=True, no_xvfb=args.no_xvfb)
+                        hardening_backend = _invoke_slicer_hardening(
+                            tmp_nonrig, rig_target_dir, rig_tfm_path, slicer_path, workers,
+                            inverse=True, split_output_dir=rig_split_dir, no_xvfb=args.no_xvfb)
+                    else:
+                        hardening_backend = _invoke_slicer_hardening(
+                            outrem_work, rig_target_dir, rig_tfm_path, slicer_path, workers,
+                            inverse=True, split_output_dir=rig_split_dir, no_xvfb=args.no_xvfb)
 
-                for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
-                    for name in atlas_cluster_names:
-                        separated_map[folder][name] = wma.io.read_polydata(str(sep_final_dir / folder / name))
+                    if args.transform:
+                        hardening_backend = _invoke_slicer_hardening(
+                            rig_target_dir, tfm_dir, pre_tfm_path, slicer_path, workers,
+                            inverse=True, split_output_dir=sep_final_dir, no_xvfb=args.no_xvfb)
 
-            timings['hardening_and_separation'] = time.perf_counter() - t0
+                    if keep >= 1:
+                        (sep_final_dir / 'hemisphere_separation_complete.log').write_text(
+                            f'Hemisphere separation completed for {number_of_clusters} clusters.\n')
+
+                    for folder in ('tracts_left_hemisphere', 'tracts_right_hemisphere', 'tracts_commissural'):
+                        for name in atlas_cluster_names:
+                            separated_map[folder][name] = wma.io.read_polydata(str(sep_final_dir / folder / name))
+
+                timings['hardening_and_separation'] = time.perf_counter() - t0
 
             # Parallel anatomical tract assembly
             t0 = time.perf_counter()
             tracts_dir = work_dir / 'AnatomicalTracts'
             tracts_dir.mkdir(parents=True, exist_ok=True)
 
-            def _run_tract(task):
-                out_name, folder, members = task
-                member_pds = [separated_map[folder][m] for m in members]
-                n_lines, n_pts = _assemble_single_tract(member_pds, tracts_dir / out_name)
-                return out_name, n_lines, n_pts
+            if indexed_assembly is not None:
+                (kept_by_hemi, assessed_hemi, hardened_geometry,
+                 point_specs, cell_specs, tensor_names) = indexed_assembly
+
+                def _run_tract(task):
+                    out_name, folder, members = task
+                    member_lines = [kept_by_hemi[folder][m] for m in members]
+                    nonempty_lines = [arr for arr in member_lines if len(arr) > 0]
+                    all_lines = numpy.concatenate(nonempty_lines) if nonempty_lines else numpy.empty(0, dtype=numpy.int64)
+                    cluster_idx_per_line = (
+                        numpy.concatenate([
+                            numpy.full(len(arr), m_idx, dtype=numpy.int32)
+                            for m_idx, arr in enumerate(member_lines) if len(arr) > 0
+                        ])
+                        if all_lines.size else numpy.empty(0, dtype=numpy.int32)
+                    )
+                    extra_arrays = []
+                    if assessed_hemi is not None:
+                        hemi_vals = (assessed_hemi[all_lines]
+                                     if all_lines.size else numpy.empty(0, dtype=numpy.float32))
+                        extra_arrays.append(('HemisphereLocation', hemi_vals, numpy.float32))
+                    extra_arrays.append(('cluster_idx', cluster_idx_per_line, numpy.int32))
+                    n_lines, n_pts = _assemble_single_tract(
+                        None, tracts_dir / out_name,
+                        indexed_source=(
+                            hardened_geometry, all_lines, point_specs,
+                            cell_specs, tensor_names, extra_arrays,
+                        ),
+                    )
+                    return out_name, n_lines, n_pts
+            else:
+                def _run_tract(task):
+                    out_name, folder, members = task
+                    member_pds = [separated_map[folder][m] for m in members]
+                    n_lines, n_pts = _assemble_single_tract(member_pds, tracts_dir / out_name)
+                    return out_name, n_lines, n_pts
 
             if workers > 1:
                 with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -896,7 +1176,10 @@ def run_pipeline(args):
             else:
                 tract_results = [_run_tract(t) for t in tract_tasks]
 
-            del separated_map
+            if indexed_assembly is not None:
+                del indexed_assembly, hardened_pd, hardened_geometry, kept_by_hemi, assessed_hemi
+            else:
+                del separated_map
             gc.collect()
 
             if any(not (tracts_dir / out_name).is_file() for out_name, _, _ in tract_results):
