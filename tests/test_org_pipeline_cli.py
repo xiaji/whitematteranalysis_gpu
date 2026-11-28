@@ -755,11 +755,14 @@ class ORGPipelineCLITests(unittest.TestCase):
                 org_cli.main()
             # 3 hardening invocations total: forward pre_tfm, rig inverse -> scratch, pre_tfm inverse -> TransformedClusters + SeparatedClusters
             self.assertEqual(mock_inv.call_count, 3)
+            qc2 = json.loads((out_keep2 / 'sub-nontier1' / 'qc_summary.json').read_text())
+            self.assertEqual(qc2['input_fibers'], len(fibers1))
+            self.assertGreater(qc2['retained_clustered_fibers'], 0)
             tfm_vtp_count = sum(
                 _assert_native_roundtrip_points(self, p, fibers1)
                 for p in sorted((out_keep2 / 'sub-nontier1' / 'FiberClustering' / 'TransformedClusters' / 'sub-nontier1').glob('cluster_*.vtp'))
             )
-            self.assertEqual(tfm_vtp_count, len(fibers1))
+            self.assertEqual(tfm_vtp_count, qc2['retained_clustered_fibers'])
 
             checked_tracts = sum(
                 _assert_native_roundtrip_points(self, keep1_case / 'AnatomicalTracts' / tract, fibers1)

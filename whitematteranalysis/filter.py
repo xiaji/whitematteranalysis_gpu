@@ -153,8 +153,8 @@ def _build_polydata_from_indexed_lines(geometry, line_indices, point_specs=(), c
 
     outlines = vtk.vtkCellArray()
     offsets_vtk = numpy_support.numpy_to_vtk(
-        out_offsets, deep=True, array_type=vtk.vtkIdTypeArray().GetDataType())
-    conn_vtk = vtk.vtkIdTypeArray()
+        out_offsets, deep=True, array_type=vtk.VTK_TYPE_INT64)
+    conn_vtk = vtk.vtkTypeInt64Array()
     conn_vtk.SetNumberOfValues(total)
     out_conn = numpy_support.vtk_to_numpy(conn_vtk)
     for first in range(0, total, 262144):
@@ -673,8 +673,8 @@ def mask(inpd, fiber_mask, color=None, preserve_point_data=False, preserve_cell_
         # lines
         out_lines = vtk.vtkCellArray()
         offsets_vtk = numpy_support.numpy_to_vtk(
-            out_offsets, deep=True, array_type=vtk.vtkIdTypeArray().GetDataType())
-        conn_vtk = vtk.vtkIdTypeArray()
+            out_offsets, deep=True, array_type=vtk.VTK_TYPE_INT64)
+        conn_vtk = vtk.vtkTypeInt64Array()
         conn_vtk.SetNumberOfValues(total)
         out_conn = numpy_support.vtk_to_numpy(conn_vtk)
         for first in range(0, total, 262144):

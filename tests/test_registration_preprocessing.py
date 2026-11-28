@@ -55,7 +55,11 @@ class RegistrationPreprocessingTests(unittest.TestCase):
             new_path = Path(directory) / 'new.vtp'
             wma.io.write_polydata(expected, str(old_path))
             wma.io.write_polydata(actual, str(new_path))
-            self.assertEqual(old_path.read_bytes(), new_path.read_bytes())
+            # VTK 9.6+ emits IdType="1" on vtkIdTypeArray (used by frozen baseline d8447aa)
+            # vs native vtkCellArray vtkTypeInt64Array storage; data bytes are identical.
+            old_bytes = old_path.read_bytes().replace(b' IdType="1"', b'')
+            new_bytes = new_path.read_bytes().replace(b' IdType="1"', b'')
+            self.assertEqual(old_bytes, new_bytes)
 
     def test_indices_and_preprocess_output_match_previous_implementation(self):
         options = (

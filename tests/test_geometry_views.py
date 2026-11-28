@@ -54,7 +54,10 @@ class GeometryViewTests(unittest.TestCase):
                     a, b = Path(directory)/'a.vtp', Path(directory)/'b.vtp'
                     wma.io.write_polydata(expected, str(a))
                     wma.io.write_polydata(actual, str(b))
-                    self.assertEqual(a.read_bytes(), b.read_bytes())
+                    self.assertEqual(
+                        a.read_bytes().replace(b' IdType="1"', b''),
+                        b.read_bytes().replace(b' IdType="1"', b''),
+                    )
             for points in (2, 3, 10, 20):
                 a, b = self.old_fibers.FiberArray(), wma.fibers.FiberArray()
                 a.convert_from_polydata(data, points)
@@ -89,7 +92,10 @@ class GeometryViewTests(unittest.TestCase):
             a, b = Path(directory) / 'expected.vtp', Path(directory) / 'actual.vtp'
             wma.io.write_polydata(expected, str(a))
             wma.io.write_polydata(actual, str(b))
-            self.assertEqual(a.read_bytes(), b.read_bytes())
+            self.assertEqual(
+                a.read_bytes().replace(b' IdType="1"', b''),
+                b.read_bytes().replace(b' IdType="1"', b''),
+            )
         actual.GetPointData().GetArray('scalar').SetTuple1(0, -100.)
         np.testing.assert_array_equal(vtk_to_numpy(data.GetPointData().GetArray('scalar')), values[:, 0])
 
