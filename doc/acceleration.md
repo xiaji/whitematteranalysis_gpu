@@ -2,7 +2,7 @@
 
 WMA accelerates the expensive tractography comparisons in registration, atlas
 labeling and outlier removal. The original per-fiber joblib backend remains
-available for comparison. See the [README](../README.md#full-pipeline-performance)
+available for comparison. See the [README](../README.md#benchmarks)
 for measured end-to-end times and output validation, and the
 [command-line reference](command-line-reference.md#shared-acceleration-options)
 for backend selection.
