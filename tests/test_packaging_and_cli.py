@@ -138,6 +138,23 @@ class WMACLITests(unittest.TestCase):
                 resolved = cli.resolve_script('wm_unique_venv_test_script.py')
             self.assertEqual(resolved, str(fake_script))
 
+    def test_resolve_script_prefers_imported_checkout_over_stale_installed_scripts(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='wma_stale_scripts_') as tmp:
+            stale_bin = Path(tmp) / 'bin'
+            stale_bin.mkdir(parents=True)
+            stale_harden = stale_bin / 'wm_harden_transform.py'
+            stale_harden.write_text('# stale installed script\n', encoding='utf-8')
+            stale_py = stale_bin / 'python3'
+            stale_py.write_text('#!/bin/sh\n', encoding='utf-8')
+
+            with patch.object(cli.sysconfig, 'get_path', return_value=str(stale_bin)), \
+                    patch.object(cli.sys, 'executable', str(stale_py)), \
+                    patch.object(cli.sys, 'argv', ['-m']), \
+                    patch.object(cli.shutil, 'which', return_value=str(stale_harden)):
+                resolved = cli.resolve_script('wm_harden_transform.py')
+            self.assertEqual(Path(resolved).resolve(), (ROOT / 'bin' / 'wm_harden_transform.py').resolve())
+
     def test_unknown_command_returns_exit_2(self):
         buf = io.StringIO()
         with patch('sys.stderr', buf):

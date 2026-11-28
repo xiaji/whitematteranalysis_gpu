@@ -263,6 +263,88 @@ class PipelinesSDKTests(unittest.TestCase):
                     gpu_cfg.device_index,
                 ) = orig_state
 
+    def test_case_id_path_traversal_is_rejected_without_touching_outside_files(self):
+        with tempfile.TemporaryDirectory(prefix='wma_sdk_case_id_') as tmp:
+            root = Path(tmp)
+            atlas_dir = root / 'atlas'
+            _build_synthetic_org_atlas(atlas_dir)
+            subj_path = root / 'sub-01.vtp'
+            _write_synthetic_subject(subj_path, seed_offset=5)
+
+            victim_tracts = root / 'victim' / 'AnatomicalTracts'
+            victim_tracts.mkdir(parents=True)
+            sentinel = victim_tracts / 'keep.txt'
+            sentinel.write_text('do not delete', encoding='utf-8')
+            out_dir = root / 'out'
+
+            with ORGParcellationPipeline(atlas_dir, gpu=False, atomic_publish=False, jobs=1) as pipe:
+                for bad_id in ('../victim', '..', '.', '', 'sub/nested', '/tmp/escape', 'sub\\win'):
+                    with self.assertRaises(ValueError, msg=f'Expected ValueError for {bad_id!r}'):
+                        pipe.run(subj_path, out_dir, case_id=bad_id)
+                with self.assertRaises(ValueError):
+                    pipe.run_batch([('../victim', subj_path)], out_dir)
+
+            self.assertTrue(sentinel.is_file())
+            self.assertEqual(sentinel.read_text(encoding='utf-8'), 'do not delete')
+
+    def test_resident_gpu_and_ref_caches_invalidate_on_precision_change(self):
+        from whitematteranalysis.pipelines import org as org_mod
+
+        with tempfile.TemporaryDirectory(prefix='wma_sdk_prec_cache_') as tmp:
+            root = Path(tmp)
+            atlas_dir = root / 'atlas'
+            _build_synthetic_org_atlas(atlas_dir)
+
+            gpu_cfg = wma.gpu.config
+            orig_f32 = gpu_cfg.float32
+            fake_dev = type('FakeDev', (), {'type': 'cuda', 'index': 0, '__str__': lambda self: 'cuda:0'})()
+            prepared_calls = []
+
+            def _fake_prepare(atlas, device=None):
+                tag = (bool(wma.gpu.float32_enabled()), str(device))
+                prepared_calls.append(tag)
+                return tag
+
+            try:
+                with ORGParcellationPipeline(atlas_dir, keep_resident=True, jobs=1) as pipe:
+                    with patch.object(wma.gpu, 'use_gpu', return_value=True), \
+                            patch.object(wma.gpu, 'get_device', return_value=fake_dev), \
+                            patch.object(wma.gpu, 'visible_device_count', return_value=1), \
+                            patch.object(wma.gpu.linalg, 'prepare_atlas_gpu', side_effect=_fake_prepare):
+                        wma.gpu.set_float32(False)
+                        p1 = pipe._session.get_prepared_gpu()
+                        p2 = pipe._session.get_prepared_gpu()
+                        self.assertIs(p1, p2)
+                        self.assertEqual(prepared_calls, [(False, 'cuda:0')])
+
+                        wma.gpu.set_float32(True)
+                        p3 = pipe._session.get_prepared_gpu()
+                        self.assertIsNot(p3, p1)
+                        self.assertEqual(prepared_calls, [(False, 'cuda:0'), (True, 'cuda:0')])
+
+                    ref_cache = {}
+                    ref_loads = []
+
+                    def _fake_load_ref(*args, **kwargs):
+                        val = ('ref', bool(wma.gpu.float32_enabled()))
+                        ref_loads.append(val)
+                        return val
+
+                    with patch.object(org_mod, 'load_reference', side_effect=_fake_load_ref):
+                        wma.gpu.set_float32(False)
+                        r1 = org_mod._load_cluster_reference(
+                            'c1.vtp', 400.0, 'Mean', True, 'gpu', ref_cache=ref_cache
+                        )
+                        wma.gpu.set_float32(True)
+                        r2 = org_mod._load_cluster_reference(
+                            'c1.vtp', 400.0, 'Mean', True, 'gpu', ref_cache=ref_cache
+                        )
+                        self.assertEqual(r1, ('ref', False))
+                        self.assertEqual(r2, ('ref', True))
+                        self.assertEqual(len(ref_loads), 2)
+            finally:
+                gpu_cfg.float32 = orig_f32
+
 
 if __name__ == '__main__':
     unittest.main()

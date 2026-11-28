@@ -270,6 +270,10 @@ def format_doctor_report(info):
 def resolve_script(script_name):
     """Locate an installed or source-tree WMA script by filename."""
     candidates = []
+    repo_root = Path(__file__).resolve().parents[1]
+    if (repo_root / 'pyproject.toml').is_file():
+        candidates.append(repo_root / 'bin' / script_name)
+        candidates.append(repo_root / 'utilities' / script_name)
     scripts_dir = sysconfig.get_path('scripts')
     if scripts_dir:
         candidates.append(Path(scripts_dir) / script_name)
@@ -282,7 +286,6 @@ def resolve_script(script_name):
         candidates.append(argv_path.resolve().parent / script_name)
     if sys.executable:
         candidates.append(Path(sys.executable).resolve().parent / script_name)
-    repo_root = Path(__file__).resolve().parents[1]
     candidates.append(repo_root / 'bin' / script_name)
     candidates.append(repo_root / 'utilities' / script_name)
 

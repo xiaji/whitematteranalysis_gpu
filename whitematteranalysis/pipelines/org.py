@@ -385,7 +385,8 @@ def _dispatch_cluster_workers(atlas_cluster_paths, backend, workers, worker_fn):
 def _load_cluster_reference(ca_path, sigmasq, distance_method, atlas_bilateral,
                             backend, device=None, ref_cache=None, ref_lock=None):
     if ref_cache is not None:
-        key = (ca_path, float(sigmasq), str(distance_method), bool(atlas_bilateral), str(backend))
+        f32 = bool(wma.gpu.float32_enabled()) if backend == 'gpu' else False
+        key = (ca_path, float(sigmasq), str(distance_method), bool(atlas_bilateral), str(backend), f32)
         if ref_lock is not None:
             with ref_lock:
                 cached = ref_cache.get(key)
@@ -832,6 +833,7 @@ class _AtlasSession:
         self._reg_atlas_pd = None
         self._spectral_atlas = None
         self._prepared_gpu = None
+        self._prepared_gpu_key = None
         self.ref_cache = {} if self.keep_resident else None
         self.ref_lock = threading.Lock() if self.keep_resident else None
 
@@ -858,28 +860,33 @@ class _AtlasSession:
     def get_prepared_gpu(self):
         if not self.keep_resident or not wma.gpu.use_gpu():
             return None
-        if self._prepared_gpu is None:
+        base_dev = wma.gpu.get_device()
+        n_gpus = wma.gpu.visible_device_count() if base_dev.type != 'mps' else 1
+        devices = (
+            [wma.gpu.get_device(i) for i in range(n_gpus)]
+            if base_dev.type != 'mps' and n_gpus >= 1
+            else [base_dev]
+        )
+        cache_key = (bool(wma.gpu.float32_enabled()), tuple(str(d) for d in devices))
+        if self._prepared_gpu is None or self._prepared_gpu_key != cache_key:
+            self._prepared_gpu = None
             atlas = self.get_spectral_atlas()
-            base_dev = wma.gpu.get_device()
-            n_gpus = wma.gpu.visible_device_count() if base_dev.type != 'mps' else 1
-            devices = (
-                [wma.gpu.get_device(i) for i in range(n_gpus)]
-                if base_dev.type != 'mps' and n_gpus >= 1
-                else [base_dev]
-            )
             prepared = {}
             for dev in devices:
                 prepared[dev] = wma.gpu.linalg.prepare_atlas_gpu(atlas, device=dev)
             self._prepared_gpu = prepared
+            self._prepared_gpu_key = cache_key
         return self._prepared_gpu
 
     def release_spectral_atlas(self):
         if not self.keep_resident:
             self._spectral_atlas = None
             self._prepared_gpu = None
+            self._prepared_gpu_key = None
 
     def close(self):
         self._prepared_gpu = None
+        self._prepared_gpu_key = None
         self._reg_atlas_pd = None
         self._spectral_atlas = None
         if self.ref_cache is not None:
@@ -894,9 +901,30 @@ class _AtlasSession:
         return False
 
 
+def _validate_case_id(case_id, output_root=None):
+    cid = str(case_id)
+    if not cid or cid.strip() != cid or cid in ('.', '..'):
+        raise ValueError(f'Invalid case_id {case_id!r}: must be a single directory name')
+    bad_seps = {'/', '\\', '\x00'}
+    if os.sep:
+        bad_seps.add(os.sep)
+    if os.altsep:
+        bad_seps.add(os.altsep)
+    if any(sep in cid for sep in bad_seps) or Path(cid).name != cid:
+        raise ValueError(f'Invalid case_id {case_id!r}: must not contain path separators or traversal')
+    if output_root is not None:
+        root_resolved = Path(output_root).resolve()
+        candidate = (root_resolved / cid).resolve()
+        if candidate.parent != root_resolved:
+            raise ValueError(f'Invalid case_id {case_id!r}: resolves outside output directory {root_resolved}')
+    return cid
+
+
 def _run_subject(case_id, input_path, args, session, workers, slicer_path):
     t_start = time.perf_counter()
     timings = {}
+    output_root = Path(args.output).resolve()
+    case_id = _validate_case_id(case_id, output_root)
 
     resolved_atlas = session.resolved_atlas
     atlas_base = session.atlas_base
@@ -1590,6 +1618,7 @@ def _normalize_batch_inputs(inputs):
 
     seen = {}
     for cid, p in pairs:
+        _validate_case_id(cid)
         if cid in seen:
             raise ValueError(f'Duplicate case_id {cid!r} in batch inputs: {seen[cid]} and {p}')
         seen[cid] = p
@@ -1678,7 +1707,10 @@ class ORGParcellationPipeline:
         input_path = Path(input_file).resolve()
         if not input_path.is_file():
             raise FileNotFoundError(f'Input tractography file does not exist: {input_path}')
-        resolved_case_id = str(case_id) if case_id is not None else os.path.splitext(input_path.name)[0]
+        resolved_case_id = _validate_case_id(
+            str(case_id) if case_id is not None else os.path.splitext(input_path.name)[0],
+            output_dir,
+        )
         ns = self.config._to_namespace(output_dir=output_dir, transform=transform)
         with _scoped_sdk_gpu_config(self.config):
             final_dir, qc = _run_subject(
