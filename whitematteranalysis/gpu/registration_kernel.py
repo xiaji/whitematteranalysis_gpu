@@ -164,6 +164,107 @@ if triton is not None:
             n_splits_i64 = tl.zeros((), dtype=tl.int64) + N_SPLITS
             tl.store(Out + m_idx * n_splits_i64 + split_id.to(tl.int64), row_acc, valid_m)
 
+    @triton.jit
+    def _pairwise_probability_sums_and_weighted_fixed(
+        F, M, OutSum, OutWeighted, NF, NM, N_SPLITS,
+        P: tl.constexpr, SPLIT_F: tl.constexpr,
+        BM: tl.constexpr, BN: tl.constexpr,
+        SINGLE_SPLIT: tl.constexpr,
+        INV_SIGMA: tl.constexpr, DTYPE: tl.constexpr = tl.float64,
+    ):
+        m_base = tl.program_id(0).to(tl.int64) * BM
+        split_id = tl.program_id(1)
+        f_start = split_id * SPLIT_F
+        f_end = tl.where(f_start + SPLIT_F < NF, f_start + SPLIT_F, NF)
+
+        m_idx = m_base + tl.arange(0, BM).to(tl.int64)
+        valid_m = m_idx < NM
+        zero = tl.full((), 0., DTYPE)
+        inv = tl.full((), 1.0 / P, DTYPE)
+        inv_sigma = tl.full((), INV_SIGMA, DTYPE)
+        n_splits_i64 = tl.zeros((), dtype=tl.int64) + N_SPLITS
+        row_acc = tl.zeros((BM,), dtype=DTYPE)
+        first_tile = True
+
+        for f_base in range(f_start, f_end, BN):
+            f_idx = (f_base + tl.arange(0, BN)).to(tl.int64)
+            valid_f = f_idx < f_end
+            fwd_acc = tl.zeros((BM, BN), dtype=DTYPE)
+            rev_acc = tl.zeros((BM, BN), dtype=DTYPE)
+            for p in range(P):
+                f_ptrs = F + (f_idx * P + p) * 3
+                m_ptrs = M + (m_idx * P + p) * 3
+                mr_ptrs = M + (m_idx * P + (P - 1 - p)) * 3
+
+                fx = tl.load(f_ptrs, valid_f, other=zero)[None, :]
+                fy = tl.load(f_ptrs + 1, valid_f, other=zero)[None, :]
+                fz = tl.load(f_ptrs + 2, valid_f, other=zero)[None, :]
+
+                mx = tl.load(m_ptrs, valid_m, other=zero)[:, None]
+                my = tl.load(m_ptrs + 1, valid_m, other=zero)[:, None]
+                mz = tl.load(m_ptrs + 2, valid_m, other=zero)[:, None]
+
+                dx = fx - mx
+                dy = fy - my
+                dz = fz - mz
+                fwd_acc += (dx * dx + dy * dy) + dz * dz
+
+                rx = tl.load(mr_ptrs, valid_m, other=zero)[:, None]
+                ry = tl.load(mr_ptrs + 1, valid_m, other=zero)[:, None]
+                rz = tl.load(mr_ptrs + 2, valid_m, other=zero)[:, None]
+
+                rdx = fx - rx
+                rdy = fy - ry
+                rdz = fz - rz
+                rev_acc += (rdx * rdx + rdy * rdy) + rdz * rdz
+
+            fwd_mean = fwd_acc * inv
+            rev_mean = rev_acc * inv
+            mask_fwd = fwd_mean <= rev_mean
+            d = tl.where(mask_fwd, fwd_mean, rev_mean)
+            prob = libdevice.exp(-d * inv_sigma)
+            pair_valid = valid_m[:, None] & valid_f[None, :]
+            prob = tl.where(pair_valid, prob, zero)
+            row_acc += tl.sum(prob, axis=1)
+
+            p_fwd = tl.where(mask_fwd, prob, zero)
+            p_rev = prob - p_fwd
+            for p in range(P):
+                f_ptrs = F + (f_idx * P + p) * 3
+                fr_ptrs = F + (f_idx * P + (P - 1 - p)) * 3
+                fx_f = tl.load(f_ptrs, valid_f, other=zero)[None, :]
+                fy_f = tl.load(f_ptrs + 1, valid_f, other=zero)[None, :]
+                fz_f = tl.load(f_ptrs + 2, valid_f, other=zero)[None, :]
+                fx_r = tl.load(fr_ptrs, valid_f, other=zero)[None, :]
+                fy_r = tl.load(fr_ptrs + 1, valid_f, other=zero)[None, :]
+                fz_r = tl.load(fr_ptrs + 2, valid_f, other=zero)[None, :]
+
+                wx = tl.sum(p_fwd * fx_f + p_rev * fx_r, axis=1)
+                wy = tl.sum(p_fwd * fy_f + p_rev * fy_r, axis=1)
+                wz = tl.sum(p_fwd * fz_f + p_rev * fz_r, axis=1)
+
+                if SINGLE_SPLIT:
+                    w_ptrs = OutWeighted + (m_idx * P + p) * 3
+                else:
+                    w_ptrs = OutWeighted + ((m_idx * n_splits_i64 + split_id.to(tl.int64)) * P + p) * 3
+                if first_tile:
+                    tl.store(w_ptrs + 0, wx, valid_m)
+                    tl.store(w_ptrs + 1, wy, valid_m)
+                    tl.store(w_ptrs + 2, wz, valid_m)
+                else:
+                    px = tl.load(w_ptrs + 0, valid_m, other=zero)
+                    py = tl.load(w_ptrs + 1, valid_m, other=zero)
+                    pz = tl.load(w_ptrs + 2, valid_m, other=zero)
+                    tl.store(w_ptrs + 0, px + wx, valid_m)
+                    tl.store(w_ptrs + 1, py + wy, valid_m)
+                    tl.store(w_ptrs + 2, pz + wz, valid_m)
+            first_tile = False
+
+        if SINGLE_SPLIT:
+            tl.store(OutSum + m_idx, row_acc, valid_m)
+        else:
+            tl.store(OutSum + m_idx * n_splits_i64 + split_id.to(tl.int64), row_acc, valid_m)
+
 
 def _triton_dtype(tensor):
     import torch
@@ -286,3 +387,43 @@ def pairwise_probability_sums(fixed, moving, sigmasq):
             INV_SIGMA=1. / sigmasq, DTYPE=_triton_dtype(fixed),
             num_warps=4, enable_fp_fusion=False)
     return out if single_split else out.sum(-1)
+
+
+def pairwise_probability_sums_and_weighted_fixed(fixed, moving, sigmasq):
+    """2D-tiled fused forward/backward reduction returning ``(sum_p, weighted_F)``.
+
+    Avoids materializing an ``O(Nm * Nf)`` probability matrix by streaming tiles
+    in registers and reducing across ``F`` splits in ``O(Nm * N_splits * P)``.
+    """
+    import torch
+
+    nf = fixed.shape[0]
+    nm = moving.shape[0]
+    points = fixed.shape[1]
+    if nm == 0:
+        return (torch.empty((0,), dtype=fixed.dtype, device=fixed.device),
+                torch.empty((0, points, 3), dtype=fixed.dtype, device=fixed.device))
+    if nf == 0:
+        return (torch.zeros((nm,), dtype=fixed.dtype, device=fixed.device),
+                torch.zeros((nm, points, 3), dtype=fixed.dtype, device=fixed.device))
+    bm = 16
+    bn = 64
+    split_f = 512
+    n_splits = triton.cdiv(nf, split_f)
+    single_split = (n_splits == 1)
+    if single_split:
+        out_sum = torch.empty((nm,), dtype=fixed.dtype, device=fixed.device)
+        out_weighted = torch.empty((nm, points, 3), dtype=fixed.dtype, device=fixed.device)
+    else:
+        out_sum = torch.empty((nm, n_splits), dtype=fixed.dtype, device=fixed.device)
+        out_weighted = torch.empty((nm, n_splits, points, 3), dtype=fixed.dtype, device=fixed.device)
+    with torch.cuda.device(fixed.device):
+        _pairwise_probability_sums_and_weighted_fixed[(triton.cdiv(nm, bm), n_splits)](
+            fixed, moving, out_sum, out_weighted, nf, nm, n_splits,
+            P=points, SPLIT_F=split_f, BM=bm, BN=bn,
+            SINGLE_SPLIT=single_split,
+            INV_SIGMA=1. / sigmasq, DTYPE=_triton_dtype(fixed),
+            num_warps=4, enable_fp_fusion=False)
+    if single_split:
+        return out_sum, out_weighted
+    return out_sum.sum(-1), out_weighted.sum(1)

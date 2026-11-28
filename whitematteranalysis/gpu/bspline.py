@@ -336,42 +336,61 @@ class NonrigidObjective:
         sigmasq = float(sigma) * float(sigma)
         points_f = float(n_points_per_fiber)
         grad_scale = 2.0 / (points_f * sigmasq)
-        if self._F_flat is None:
+        use_fused_triton = (
+            self._use_triton
+            and not strict_enabled()
+            and 1 <= n_points_per_fiber <= 64
+        )
+        if not use_fused_triton and self._F_flat is None:
             self._F_flat = self.fixed.reshape(n_fixed, n_points_per_fiber * 3).contiguous()
             self._F_rev_flat = self.fixed.flip(1).reshape(n_fixed, n_points_per_fiber * 3).contiguous()
 
         grad_q = torch.empty_like(moved)
-        chunk_rows = (self.workspace.chunk_rows if self.workspace is not None
-                      else max(1, min(n_moving, 256)))
+        if use_fused_triton:
+            chunk_rows = min(n_moving, 2048)
+        else:
+            chunk_rows = (self.workspace.chunk_rows if self.workspace is not None
+                          else max(1, min(n_moving, 256)))
         total_loss = 0.0
         s = 0
         while s < n_moving:
             e = min(s + chunk_rows, n_moving)
             q_c = moved[s:e]
             try:
-                d_fwd = registration._squared_point_distances(self.fixed, q_c).sum(-1) / points_f
-                d_rev = registration._squared_point_distances(self.fixed, q_c.flip(1)).sum(-1) / points_f
-                mask_fwd = d_fwd <= d_rev
-                d_min = torch.where(mask_fwd, d_fwd, d_rev)
-                del d_fwd, d_rev
-                prob = torch.exp(d_min.neg_().div_(sigmasq))
-                sum_p = prob.sum(-1)
-                denom = sum_p + 1e-20
-                chunk_loss = float(torch.neg(torch.log(denom / float(n_fixed))).sum())
-                p_fwd = torch.where(mask_fwd, prob, torch.zeros_like(prob))
-                p_rev = prob - p_fwd
-                weighted_F = (
-                    torch.matmul(p_fwd, self._F_flat) + torch.matmul(p_rev, self._F_rev_flat)
-                ).reshape(e - s, n_points_per_fiber, 3)
-                grad_q[s:e] = (grad_scale / denom)[:, None, None] * (
-                    sum_p[:, None, None] * q_c - weighted_F
-                )
+                if use_fused_triton:
+                    q_contig = q_c.contiguous()
+                    sum_p, weighted_F = registration_kernel.pairwise_probability_sums_and_weighted_fixed(
+                        self.fixed, q_contig, sigmasq)
+                    denom = sum_p + 1e-20
+                    chunk_loss = float(torch.neg(torch.log(denom / float(n_fixed))).sum())
+                    grad_q[s:e] = (grad_scale / denom)[:, None, None] * (
+                        sum_p[:, None, None] * q_contig - weighted_F
+                    )
+                    del q_contig, sum_p, weighted_F, denom
+                else:
+                    d_fwd = registration._squared_point_distances(self.fixed, q_c).sum(-1) / points_f
+                    d_rev = registration._squared_point_distances(self.fixed, q_c.flip(1)).sum(-1) / points_f
+                    mask_fwd = d_fwd <= d_rev
+                    d_min = torch.where(mask_fwd, d_fwd, d_rev)
+                    del d_fwd, d_rev
+                    prob = torch.exp(d_min.neg_().div_(sigmasq))
+                    sum_p = prob.sum(-1)
+                    denom = sum_p + 1e-20
+                    chunk_loss = float(torch.neg(torch.log(denom / float(n_fixed))).sum())
+                    p_fwd = torch.where(mask_fwd, prob, torch.zeros_like(prob))
+                    p_rev = prob - p_fwd
+                    weighted_F = (
+                        torch.matmul(p_fwd, self._F_flat) + torch.matmul(p_rev, self._F_rev_flat)
+                    ).reshape(e - s, n_points_per_fiber, 3)
+                    grad_q[s:e] = (grad_scale / denom)[:, None, None] * (
+                        sum_p[:, None, None] * q_c - weighted_F
+                    )
             except Exception as exc:
                 if not _memory.is_gpu_oom(exc) or (e - s) == 1:
                     raise
                 _memory.empty_cache(self.device)
                 chunk_rows = max(1, (e - s) // 2)
-                if self.workspace is not None:
+                if self.workspace is not None and not use_fused_triton:
                     self.workspace.chunk_rows = chunk_rows
                 continue
             total_loss += chunk_loss
@@ -380,21 +399,23 @@ class NonrigidObjective:
         g_pts = grad_q.reshape(self.points.shape[0], 3)
         g_pts = torch.where(self.invalid[:, None], torch.zeros_like(g_pts), g_pts)
         dC = torch.zeros((R ** 3, 3), dtype=self._dtype, device=self.device)
-        ix = self.indices[:, 0, :].to(torch.int64)
-        iy = self.indices[:, 1, :].to(torch.int64)
-        iz = self.indices[:, 2, :].to(torch.int64)
-        wx = self.weights[:, 0, :]
-        wy = self.weights[:, 1, :]
-        wz = self.weights[:, 2, :]
-        for a in range(4):
-            w_z = wz[:, a]
-            z_off = iz[:, a] * R
-            for b in range(4):
-                w_zy = w_z * wy[:, b]
-                zy_off = (z_off + iy[:, b]) * R
-                for c in range(4):
-                    w = (w_zy * wx[:, c])[:, None]
-                    dC.index_add_(0, zy_off + ix[:, c], w * g_pts)
+        n_pts = self.points.shape[0]
+        if n_pts > 0:
+            scatter_chunk = 8192
+            for start in range(0, n_pts, scatter_chunk):
+                end = min(start + scatter_chunk, n_pts)
+                ix_c = self.indices[start:end, 0, :].to(torch.int64)
+                iy_c = self.indices[start:end, 1, :].to(torch.int64)
+                iz_c = self.indices[start:end, 2, :].to(torch.int64)
+                wx_c = self.weights[start:end, 0, :]
+                wy_c = self.weights[start:end, 1, :]
+                wz_c = self.weights[start:end, 2, :]
+                flat_idx = ((iz_c[:, :, None, None] * R + iy_c[:, None, :, None]) * R
+                            + ix_c[:, None, None, :]).reshape(-1)
+                w64 = (wz_c[:, :, None, None] * wy_c[:, None, :, None]
+                       * wx_c[:, None, None, :])
+                vals = (w64[..., None] * g_pts[start:end, None, None, None, :]).reshape(-1, 3)
+                dC.index_add_(0, flat_idx, vals)
 
         dD = _apply_separable_3d(self._prefilter_matrix.t(), dC.reshape(R, R, R, 3))
         grad_np = dD.reshape(-1).detach().cpu().numpy().astype(numpy.float64)

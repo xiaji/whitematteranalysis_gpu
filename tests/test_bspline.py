@@ -295,3 +295,59 @@ class GPUBSplineTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'failed'):
                     reg.compute()
             self.assertIsNone(reg._gpu_objective)
+
+    @unittest.skipUnless(registration_kernel.triton is not None, 'Triton is required')
+    def test_fused_triton_backward_kernel_and_memory(self):
+        import torch
+
+        prev_strict = wma.gpu.strict_enabled()
+        self.addCleanup(wma.gpu.set_strict, prev_strict)
+        rng = np.random.RandomState(314)
+        device = wma.gpu.get_device()
+
+        for dtype, rtol, atol in ((torch.float64, 1e-12, 1e-12), (torch.float32, 1e-5, 1e-5)):
+            for nm, nf, p in ((17, 13, 3), (33, 600, 10), (19, 1050, 15), (9, 530, 40)):
+                with self.subTest(dtype=str(dtype), nm=nm, nf=nf, p=p):
+                    fixed = torch.as_tensor(rng.uniform(-60, 60, (nf, p, 3)), dtype=dtype, device=device)
+                    moving = torch.as_tensor(rng.uniform(-60, 60, (nm, p, 3)), dtype=dtype, device=device)
+                    sigmasq = 400.0
+                    sum_k, wf_k = registration_kernel.pairwise_probability_sums_and_weighted_fixed(
+                        fixed, moving, sigmasq)
+
+                    d_fwd = registration._squared_point_distances(fixed, moving).sum(-1) / float(p)
+                    d_rev = registration._squared_point_distances(fixed, moving.flip(1)).sum(-1) / float(p)
+                    mask_fwd = d_fwd <= d_rev
+                    d_min = torch.where(mask_fwd, d_fwd, d_rev)
+                    prob = torch.exp(-d_min / sigmasq)
+                    sum_ref = prob.sum(-1)
+                    p_fwd = torch.where(mask_fwd, prob, torch.zeros_like(prob))
+                    p_rev = prob - p_fwd
+                    wf_ref = (
+                        torch.matmul(p_fwd, fixed.reshape(nf, p * 3))
+                        + torch.matmul(p_rev, fixed.flip(1).reshape(nf, p * 3))
+                    ).reshape(nm, p, 3)
+
+                    torch.testing.assert_close(sum_k, sum_ref, rtol=rtol, atol=atol)
+                    torch.testing.assert_close(wf_k, wf_ref, rtol=rtol, atol=atol)
+
+        # Verify NonrigidObjective.value_and_gradient fused Triton vs strict PyTorch fallback & bounded VRAM
+        fixed_big = rng.uniform(-70, 70, (3, 2048, 10))
+        moving_big = rng.uniform(-70, 70, (3, 2048, 10))
+        disp = rng.normal(scale=2.5, size=6 ** 3 * 3)
+        obj = bspline.NonrigidObjective(fixed_big, moving_big, 6, device=device, gpu_float32=False)
+
+        wma.gpu.set_strict(True)
+        val_strict, grad_strict = obj.value_and_gradient(disp, sigma=20.0)
+
+        wma.gpu.set_strict(False)
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        base_alloc = torch.cuda.memory_allocated(device)
+        val_fused, grad_fused = obj.value_and_gradient(disp, sigma=20.0)
+        torch.cuda.synchronize(device)
+        peak_delta = torch.cuda.max_memory_allocated(device) - base_alloc
+
+        np.testing.assert_allclose(val_fused, val_strict, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(grad_fused, grad_strict, rtol=1e-10, atol=1e-10)
+        # Eager (2048 x 2048 x 10) or (2048 x 2048) float64 would exceed 32 MiB/point or 32 MiB/pair
+        self.assertLess(peak_delta, 128 * 1024 * 1024)
