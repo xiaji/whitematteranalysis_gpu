@@ -320,12 +320,35 @@ def _print_help():
     print('\n'.join(lines))
 
 
-def _print_list():
-    print(f'WhiteMatterAnalysis {__version__} commands:')
+def collect_list_info():
+    """Return structured metadata for all ``wma`` subcommands."""
+    commands = []
     for cmd, (script_name, desc) in COMMAND_SCRIPTS.items():
-        resolved = resolve_script(script_name) or 'not found'
-        print(f'  wma {cmd:<15} -> {script_name} ({resolved})')
-        print(f'      {desc}')
+        resolved = resolve_script(script_name)
+        commands.append({
+            'command': cmd,
+            'script': script_name,
+            'path': resolved,
+            'available': resolved is not None,
+            'description': desc,
+        })
+    return {
+        'version': __version__,
+        'builtins': [
+            {'command': 'doctor', 'flags': ['--json'], 'description': 'Inspect runtime, GPU/Triton, VTK, and cache status'},
+            {'command': 'list', 'flags': ['--json'], 'description': 'List wma subcommands and resolved script paths'},
+        ],
+        'commands': commands,
+    }
+
+
+def _print_list():
+    info = collect_list_info()
+    print(f"WhiteMatterAnalysis {info['version']} commands:")
+    for item in info['commands']:
+        resolved = item['path'] or 'not found'
+        print(f"  wma {item['command']:<15} -> {item['script']} ({resolved})")
+        print(f"      {item['description']}")
 
 
 def main(argv=None):
@@ -356,7 +379,18 @@ def main(argv=None):
         return 0
 
     if cmd == 'list':
-        _print_list()
+        if any(flag in ('-h', '--help') for flag in rest):
+            print('usage: wma list [--json]')
+            return 0
+        as_json = '--json' in rest
+        unknown = [a for a in rest if a != '--json']
+        if unknown:
+            print(f"wma list: unrecognized arguments: {' '.join(unknown)}", file=sys.stderr)
+            return 2
+        if as_json:
+            print(json.dumps(collect_list_info(), indent=2, sort_keys=True))
+        else:
+            _print_list()
         return 0
 
     if cmd in COMMAND_SCRIPTS:

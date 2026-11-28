@@ -267,6 +267,22 @@ class WMACLITests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn("unknown command 'nonexistent-cmd'", buf.getvalue())
 
+    def test_list_json_and_agent_docs_present(self):
+        self.assertTrue((ROOT / 'AGENTS.md').is_file())
+        self.assertTrue((ROOT / 'llms.txt').is_file())
+        self.assertFalse((ROOT / 'slicer').exists())
+
+        buf = io.StringIO()
+        with patch('sys.stdout', buf):
+            rc = cli.main(['list', '--json'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload['version'], wma.__version__)
+        cmd_names = {item['command'] for item in payload['commands']}
+        self.assertIn('org', cmd_names)
+        self.assertIn('harden', cmd_names)
+        self.assertTrue(all(item['available'] for item in payload['commands']))
+
 
 if __name__ == '__main__':
     unittest.main()

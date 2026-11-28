@@ -246,11 +246,11 @@ CLI flags (`-gpu`, `-gpu_float32`, `-gpu_devices`) take precedence when passed e
 
 ## Documentation
 
+- [Agent Integration Guide (`AGENTS.md`)](AGENTS.md) & [`llms.txt`](llms.txt)
 - [Acceleration Architecture & Benchmarks A–H](doc/acceleration.md)
 - [Command-Line Reference (28 `bin/` Scripts)](doc/command-line-reference.md)
 - [Subject-Specific Tractography Parcellation Guide](doc/subject-specific-tractography-parcellation.md)
 - [Anatomical White Matter Bundles](doc/bundles.md)
-- [3D Slicer Extension (`WMAGPU`)](slicer/WMAGPU/README.md) — optional GUI module ([installer](slicer/WMAGPU/dist/WMAGPU-Installer.zip))
 
 ---
 

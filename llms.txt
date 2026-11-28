@@ -1,0 +1,25 @@
+# WhiteMatterAnalysis GPU
+
+> GPU-accelerated diffusion MRI (dMRI) streamline tractography registration, spectral fiber clustering, and Slicer-free ORG white matter parcellation (CLI, Python SDK, and Docker/Apptainer).
+
+## Core Entrypoints
+
+- [README.md](README.md): Overview, RTX 3090 benchmarks, and quick start across CLI, Python SDK, and Docker/Apptainer.
+- [AGENTS.md](AGENTS.md): Machine-readable integration contract, JSON CLI probes, I/O schemas, exit codes, and resource controls for AI agents.
+- [pyproject.toml](pyproject.toml): PEP 621 package metadata, dependencies, optional extras (`gpu`, `h5`, `dev`, `doc`), and `wma` console script.
+- [Dockerfile](Dockerfile): Multi-target container build (`gpu` default CUDA 12.4 / optional CUDA 12.8, plus lightweight `cpu` target).
+
+## Code Map
+
+- [whitematteranalysis/pipelines/org.py](whitematteranalysis/pipelines/org.py): Python SDK (`ORGParcellationPipeline`, `ORGConfig`, `SubjectResult`, `BatchResult`, `parcellate_subject`, `parcellate_batch`) and single-process ORG engine.
+- [whitematteranalysis/cli.py](whitematteranalysis/cli.py): Unified `wma` CLI (`doctor --json`, `list --json`, `org`, `harden`, `register`, `cluster`, `build-atlas`, `remove-outliers`, `separate`, `download-atlas`).
+- [whitematteranalysis/transform.py](whitematteranalysis/transform.py): Pure-Python/VTK ITK affine, 3D cubic BSpline, and Composite (`.tfm`/`.h5`) transform reader and polydata hardening.
+- [whitematteranalysis/gpu/](whitematteranalysis/gpu/__init__.py): CUDA/Triton kernels (distance, embedding, split-C centroids, `O(N + R^3)` nonrigid B-spline backward, batched `kmeans2`), vectorized CPU backend, and `.npz` atlas caching.
+- [whitematteranalysis/atlases.py](whitematteranalysis/atlases.py): Multi-atlas resolution and validation (`org`, `east-west`, `naba`).
+
+## Technical Docs
+
+- [doc/acceleration.md](doc/acceleration.md): GPU/CPU acceleration architecture and Benchmarks A–H.
+- [doc/command-line-reference.md](doc/command-line-reference.md): Complete argument reference for all 28 `bin/` CLI scripts.
+- [doc/bundles.md](doc/bundles.md): Anatomical white matter tract definitions.
+- [doc/subject-specific-tractography-parcellation.md](doc/subject-specific-tractography-parcellation.md): Step-by-step parcellation pipeline guide.

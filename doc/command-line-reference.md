@@ -33,9 +33,7 @@ the checkout.
   Linux system. The shell pipeline's `-x 1` selects its virtual-display path.
 - Shell examples use POSIX syntax. The `.sh` pipeline requires Bash and its shell
   utilities; these examples are not native PowerShell commands. Python scripts
-  use the same arguments on Windows, with Windows paths and an appropriate
-  Python/Slicer installation. See the [Slicer guide](../slicer/WMAGPU/README.md)
-  for the extension's platform support.
+  use the same arguments across platforms with native paths.
 
 ### Shared acceleration options
 
