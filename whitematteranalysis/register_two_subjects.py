@@ -303,8 +303,7 @@ class RegisterTractography:
                                                                                maxfun=self.maxfun,
                                                                                maxiter=self.maxfun,
                                                                                factr=1e12,
-                                                                               epsilon=self.final_step,
-                                                                               iprint=0)
+                                                                               epsilon=self.final_step)
                 print(f, dict)
 
             elif self.optimizer == "Powell":

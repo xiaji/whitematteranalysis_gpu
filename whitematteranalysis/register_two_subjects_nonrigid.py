@@ -300,8 +300,7 @@ class RegisterTractographyNonrigidThinPlateSplines(wma.register_two_subjects.Reg
                                                                            approx_grad = True,
                                                                            maxiter=self.maxfun,
                                                                            factr=1e12,
-                                                                           epsilon=self.final_step,
-                                                                           iprint=0)
+                                                                           epsilon=self.final_step)
             print(f, dict)
 
         elif self.optimizer == "Powell":

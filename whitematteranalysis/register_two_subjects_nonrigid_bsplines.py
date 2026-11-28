@@ -305,8 +305,7 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
                             approx_grad=False,
                             maxfun=self.maxfun,
                             maxiter=2,
-                            factr=1e12,
-                            iprint=1)
+                            factr=1e12)
                     else:
                         (not_used, f, dict) = scipy.optimize.fmin_l_bfgs_b(
                             self.objective_function,
@@ -315,8 +314,7 @@ class RegisterTractographyNonrigid(wma.register_two_subjects.RegisterTractograph
                             maxfun=self.maxfun,
                             maxiter=2,
                             factr=1e12,
-                            epsilon=self.final_step * self.scaling,
-                            iprint=1)
+                            epsilon=self.final_step * self.scaling)
                 except _MaxFunReached:
                     print("EXCEPTION WAS CAUGHT, total objectives:", self.objective_computations)
 
