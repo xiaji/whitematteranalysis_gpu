@@ -58,37 +58,58 @@ See [doc/acceleration.md](doc/acceleration.md#phase-2-benchmarks-fan93-rtx-3090)
 
 ## Python / command line
 
-Install this fork from a local checkout:
+This package uses a modern PEP 621 [pyproject.toml](pyproject.toml) (pure Python — no C/C++ compilation required).
+
+### Recommended installation (GPU or CPU)
 
 ```shell
-git clone https://github.com/yishengpoxiao/whitematteranalysis_gpu.git
+# 1. (GPU only) Create an isolated venv and install the CUDA-enabled PyTorch build matching your driver first
+#    Example for CUDA 12.8 with uv (or use python -m venv + pip):
+uv venv .venv && source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# 2. Install directly from GitHub (or locally with `pip install -e .` for development)
+uv pip install "git+https://github.com/xiaji/whitematteranalysis_gpu.git@main"
+# Optional extras: [h5] for ITK .h5 transforms, [dev] for pytest, [doc] for Sphinx
+# uv pip install -e ".[h5]"
+
+# 3. Verify Python, VTK, PyTorch/CUDA, Triton, and atlas cache status
+wma doctor
+```
+
+Or install from a local checkout with standard `pip`:
+
+```shell
+git clone https://github.com/xiaji/whitematteranalysis_gpu.git
 cd whitematteranalysis_gpu
-python -m pip install .
+python -m pip install --no-build-isolation .
+# Or editable mode: python -m pip install --no-build-isolation -e ".[h5]"
 ```
 
-Choose one dependency profile in the same Python environment:
+The base package installs the CPU runtime profile (no PyTorch required), including
+`threadpoolctl>=3.1,<3.7` for scoped BLAS control. Existing compatible CUDA PyTorch
+installations are preserved; `requirements_cpu.txt` and `requirements_gpu.txt` remain
+available for requirement-file workflows.
+
+### Unified `wma` CLI
+
+Installing the package exposes both the unified `wma` command and all legacy `wm_*.py` scripts:
 
 ```shell
-# CPU: base dependencies, no PyTorch required
-python -m pip install -r requirements_cpu.txt
-
-# GPU: install a CUDA-enabled PyTorch build first, then the remaining dependencies
-python -m pip install -r requirements_gpu.txt
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+wma doctor                 # Check Python, VTK, CUDA/PyTorch, Triton, h5py, Slicer, and cache paths
+wma list                   # List subcommands and resolved script locations
+wma org -i subject.vtp -o out_dir -a /path/to/ORG-Atlases -r rig -j 4 -gpu on
+wma harden --pure-python -i -j 4 input_dir out_dir transform.tfm
+wma build-atlas ...        # Wraps wm_cluster_atlas.py
 ```
-
-`python -m pip install .` installs the current CPU profile, including
-`threadpoolctl` for scoped BLAS control. The GPU profile includes the CPU profile
-and `torch>=2.4.1`, without fixing a CUDA wheel index or exact PyTorch release.
-Existing compatible PyTorch installations are reused.
 
 Install the CUDA-enabled PyTorch build matching your Python, GPU and NVIDIA
 driver using the [official PyTorch selector](https://pytorch.org/get-started/locally/)
 or [version-specific commands](https://pytorch.org/get-started/previous-versions/).
 WMA is not restricted to CUDA 12.1. A CPU-only PyTorch build cannot run CUDA;
-check `torch.cuda.is_available()` after installation. Triton kernels are used when
+check `wma doctor` or `torch.cuda.is_available()` after installation. Triton kernels are used when
 Triton is available; the torch CUDA path remains available without Triton.
-Linux / Python 3.8 and Slicer 5.2.2 / Python 3.9 were tested; Windows has not been tested.
+Linux / Python 3.8–3.12 and Slicer 5.2.2 / Python 3.9 were tested; Windows has not been tested.
 
 | Setting | Behavior |
 |---|---|

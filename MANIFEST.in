@@ -1,2 +1,9 @@
-include *.txt
-recursive-include doc
+include License.txt
+include README.md
+include pyproject.toml
+include requirements_cpu.txt
+include requirements_gpu.txt
+include bin/*.py
+include utilities/*.py
+recursive-include doc *
+global-exclude __pycache__ *.py[cod]

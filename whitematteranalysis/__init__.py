@@ -2,16 +2,20 @@
 
 from importlib import import_module as _import_module
 
+__version__ = '0.4.0'
+
 __all__ = (
+    '__version__',
     'io', 'similarity', 'fibers', 'filter', 'laterality', 'render', 'cluster',
     'relative_distance', 'mrml', 'congeal_multisubject', 'register_two_subjects',
     'register_two_subjects_nonrigid', 'register_two_subjects_nonrigid_bsplines',
-    'congeal_to_atlas', 'tract_measurement', 'transform', 'atlases', 'utils', 'gpu',
+    'congeal_to_atlas', 'tract_measurement', 'transform', 'atlases', 'utils',
+    'gpu', 'cli',
 )
 
 
 def __getattr__(name):
-    if name in __all__:
+    if name in __all__ and name != '__version__':
         module = _import_module('.' + name, __name__)
         globals()[name] = module
         return module

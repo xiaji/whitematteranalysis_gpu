@@ -14,42 +14,17 @@ import os
 import re
 from datetime import datetime
 
-# import sys
+project = "whitematteranalysis"
+_author = "Fan Zhang and Lauren O'Donnell"
+_email = "odonnell@bwh.harvard.edu"
+_version = "0.0.0"
 
-# sys.path.insert(0, os.path.abspath('.'))
-
-author_setup_str = "    author="
-author_email_setup_str = "    author_email="
-name_setup_str = "    name="
-version_setup_str = "    version="
-
-
-# Load the release info into a dict by explicit execution
-info = {}
-with open(os.path.abspath(os.path.join(
-        os.path.dirname(__file__), "..", "setup.py")), "r") as f:
-    for line in f:
-        if line.startswith(name_setup_str):
-            project = (
-                re.search(name_setup_str + "(.*),", line).group(1).strip("\'"))
-        elif line.startswith(author_setup_str):
-            _author = (
-                re.search(
-                    author_setup_str + "(.*),",
-                    line).group(1).strip("\'").replace("\\", "")
-            )
-        elif line.startswith(author_email_setup_str):
-            _email = (
-                re.search(
-                    author_email_setup_str + "(.*),",
-                    line).group(1).strip("\'")
-            )
-        elif line.startswith(version_setup_str):
-            _version = (
-                re.search(
-                    version_setup_str + "(.*),",
-                    line).group(1).strip("\'")
-            )
+_init_path = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "whitematteranalysis", "__init__.py"))
+with open(_init_path, "r") as f:
+    _match = re.search(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]", f.read(), re.MULTILINE)
+    if _match:
+        _version = _match.group(1)
 
 # -- Project information -----------------------------------------------------
 
