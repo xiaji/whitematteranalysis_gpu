@@ -114,6 +114,31 @@ wma harden --pure-python -i -j 4 input_dir out_dir transform.tfm
 wma build-atlas ...        # Wraps wm_cluster_atlas.py
 ```
 
+### Python SDK (`whitematteranalysis.pipelines`)
+
+Embed the single-process ORG / multi-atlas pipeline directly in Python scripts, Jupyter notebooks,
+or training/inference workflows while reusing resident atlas and GPU state across subjects:
+
+```python
+from whitematteranalysis.pipelines import ORGParcellationPipeline, parcellate_subject
+
+# One-shot single subject
+res = parcellate_subject(
+    "sub-01.vtp",
+    "output_dir",
+    "/path/to/ORG-Atlases",
+    reg_mode="rig",   # or "nonrig"
+    jobs=4,
+    gpu=True,
+)
+af_left_pd = res.load_tract("T_AF_left")
+
+# Persistent multi-subject session (reuses registration atlas, spectral atlas, GPU tensors & outlier cache)
+with ORGParcellationPipeline("/path/to/ORG-Atlases", reg_mode="rig", jobs=4, gpu=True) as pipe:
+    batch = pipe.run_batch("subjects_dir/", "batch_out/", continue_on_error=True)
+    print(batch.succeeded, batch.failed, batch.summary_path)
+```
+
 Install the CUDA-enabled PyTorch build matching your Python, GPU and NVIDIA
 driver using the [official PyTorch selector](https://pytorch.org/get-started/locally/)
 or [version-specific commands](https://pytorch.org/get-started/previous-versions/).
