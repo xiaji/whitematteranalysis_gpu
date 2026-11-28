@@ -1,0 +1,73 @@
+cff-version: 1.2.0
+title: "WhiteMatterAnalysis GPU"
+message: "If you use this software or the ORG white matter atlas in your research, please cite this repository and the original WhiteMatterAnalysis / ORG atlas publications."
+type: software
+version: "0.4.0"
+license: BSD-3-Clause
+repository-code: "https://github.com/xiaji/whitematteranalysis_gpu"
+keywords:
+  - diffusion-mri
+  - tractography
+  - white-matter
+  - neuroimaging
+  - fiber-clustering
+  - org-atlas
+  - cuda
+  - triton
+  - pytorch
+authors:
+  - family-names: Zhang
+    given-names: Fan
+  - family-names: O'Donnell
+    given-names: Lauren J.
+  - alias: xiaji
+preferred-citation:
+  type: article
+  title: "An anatomically curated fiber clustering white matter atlas for consistent white matter tract parcellation across the lifespan"
+  authors:
+    - family-names: Zhang
+      given-names: Fan
+    - family-names: Wu
+      given-names: Ye
+    - family-names: Norton
+      given-names: Isaiah
+    - family-names: Rathi
+      given-names: Yogesh
+    - family-names: Makris
+      given-names: Nikos
+    - family-names: O'Donnell
+      given-names: Lauren J.
+  journal: "NeuroImage"
+  volume: 179
+  start: 429
+  end: 447
+  year: 2018
+references:
+  - type: conference-paper
+    title: "Unbiased groupwise registration of white matter tractography"
+    authors:
+      - family-names: O'Donnell
+        given-names: Lauren J.
+      - family-names: Wells III
+        given-names: William M.
+      - family-names: Golby
+        given-names: Alexandra J.
+      - family-names: Westin
+        given-names: Carl-Fredrik
+    collection-title: "MICCAI"
+    start: 123
+    end: 130
+    year: 2012
+  - type: article
+    title: "Automatic tractography segmentation using a high-dimensional white matter atlas"
+    authors:
+      - family-names: O'Donnell
+        given-names: Lauren J.
+      - family-names: Westin
+        given-names: Carl-Fredrik
+    journal: "IEEE Transactions on Medical Imaging"
+    volume: 26
+    issue: 11
+    start: 1562
+    end: 1575
+    year: 2007

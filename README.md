@@ -1,5 +1,6 @@
 # WhiteMatterAnalysis GPU
 
+[![CI](https://github.com/xiaji/whitematteranalysis_gpu/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaji/whitematteranalysis_gpu/actions/workflows/ci.yml)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB.svg)](pyproject.toml)
 [![CUDA 12.4 | 12.8](https://img.shields.io/badge/CUDA-12.4%20%7C%2012.8-76B900.svg)](Dockerfile)
 [![PyTorch + Triton](https://img.shields.io/badge/backend-PyTorch%20%2B%20Triton%20%7C%20CPU-EE4C2C.svg)](doc/acceleration.md)
